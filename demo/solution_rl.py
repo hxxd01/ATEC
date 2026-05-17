@@ -58,6 +58,11 @@ class AlgSolution:
             dtype=torch.float32,
         )
 
+        # Yaw heading correction state
+        self._yaw_accumulated = 0.0   # integrated yaw drift from start (rad)
+        self._step_dt = 0.02          # env step dt (seconds)
+        self._yaw_kp = 1.0            # P-gain: how aggressively to correct heading
+
 
     def _resolve_joint_ids(self, candidates: tuple[list[str], ...]) -> list[int]:
         last_error = None
@@ -107,10 +112,21 @@ class AlgSolution:
         return (full_target - self.default_joint_pos) / self.ACTION_SCALE
 
     def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
-        """Return fixed velocity commands for policy input."""
+        """Return velocity commands with yaw correction to keep robot heading in +x direction."""
         num_envs = proprio.shape[0]
 
-        cmd = self.fixed_velocity_commands.to(dtype=proprio.dtype, device=self.device)
+        # proprio layout: [base_lin_vel(3), base_ang_vel(3), vel_cmd(3), gravity(3), ...]
+        # base_ang_vel[2] is yaw rate in body frame
+        yaw_rate_measured = proprio[:, 5].mean().item()
+        self._yaw_accumulated += yaw_rate_measured * self._step_dt
+
+        # P controller: if we've rotated by yaw_accumulated, command opposite yaw to return
+        yaw_cmd = -self._yaw_kp * self._yaw_accumulated
+        yaw_cmd = max(-1.0, min(1.0, yaw_cmd))  # clamp to reasonable range
+
+        cmd = self.fixed_velocity_commands.clone().to(dtype=proprio.dtype, device=self.device)
+        cmd[0, 2] = yaw_cmd  # [vx, vy, yaw_rate]
+
         if num_envs > 1:
             cmd = cmd.repeat(num_envs, 1)
         return cmd
@@ -185,8 +201,8 @@ class AlgSolution:
 
     def predicts(self, obs, current_score):
         """Run policy inference and return current-env full-body action."""
-        if current_score > 1:
-            return {'action': [], 'giveup': True}
+        #if current_score > 1:
+            #return {'action': [], 'giveup': True}
         proprio = obs["proprio"].to(self.device)
         action_dim = (int(proprio.shape[-1]) - 12) // 3
         policy_obs = self._extract_policy_obs(obs, action_dim)
