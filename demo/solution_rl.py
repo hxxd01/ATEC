@@ -45,24 +45,27 @@ class AlgSolution:
             dtype=torch.float32,
         ).view(1, -1)
 
-        # Fixed zero base velocity command for policy input.
-        self.fixed_velocity_commands = torch.tensor(
-            [0.5, 0.0, 0.0],
-            device=self.device,
-            dtype=torch.float32,
-        ).view(1, 3)
-
         self.arm_default_action = torch.zeros(
             (1, self.arm_action_dim),
             device=self.device,
             dtype=torch.float32,
         )
 
-        # Yaw heading correction state
-        self._yaw_accumulated = 0.0   # integrated yaw drift from start (rad)
-        self._step_dt = 0.02          # env step dt (seconds)
-        self._yaw_kp = 1.0            # P-gain: how aggressively to correct heading
+        # Task A navigation: approximate odometry + closed-loop cmds (vx, vy, yaw_rate)
+        self.dt = 0.02
+        self.nav_vx_target = 0.25
+        self.nav_k_lat = 0.35
+        self.nav_vy_lim = 0.25
+        self.nav_k_yaw = 0.8
+        self.nav_k_wz = 0.25
+        self.nav_wz_lim = 0.45
+        self.yaw_est = None
+        self.y_est = None
 
+    def reset(self, **kwargs):
+        """Clear odometry when starting a new episode (optional; play script may not call)."""
+        self.yaw_est = None
+        self.y_est = None
 
     def _resolve_joint_ids(self, candidates: tuple[list[str], ...]) -> list[int]:
         last_error = None
@@ -112,24 +115,38 @@ class AlgSolution:
         return (full_target - self.default_joint_pos) / self.ACTION_SCALE
 
     def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
-        """Return velocity commands with yaw correction to keep robot heading in +x direction."""
-        num_envs = proprio.shape[0]
+        """Body odometry + lateral / heading loop; feed policy a consistent command vector."""
+        # proprio: [base_lin_vel(3), base_ang_vel(3), vel_cmd(3), gravity(3), ...]
+        device = proprio.device
+        dtype = proprio.dtype
+        b = proprio.shape[0]
 
-        # proprio layout: [base_lin_vel(3), base_ang_vel(3), vel_cmd(3), gravity(3), ...]
-        # base_ang_vel[2] is yaw rate in body frame
-        yaw_rate_measured = proprio[:, 5].mean().item()
-        self._yaw_accumulated += yaw_rate_measured * self._step_dt
+        base_lin_vel = proprio[:, 0:3]
+        base_ang_vel = proprio[:, 3:6]
+        vx_body = base_lin_vel[:, 0:1]
+        vy_body = base_lin_vel[:, 1:2]
+        wz = base_ang_vel[:, 2:3]
 
-        # P controller: if we've rotated by yaw_accumulated, command opposite yaw to return
-        yaw_cmd = -self._yaw_kp * self._yaw_accumulated
-        yaw_cmd = max(-1.0, min(1.0, yaw_cmd))  # clamp to reasonable range
+        if self.yaw_est is None or self.yaw_est.shape[0] != b:
+            self.yaw_est = torch.zeros((b, 1), device=device, dtype=dtype)
+            self.y_est = torch.zeros((b, 1), device=device, dtype=dtype)
+        else:
+            self.yaw_est = self.yaw_est.to(device=device, dtype=dtype)
+            self.y_est = self.y_est.to(device=device, dtype=dtype)
 
-        cmd = self.fixed_velocity_commands.clone().to(dtype=proprio.dtype, device=self.device)
-        cmd[0, 2] = yaw_cmd  # [vx, vy, yaw_rate]
+        self.yaw_est = self.yaw_est + wz * self.dt
+        self.yaw_est = torch.atan2(torch.sin(self.yaw_est), torch.cos(self.yaw_est))
 
-        if num_envs > 1:
-            cmd = cmd.repeat(num_envs, 1)
-        return cmd
+        world_vy = torch.sin(self.yaw_est) * vx_body + torch.cos(self.yaw_est) * vy_body
+        self.y_est = self.y_est + world_vy * self.dt
+
+        vx_cmd = torch.full((b, 1), self.nav_vx_target, device=device, dtype=dtype)
+        vy_cmd = (-self.nav_k_lat * self.y_est).clamp(-self.nav_vy_lim, self.nav_vy_lim)
+        yaw_cmd = (-self.nav_k_yaw * self.yaw_est - self.nav_k_wz * wz).clamp(
+            -self.nav_wz_lim, self.nav_wz_lim
+        )
+
+        return torch.cat([vx_cmd, vy_cmd, yaw_cmd], dim=-1)
 
     def _extract_policy_obs(self, obs, action_dim) -> torch.Tensor:
         proprio = obs["proprio"].to(self.device)

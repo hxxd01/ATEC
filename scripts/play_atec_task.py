@@ -1,9 +1,15 @@
 # Created by skywoodsz on 2026/02/07.
 
 import argparse
-import os
-import time
 import json
+import os
+import sys
+import time
+
+# Repo root contains package `demo/`; running `python scripts/...` only puts scripts/ on sys.path.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from isaaclab.app import AppLauncher
 

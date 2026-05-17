@@ -3,3 +3,4 @@
 """Configurations for velocity-based locomotion environments."""
 
 from .unitree_b2 import *
+from .unitree_b2_piper import *

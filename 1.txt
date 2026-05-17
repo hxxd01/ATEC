@@ -1,0 +1,23 @@
+python scripts/rsl_rl/play.py \
+  --task ATEC-Isaac-Velocity-Rough-Unitree-B2-v0 \
+  --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_2400.pt \
+  --headless
+
+& "C:\Windows\System32\OpenSSH\scp.exe" ubuntu@117.50.75.119:/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_rough/2026-05-17_03-41-56/model_6600.pt "C:\Users\xxd\Desktop\"
+
+
+python scripts/rsl_rl/play.py \ 
+ --task ATEC-Isaac-Velocity-Rough-Unitree-B2-v0 \
+ --video
+
+python scripts/rsl_rl/play.py --task ATEC-Isaac-Velocity-Rough-Unitree-B2-v0 --video --headless --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_rough/2026-05-17_03-41-56/model_7200.pt --video_length 400
+
+#转为jit
+python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_2400.pt   --headless
+
+
+#测试
+python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_2400.pt   --headless
+
+#demo里面评分
+cd /home/ubuntu/ATEC2026_Simulation_Challenge && python scripts/play_atec_task.py   --task ATEC-TaskA-B2Piper   --headless   --enable_cameras   --video   --video_length 10000
