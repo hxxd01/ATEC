@@ -32,7 +32,7 @@ parser.add_argument(
     "--debug",
     action="store_true",
     default=False,
-    help="Enable debug prints for per-step reward/time metrics.",
+    help="Enable debug prints: reward, elapsed sim time, measured base linear velocities.",
 )
 
 # Isaac Sim / Kit args
@@ -62,6 +62,34 @@ from isaaclab.utils.dict import print_dict  # noqa: E402
 import atec_rl_lab.tasks  # noqa: F401, E402 (register your tasks)
 from isaaclab_tasks.utils import parse_env_cfg
 from rl_utils import camera_follow
+
+
+def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_time: float) -> None:
+    """Print reward/time and measured velocities (after env.step)."""
+    print(f"total_episode_reward:{total_episode_reward: .2f}")
+    print(f"total_elapsed_time:{total_elapsed_time: .2f}")
+    proprio = obs.get("proprio")
+    if proprio is None:
+        return
+    pr = proprio[0] if isinstance(proprio, torch.Tensor) and proprio.ndim == 2 else proprio.flatten()
+    if isinstance(pr, torch.Tensor):
+        pr = pr.detach().cpu()
+        bv = pr[:3].tolist()
+        print(
+            "base_lin_vel_body (vx,vy,vz m/s): "
+            f"{bv[0]: .3f}, {bv[1]: .3f}, {bv[2]: .3f}"
+        )
+    try:
+        robot = env.unwrapped.scene.articulations["robot"]
+        wv = robot.data.root_lin_vel_w[0].detach().cpu().tolist()
+        print(
+            "root_lin_vel_world (vx,vy,vz m/s): "
+            f"{wv[0]: .3f}, {wv[1]: .3f}, {wv[2]: .3f}"
+        )
+        speed_xy = (wv[0] ** 2 + wv[1] ** 2) ** 0.5
+        print(f"horizontal_speed_xy (world): {speed_xy: .3f}")
+    except (AttributeError, KeyError):
+        pass
 
 
 def play() -> tuple[float, float]:
@@ -142,8 +170,7 @@ def play() -> tuple[float, float]:
                 total_elapsed_time += dt  # wall clock time as fallback
 
             if args_cli.debug:
-                print(f"total_episode_reward:{total_episode_reward: .2f}")
-                print(f"total_elapsed_time:{total_elapsed_time: .2f}")
+                _debug_print_motion(obs, env, total_episode_reward, total_elapsed_time)
 
             done = (terminated.item() or truncated.item())
             if done:
