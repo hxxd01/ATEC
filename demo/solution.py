@@ -3,10 +3,9 @@ import torch
 
 class AlgSolution:
 
-    # Task A: strips match IsaacLab TerrainGenerator layout (terrain.py TASK_A_TERRAIN_CFG).
-    # Sub-terrain (row=r, size=(20,20)) is shifted by -(num_rows/2)*size then cell at +(r+0.5)*size[0].
-    # => world-x cell centers at -140,-120,...,+140 ; left edges at -150,-130,...,+130 .
-    # row r==0 first in np.unravel_index order aligns with terrain_sequence[0].
+    #思路：y_est积分：维持4s的滑动窗口泄露，通过本体y计算（这里默认角度纠偏正确，如果用当前朝向的y分速度很可能出现偏差）。
+    #yaw_est用长时间积分计算，可能会因为打滑而出现偏差。因此在粗糙地面的恢复过程中冻结y_est和yaw_est。
+    #在金字塔坡度的时候会有重力导致y的变化，给重力投影的反向速度来抵消。
     '''地形中心 x	x 范围	地形类型	对应分数约
     -140	-150 ~ -130	平地	0
     -120	-130 ~ -110	平地	0.85 ~ 2.25
@@ -93,26 +92,37 @@ class AlgSolution:
 
         # Task A navigation: approximate odometry + closed-loop cmds (vx, vy, yaw_rate)
         self.dt = 0.02
-        # Fallback forward speed when terrain segmentation disabled or coords invalid
+        self.nav_vx_max = 1.0  # cap forward cmd (matches loco-friendly training range)
         self.nav_vx_target = 0.5
         self.nav_use_task_a_strip_vx = True
         # World-x seed for integrating position (matches ~Task A B2Piper spawn): (-141, ...)
         self.nav_init_world_x = -141.0
-        self.nav_k_lat = 0.20
-        self.nav_vy_lim = 0.12
-        self.nav_k_yaw = 0.8
-        self.nav_k_wz = 0.25
-        self.nav_wz_lim = 0.35
+        self.nav_goal_x = 145.0
+        self.nav_goal_slow_x = 125.0  # start easing vx before the finish strip
+        self.nav_k_lat = 1.0 #y_est反馈
+        self.nav_vy_lim = 0.45 #横向速度命令限幅
+        self.nav_k_yaw = 0.8 #角度反馈
+        self.nav_k_wz = 0.25 #角速度阻尼
+        self.nav_wz_lim = 0.35 #yaw_cmd限幅度
+        # LiDAR guard switches:
+        # - keep lateral safety correction on
+        # - do NOT scale down forward speed
+        self.use_lidar_vy_guard = True
+        self.use_lidar_vx_guard = False
+        self.nav_cmd_ema_alpha = 0.35  # smooth vel_cmd at 50 Hz (0=hold, 1=no filter)
         self.yaw_est = None
         self.y_est = None
         self.x_est = None
+        self._cmd_ema = None
+        self._robot = None  # optional: set via bind_robot() for true world-x strip lookup
+        self._debug_step = 0
 
         # Stuck → short recovery burst (cmds override normal nav loop)
         self.recovery_stuck_vx_thresh = 0.03
         self.recovery_stuck_steps = 50  # ~1 s @ dt=0.02
         self.recovery_duration_steps = 50
-        self.recovery_vx_cmd = -0.10
-        self.recovery_yaw_mag = 0.25
+        self.recovery_vx_cmd = 0.15  # small forward nudge (backward drifts off the strip)
+        self.recovery_yaw_mag = 0.30
         self._slow_vx_accum = None
         self._recovery_left = None
         self._recovery_next_yaw = None  # ±1, toggles on each new trigger
@@ -122,10 +132,10 @@ class AlgSolution:
         self.nav_vx_by_terrain_kind = dict(
             flat=2.0,
             random_rough=1.2,
-            hf_pyramid_slope=0.8,
-            hf_pyramid_slope_inv=0.8,
-            pyramid_stairs=0.5,
-            pyramid_stairs_inv=0.5,
+            hf_pyramid_slope=1.0,
+            hf_pyramid_slope_inv=1.0,
+            pyramid_stairs=0.7,
+            pyramid_stairs_inv=0.7,
         )
         vx_per_strip = [
             float(self.nav_vx_by_terrain_kind[k]) for k in self._TASK_A_STRIP_TERRAINS
@@ -153,6 +163,7 @@ class AlgSolution:
         self._recovery_left = None
         self._recovery_next_yaw = None
         self._active_recovery_yaw = None
+        self._debug_step = 0
 
     def _resolve_joint_ids(self, candidates: tuple[list[str], ...]) -> list[int]:
         last_error = None
@@ -222,8 +233,104 @@ class AlgSolution:
         vx = vx_tab[idx].view(world_x.shape[0], 1)
         return vx
 
-    def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
-        """Body odometry + lateral / heading loop; feed policy a consistent command vector."""
+    # ── LiDAR cliff guard constants ───────────────────────────────────────────
+    # extero = mdp.height_scan(sensor) = sensor_z − hit_z − 0.5  (per ray)
+    #   flat ground  → ≈ 0.08  (~0 in practice, sensor≈0.58m, offset=0.5)
+    #   1 m drop     → ≈ 1.08  (large positive: terrain fell away)
+    #   wall ahead   → negative (terrain higher than expected)
+    #   ray miss     → max_d × sin(20°) − 0.5 ≈ 2.9  (no terrain hit)
+    #
+    # Ray layout: ray_idx = channel * 360 + (horiz_angle_deg + 180)
+    #   Channel 0 = −20° (most downward).  0°=forward, +90°=left, −90°=right.
+    _LIDAR_H             = 360   # horizontal rays per channel
+    _LIDAR_CLIFF_THRESH  = 0.30  # height-scan value above this → cliff (terrain dropped)
+    _LIDAR_DANGER_THRESH = 0.80  # serious drop: cut vx to ~10%
+    _LIDAR_FRONT_HALF    = 25    # ±25° forward cone  (indices 155..205)
+    _LIDAR_SIDE_START    = 55    # side cone half-width
+    _LIDAR_SIDE_END      = 35    # trailing edge of cone
+
+    def _sector_drop_value(self, ch0, ch1, ch2, center: int, half_width: int) -> torch.Tensor:
+        """Robust drop metric for a sector; mean values hide narrow cliffs."""
+        H = self._LIDAR_H
+        idx = torch.arange(
+            center - half_width,
+            center + half_width + 1,
+            device=ch0.device,
+        ) % H
+        vals = torch.cat([ch0[idx], ch1[idx], ch2[idx]], dim=0).clamp(min=0.0)
+        k = max(1, vals.numel() // 5)
+        return torch.topk(vals, k).values.mean()
+
+    def _lidar_cliff_guard(self, extero: torch.Tensor, device, dtype):
+        """Cliff / edge detection from height-scan LiDAR data.
+
+        extero values ≈ 0 on flat terrain; large positive when terrain drops.
+
+        Returns a dict:
+          vx_scale  – multiply vx_cmd (1.0=normal, <1=slow down)
+          vy_corr   – additive body-frame vy correction (steer away from edge)
+          front_val / left_val / right_val  – mean height-scan values (debug)
+
+        L/R sanity check: walk near a RIGHT edge → right_val should rise.
+        If left_val rises instead, swap l_c / r_c below.
+        """
+        H = self._LIDAR_H
+        rays = extero[0].to(device=device, dtype=dtype)   # [5760]
+
+        # Clamp -inf / +inf before any arithmetic.
+        # Upper-pointing rays that miss terrain return -inf; clamp to 0 (no cliff info).
+        # Very large positive values (ray miss going downward) stay as-is.
+        rays = rays.nan_to_num(nan=0.0, posinf=3.0, neginf=0.0)
+
+        # Use 3 bottom channels to maximise look-ahead range:
+        #   ch0 (-20°): hits ground ~1.4m ahead — most sensitive to drops
+        #   ch1 (-17°): hits ground ~1.7m ahead
+        #   ch2 (-15°): hits ground ~2.1m ahead
+        # Weight ch0 highest (most reliable) and ch2 lowest (more noise).
+        ch0 = rays[0*H : 1*H]
+        ch1 = rays[1*H : 2*H]
+        ch2 = rays[2*H : 3*H]
+
+        front_val = self._sector_drop_value(ch0, ch1, ch2, 180, self._LIDAR_FRONT_HALF)
+        front_left_val = self._sector_drop_value(ch0, ch1, ch2, 230, 25)
+        front_right_val = self._sector_drop_value(ch0, ch1, ch2, 130, 25)
+
+        # Lateral sectors centred on ±90° — ch0 only (most sensitive to side drops)
+        l_c, r_c = 270, 90          # +90° = LEFT,  −90° = RIGHT
+        ls, le = self._LIDAR_SIDE_START, self._LIDAR_SIDE_END
+        left_val = self._sector_drop_value(ch0, ch1, ch2, 270, 35)
+        right_val = self._sector_drop_value(ch0, ch1, ch2, 90, 35)
+
+        # Front slow-down: height_scan > CLIFF_THRESH → terrain dropped → reduce vx
+        cliff_t  = self._LIDAR_CLIFF_THRESH
+        danger_t = self._LIDAR_DANGER_THRESH
+        front_guard_val = torch.maximum(front_val, torch.maximum(front_left_val, front_right_val))
+        front_excess = (front_guard_val - cliff_t).clamp(min=0.0)
+        span = max(danger_t - cliff_t, 1e-3)
+        vx_scale = (1.0 - front_excess / span).clamp(min=0.1)
+
+        # Lateral steering: diff > 0 → right dropped more → push left (vy_corr < 0)
+        diff = left_val - right_val
+        vy_corr = (-diff * 0.55).clamp(-0.35, 0.35)
+
+        return {
+            "vx_scale":  vx_scale,
+            "vy_corr":   vy_corr,
+            "front_val": front_val.item(),
+            "front_left_val": front_left_val.item(),
+            "front_right_val": front_right_val.item(),
+            "left_val":  left_val.item(),
+            "right_val": right_val.item(),
+        }
+
+    def _get_velocity_commands(
+        self, proprio: torch.Tensor, extero: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Body odometry + lateral / heading loop; feed policy a consistent command vector.
+
+        extero: [B, 5760] height-scan values (sensor_z − hit_z − 0.5) from the
+        spherical LiDAR (optional).  ≈0 on flat terrain, large positive on cliffs.
+        """
         # proprio: [base_lin_vel(3), base_ang_vel(3), vel_cmd(3), gravity(3), ...]
         device = proprio.device
         dtype = proprio.dtype
@@ -231,9 +338,16 @@ class AlgSolution:
 
         base_lin_vel = proprio[:, 0:3]
         base_ang_vel = proprio[:, 3:6]
+        # proprio[:, 6:9] is vel_cmd (skipped); gravity is at [9:12]
+        projected_gravity = proprio[:, 9:12]
         vx_body = base_lin_vel[:, 0:1]
         vy_body = base_lin_vel[:, 1:2]
         wz = base_ang_vel[:, 2:3]
+        # gravity_y: body-frame lateral component of gravity.
+        # Negative → right side lower (slope pushes robot rightward).
+        # Feed-forward: push back opposite to gravity lean.
+        gravity_y = projected_gravity[:, 1:2]
+        gravity_x = projected_gravity[:, 0:1]   # pitch: negative when climbing
 
         if self.yaw_est is None or self.yaw_est.shape[0] != b:
             self.yaw_est = torch.zeros((b, 1), device=device, dtype=dtype)
@@ -255,16 +369,28 @@ class AlgSolution:
             self._recovery_next_yaw = self._recovery_next_yaw.to(device=device, dtype=dtype)
             self._active_recovery_yaw = self._active_recovery_yaw.to(device=device, dtype=dtype)
 
-        self.yaw_est = self.yaw_est + wz * self.dt
+        in_recovery_before = self._recovery_left > 0
+
+        # Freeze yaw/y during recovery: wz from turning maneuver would pollute heading estimate.
+        self.yaw_est = torch.where(
+            in_recovery_before,
+            self.yaw_est,
+            self.yaw_est + wz * self.dt,
+        )
         self.yaw_est = torch.atan2(torch.sin(self.yaw_est), torch.cos(self.yaw_est))
 
         cos_y, sin_y = torch.cos(self.yaw_est), torch.sin(self.yaw_est)
         vx_world = cos_y * vx_body - sin_y * vy_body
-        world_vy = sin_y * vx_body + cos_y * vy_body
         self.x_est = self.x_est + vx_world * self.dt
-        self.y_est = self.y_est + world_vy * self.dt
 
-        in_recovery_before = self._recovery_left > 0
+        # Use vy_body directly (not world_vy) to avoid yaw drift contaminating y_est.
+        # Leaky integrator (τ ≈ 4 s) + clamp to prevent wind-up.
+        self.y_est = torch.where(
+            in_recovery_before,
+            self.y_est,
+            0.995 * self.y_est + vy_body * self.dt,
+        )
+        self.y_est = self.y_est.clamp(-0.6, 0.6)
         thresh = torch.tensor(self.recovery_stuck_vx_thresh, device=device, dtype=dtype)
         vx_low = vx_world < thresh
 
@@ -293,8 +419,18 @@ class AlgSolution:
         in_recovery = self._recovery_left > 0
 
         vx_cmd = self._vx_cmd_from_strip(self.x_est, dtype).to(device=device)
-        vy_cmd = (-self.nav_k_lat * self.y_est).clamp(-self.nav_vy_lim, self.nav_vy_lim)
-        yaw_cmd = (-self.nav_k_yaw * self.yaw_est - self.nav_k_wz * wz).clamp(
+        # Three-term lateral correction:
+        #   1. y_est position feedback (unreliable on slopes, but still useful on flat)
+        #   2. vy_body velocity damping (direct, no integration error)
+        #   3. gravity_y slope feed-forward (works even when odometry is lost)
+        vy_cmd = (
+            -self.nav_k_lat * self.y_est
+            - 0.4 * vy_body
+            - 1.0 * gravity_y
+        ).clamp(-self.nav_vy_lim, self.nav_vy_lim)
+        yaw_grav = (-0.3 * gravity_y).clamp(-0.1, 0.1)
+        yaw_grav = torch.where(gravity_y.abs() > 0.06, yaw_grav, torch.zeros_like(yaw_grav))
+        yaw_cmd = (-self.nav_k_yaw * self.yaw_est - self.nav_k_wz * wz- yaw_grav).clamp(
             -self.nav_wz_lim, self.nav_wz_lim
         )
 
@@ -319,7 +455,61 @@ class AlgSolution:
             just_finished, torch.zeros_like(self._slow_vx_accum), self._slow_vx_accum
         )
 
-        return torch.cat([vx_cmd, vy_cmd, yaw_cmd], dim=-1)
+        # Pitch-based speed reduction: mild, only for extreme tilt (>25°).
+        # The strip-based vx lookup + LiDAR guard already handle normal slopes.
+        # gravity_x ≈ sin(pitch), so sin(25°)≈0.42 → just starts cutting.
+        # Kept very conservative (×0.3) to avoid double-penalising with LiDAR.
+        pitch_reduction = ((gravity_x.abs() - 0.40) * 0.8).clamp(0.0, 0.3)
+        vx_cmd = vx_cmd * (1.0 - pitch_reduction)
+
+        # ── LiDAR cliff guard ─────────────────────────────────────────────────
+        lidar_dbg: dict = {}
+        use_any_lidar_guard = self.use_lidar_vx_guard or self.use_lidar_vy_guard
+        if use_any_lidar_guard and extero is not None and extero.shape[-1] >= self._LIDAR_H:
+            guard = self._lidar_cliff_guard(extero, device, dtype)
+            lidar_dbg = guard
+            # Only apply guard outside stuck-recovery (recovery handles its own speed)
+            not_rec = (~in_recovery).to(dtype=dtype)
+            if self.use_lidar_vx_guard:
+                # not_rec=1 → apply vx_scale;  not_rec=0 (recovery) → multiply by 1 (no change)
+                vx_cmd = vx_cmd * (guard["vx_scale"] * not_rec + in_recovery.to(dtype=dtype))
+            if self.use_lidar_vy_guard:
+                vy_cmd = (vy_cmd + guard["vy_corr"] * not_rec).clamp(
+                    -self.nav_vy_lim, self.nav_vy_lim
+                )
+
+        
+      
+        cmd = torch.cat([vx_cmd, vy_cmd, yaw_cmd], dim=-1)
+        self._debug_step += 1
+        if self._debug_step % 50 == 1:
+            lidar_str = ""
+            if lidar_dbg:
+                lidar_str = (
+                    f"  hs(f/fl/fr/l/r)=("
+                    f"{lidar_dbg['front_val']:.2f}/"
+                    f"{lidar_dbg['front_left_val']:.2f}/"
+                    f"{lidar_dbg['front_right_val']:.2f}/"
+                    f"{lidar_dbg['left_val']:.2f}/"
+                    f"{lidar_dbg['right_val']:.2f})"
+                    f" vx_sc={lidar_dbg['vx_scale'].item():.2f}"
+                    f" vy_co={lidar_dbg['vy_corr'].item():+.3f}"
+                )
+            print(
+                f"[nav dbg step={self._debug_step:5d}] "
+                f"x={self.x_est[0,0].item():7.2f}  "
+                f"y_est={self.y_est[0,0].item():+6.3f}  "
+                f"yaw={self.yaw_est[0,0].item():+5.3f}  "
+                f"vx_body={vx_body[0,0].item():+5.3f}  "
+                f"vy_body={vy_body[0,0].item():+5.3f}  "
+                f"grav_y={gravity_y[0,0].item():+5.3f}  "
+                f"grav_x={gravity_x[0,0].item():+5.3f}  "
+                f"wz={wz[0,0].item():+5.3f}  "
+                f"| cmd=({vx_cmd[0,0].item():.2f}, {vy_cmd[0,0].item():+.3f}, {yaw_cmd[0,0].item():+.3f})"
+                + lidar_str
+            )
+
+        return cmd
 
     def _extract_policy_obs(self, obs, action_dim) -> torch.Tensor:
         proprio = obs["proprio"].to(self.device)
@@ -352,7 +542,8 @@ class AlgSolution:
         actions_env_leg = actions_all[:, self.leg_joint_indices]
 
         actions_train_leg = actions_env_leg * self.env_to_train_action_scale.to(dtype=proprio.dtype)
-        velocity_commands = self._get_velocity_commands(proprio)
+        extero = self._extero  # set by predicts() before calling _extract_policy_obs
+        velocity_commands = self._get_velocity_commands(proprio, extero)
 
         policy_obs = torch.cat(
             [
@@ -395,6 +586,33 @@ class AlgSolution:
             #return {'action': [], 'giveup': True}
         proprio = obs["proprio"].to(self.device)
         action_dim = (int(proprio.shape[-1]) - 12) // 3
+
+        # Cache extero only when any LiDAR guard is enabled.
+        if self.use_lidar_vx_guard or self.use_lidar_vy_guard:
+            raw_extero = obs.get("extero", None)
+            if raw_extero is not None:
+                self._extero = raw_extero.to(self.device, dtype=torch.float32)
+                # Sanity check on first step: upper-pointing rays that miss terrain
+                # return -inf. Filter out non-finite values and inspect downward rays.
+                if self._debug_step == 0:
+                    ch0_vals = self._extero[0, :360]
+                    finite_mask = torch.isfinite(ch0_vals)
+                    if finite_mask.any():
+                        mean_val = ch0_vals[finite_mask].mean().item()
+                        if mean_val > 1.5:
+                            print(
+                                f"[lidar WARNING] ch0 mean={mean_val:.2f} — rays may be missing terrain "
+                                f"(check mesh_prim_paths=['/World/ground'] in envs_base_cfg.py)"
+                            )
+                        else:
+                            print(f"[lidar OK] ch0 mean on init={mean_val:.3f} (flat terrain ≈ 0.10)")
+                    else:
+                        print("[lidar WARNING] all ch0 rays returned inf — terrain mesh not found")
+            else:
+                self._extero = None
+        else:
+            self._extero = None
+
         policy_obs = self._extract_policy_obs(obs, action_dim)
 
         with torch.inference_mode():
@@ -413,4 +631,3 @@ class AlgSolution:
         action_env = self._map_policy_action_to_env_action(action_train, action_dim)
         action_env = action_env.cpu().numpy().tolist()
         return {'action': action_env, 'giveup': False}
-
