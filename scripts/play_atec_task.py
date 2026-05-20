@@ -14,7 +14,10 @@ if _ROOT not in sys.path:
 from isaaclab.app import AppLauncher
 
 from demo.solution import AlgSolution
+
+print("[play] loading policy.pt (AlgSolution)...", flush=True)
 solution = AlgSolution()
+print("[play] AlgSolution loaded.", flush=True)
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -34,13 +37,30 @@ parser.add_argument(
     default=False,
     help="Enable debug prints: reward, elapsed sim time, measured base linear velocities.",
 )
+parser.add_argument(
+    "--fast",
+    action="store_true",
+    default=None,
+    help="Disable cameras + lidar obs for fast reset/play (default: on for TaskB when not using --video).",
+)
+parser.add_argument(
+    "--full-obs",
+    action="store_true",
+    default=False,
+    help="Keep all sensors (4 cameras + lidar); reset/step will be very slow.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
 
-# If recording video, need cameras enabled in IsaacLab/Kit
+_is_task_b = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
+if args_cli.fast is None:
+    # Task B: fast by default (proprio-only). Use --full-obs to keep 4 cameras + lidar.
+    args_cli.fast = _is_task_b and not args_cli.full_obs
+
+# RecordVideo needs Kit rendering; does NOT need 4× observation cameras (those slow reset).
 if args_cli.video:
     args_cli.enable_cameras = True
 
@@ -62,6 +82,20 @@ from isaaclab.utils.dict import print_dict  # noqa: E402
 import atec_rl_lab.tasks  # noqa: F401, E402 (register your tasks)
 from isaaclab_tasks.utils import parse_env_cfg
 from rl_utils import camera_follow
+
+
+def _disable_heavy_sensors(env_cfg) -> None:
+    """Drop cameras + lidar so reset/step only compute proprio (much faster)."""
+    if hasattr(env_cfg, "scene"):
+        env_cfg.scene.head_camera = None
+        env_cfg.scene.ee_camera = None
+        env_cfg.scene.ee_dual_camera = None
+        env_cfg.scene.lidar_sensor = None
+    # Must remove whole obs groups; empty group with concatenate_terms=True crashes Isaac Lab.
+    if hasattr(env_cfg, "observations"):
+        env_cfg.observations.extero = None
+        env_cfg.observations.image = None
+    print("[play] --fast: disabled cameras + lidar (proprio-only).", flush=True)
 
 
 def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_time: float) -> None:
@@ -107,6 +141,11 @@ def play() -> tuple[float, float]:
         use_fabric=not args_cli.disable_fabric
     )
 
+    if args_cli.fast:
+        _disable_heavy_sensors(env_cfg)
+    else:
+        print("[play] full-obs: 4 cameras + lidar enabled (reset may take several minutes).", flush=True)
+
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # Convert MARL -> single agent if needed (kept from your original script)
@@ -132,7 +171,12 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     # Reset
     # -------------------------------------------------------------------------
+    fast_hint = "fast/proprio-only" if args_cli.fast else "full-obs (4 cameras + lidar, SLOW)"
+    print(f"[play] env.reset() starting ({fast_hint}) ...", flush=True)
     obs, _ = env.reset()
+    print("[play] env.reset() done, entering control loop.", flush=True)
+    if hasattr(solution, "reset"):
+        solution.reset()
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
@@ -145,6 +189,9 @@ def play() -> tuple[float, float]:
     while simulation_app.is_running():
         with torch.inference_mode():
             start_time = time.time()
+
+            if timestep == 0:
+                print("[play] first solution.predicts() ...", flush=True)
 
             # ===== Your controller goes here =====
             resp = solution.predicts(obs, total_episode_reward)
