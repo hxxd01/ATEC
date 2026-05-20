@@ -155,6 +155,12 @@ class AlgSolution:
             device=self.device,
             dtype=torch.float32,
         ).view(1, -1)
+        # 1.0 on pyramid_stairs_inv strips (x≈80, 120): flip gravity + LiDAR lateral sign.
+        self._task_a_strip_is_stairs_inv_t = torch.tensor(
+            [1.0 if k == "pyramid_stairs_inv" else 0.0 for k in self._TASK_A_STRIP_TERRAINS],
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, -1)
 
     def reset(self, **kwargs):
         """Clear odometry when starting a new episode (optional; play script may not call)."""
@@ -421,21 +427,31 @@ class AlgSolution:
         in_recovery = self._recovery_left > 0
 
         vx_cmd = self._vx_cmd_from_strip(self.x_est, dtype).to(device=device)
+        strip_idx = self._task_a_strip_indices(self.x_est).long().reshape(-1)
+        stairs_inv_mask = (
+            self._task_a_strip_is_stairs_inv_t.to(device=device, dtype=dtype)
+            .squeeze(0)[strip_idx]
+            .view(b, 1)
+        )
+        # +1 on normal strips; −1 on pyramid_stairs_inv (right-wall geometry → flip corrections).
+        grav_sign = 1.0 - 2.0 * stairs_inv_mask
+
         # Three-term lateral correction:
         #   1. y_est position feedback (unreliable on slopes, but still useful on flat)
         #   2. vy_body velocity damping (direct, no integration error)
-        #   3. gravity_y slope feed-forward (works even when odometry is lost)
+        #   3. gravity_y feed-forward (sign flipped on pyramid_stairs_inv)
         vy_cmd = (
             -self.nav_k_lat * self.y_est
             - 0.4 * vy_body
-            - 1.0 * gravity_y
+            - grav_sign * gravity_y
         ).clamp(-self.nav_vy_lim, self.nav_vy_lim)
-        # +yaw_cmd = turn left. Left lean (gravity_y>0) → turn right to recentre → subtract yaw_grav.
+        # +yaw_cmd = turn left. Normal: left lean → subtract yaw_grav → turn right.
+        # pyramid_stairs_inv: grav_sign=−1 → add yaw_grav → turn left toward centre.
         yaw_grav = (0.4 * gravity_y).clamp(-0.1, 0.1)
         yaw_grav = torch.where(gravity_y.abs() > 0.06, yaw_grav, torch.zeros_like(yaw_grav))
-        yaw_cmd = (-self.nav_k_yaw * self.yaw_est - self.nav_k_wz * wz - yaw_grav).clamp(
-            -self.nav_wz_lim, self.nav_wz_lim
-        )
+        yaw_cmd = (
+            -self.nav_k_yaw * self.yaw_est - self.nav_k_wz * wz - grav_sign * yaw_grav
+        ).clamp(-self.nav_wz_lim, self.nav_wz_lim)
 
         vx_rec = torch.full(
             (b, 1),
@@ -477,7 +493,7 @@ class AlgSolution:
                 # not_rec=1 → apply vx_scale;  not_rec=0 (recovery) → multiply by 1 (no change)
                 vx_cmd = vx_cmd * (guard["vx_scale"] * not_rec + in_recovery.to(dtype=dtype))
             if self.use_lidar_vy_guard:
-                vy_cmd = (vy_cmd + guard["vy_corr"] * not_rec).clamp(
+                vy_cmd = (vy_cmd + grav_sign * guard["vy_corr"] * not_rec).clamp(
                     -self.nav_vy_lim, self.nav_vy_lim
                 )
 
@@ -517,6 +533,7 @@ class AlgSolution:
                 f"grav_x={gravity_x[0,0].item():+5.3f}  "
                 f"wz={wz[0,0].item():+5.3f}  "
                 f"| cmd=({vx_cmd[0,0].item():.2f}, {vy_cmd[0,0].item():+.3f}, {yaw_cmd[0,0].item():+.3f})"
+                f"  inv={stairs_inv_mask[0,0].item():.0f}"
                 + lidar_str
             )
 
