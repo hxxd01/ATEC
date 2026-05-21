@@ -18,7 +18,7 @@ def draw_text_overlay(frame: np.ndarray, lines: list[str]) -> np.ndarray:
     line_h = max(14, h // 36)
     pad = 6
     box_h = pad * 2 + line_h * len(lines)
-    box_w = min(w - 2 * pad, max(320, int(w * 0.42)))
+    box_w = min(w - 2 * pad, max(480, int(w * 0.55)))
 
     try:
         import cv2

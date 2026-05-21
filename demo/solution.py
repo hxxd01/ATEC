@@ -99,7 +99,8 @@ class AlgSolution:
         self.nav_init_world_x = -141.0
         self.nav_goal_x = 145.0
         self.nav_goal_slow_x = 125.0  # start easing vx before the finish strip
-        self.nav_k_lat = 1.0 #y_est反馈
+        self.nav_k_lat = 1.0  # y_est lateral P gain (0=off; was 1.0, unreliable on slopes/stairs)
+        self.nav_y_leak_len = 2.0  # leaky y_est: ~37% memory left after 2 m forward travel
         self.nav_vy_lim = 0.45 #横向速度命令限幅
         self.nav_k_yaw = 0.8 #角度反馈
         self.nav_k_wz = 0.25 #角速度阻尼
@@ -389,16 +390,17 @@ class AlgSolution:
 
         cos_y, sin_y = torch.cos(self.yaw_est), torch.sin(self.yaw_est)
         vx_world = cos_y * vx_body - sin_y * vy_body
+        vy_world = sin_y * vx_body + cos_y * vy_body
         self.x_est = self.x_est + vx_world * self.dt
 
-        # Use vy_body directly (not world_vy) to avoid yaw drift contaminating y_est.
-        # Leaky integrator (τ ≈ 4 s) + clamp to prevent wind-up.
+        # World-frame lateral position + distance-based leak (≈2 m memory along track).
+        leak_alpha = torch.exp(-torch.abs(vx_world) * self.dt / float(self.nav_y_leak_len))
         self.y_est = torch.where(
             in_recovery_before,
             self.y_est,
-            0.995 * self.y_est + vy_body * self.dt,
+            leak_alpha * self.y_est + vy_world * self.dt,
         )
-        self.y_est = self.y_est.clamp(-0.6, 0.6)
+        self.y_est = self.y_est.clamp(-1.0, 1.0)
         thresh = torch.tensor(self.recovery_stuck_vx_thresh, device=device, dtype=dtype)
         vx_low = vx_world < thresh
 
@@ -443,12 +445,12 @@ class AlgSolution:
         vy_cmd = (
             -self.nav_k_lat * self.y_est
             - 0.4 * vy_body
-            - grav_sign * gravity_y
+            #- grav_sign * gravity_y
         ).clamp(-self.nav_vy_lim, self.nav_vy_lim)
         # +yaw_cmd = turn left. Normal: left lean → subtract yaw_grav → turn right.
         # pyramid_stairs_inv: grav_sign=−1 → add yaw_grav → turn left toward centre.
         yaw_grav = (0.4 * gravity_y).clamp(-0.1, 0.1)
-        yaw_grav = torch.where(gravity_y.abs() > 0.06, yaw_grav, torch.zeros_like(yaw_grav))
+        yaw_grav = torch.where(gravity_y.abs() > 0.03, yaw_grav, torch.zeros_like(yaw_grav))
         yaw_cmd = (
             -self.nav_k_yaw * self.yaw_est - self.nav_k_wz * wz - grav_sign * yaw_grav
         ).clamp(-self.nav_wz_lim, self.nav_wz_lim)
@@ -483,19 +485,25 @@ class AlgSolution:
 
         # ── LiDAR cliff guard ─────────────────────────────────────────────────
         lidar_dbg: dict = {}
-        use_any_lidar_guard = self.use_lidar_vx_guard or self.use_lidar_vy_guard
-        if use_any_lidar_guard and extero is not None and extero.shape[-1] >= self._LIDAR_H:
+        self._last_lidar_dbg = None
+        if extero is not None and extero.shape[-1] >= self._LIDAR_H:
             guard = self._lidar_cliff_guard(extero, device, dtype)
             lidar_dbg = guard
-            # Only apply guard outside stuck-recovery (recovery handles its own speed)
-            not_rec = (~in_recovery).to(dtype=dtype)
-            if self.use_lidar_vx_guard:
-                # not_rec=1 → apply vx_scale;  not_rec=0 (recovery) → multiply by 1 (no change)
-                vx_cmd = vx_cmd * (guard["vx_scale"] * not_rec + in_recovery.to(dtype=dtype))
-            if self.use_lidar_vy_guard:
-                vy_cmd = (vy_cmd + grav_sign * guard["vy_corr"] * not_rec).clamp(
-                    -self.nav_vy_lim, self.nav_vy_lim
-                )
+            self._last_lidar_dbg = {
+                key: (val.item() if torch.is_tensor(val) else float(val))
+                for key, val in guard.items()
+            }
+            use_any_lidar_guard = self.use_lidar_vx_guard or self.use_lidar_vy_guard
+            if use_any_lidar_guard:
+                # Only apply guard outside stuck-recovery (recovery handles its own speed)
+                not_rec = (~in_recovery).to(dtype=dtype)
+                if self.use_lidar_vx_guard:
+                    # not_rec=1 → apply vx_scale;  not_rec=0 (recovery) → multiply by 1 (no change)
+                    vx_cmd = vx_cmd * (guard["vx_scale"] * not_rec + in_recovery.to(dtype=dtype))
+                if self.use_lidar_vy_guard:
+                    vy_cmd = (vy_cmd + grav_sign * guard["vy_corr"] * not_rec).clamp(
+                        -self.nav_vy_lim, self.nav_vy_lim
+                    )
 
         if self.debug_fixed_yaw is not None:
             yaw_cmd = torch.full(
@@ -508,6 +516,13 @@ class AlgSolution:
                 )
 
         cmd = torch.cat([vx_cmd, vy_cmd, yaw_cmd], dim=-1)
+        self._last_nav_cmd = (
+            float(cmd[0, 0].item()),
+            float(cmd[0, 1].item()),
+            float(cmd[0, 2].item()),
+        )
+        self._last_gravity_y = float(gravity_y[0, 0].item())
+        self._last_gravity_x = float(gravity_x[0, 0].item())
         self._debug_step += 1
         if self._debug_step % 50 == 1:
             lidar_str = ""
@@ -538,6 +553,37 @@ class AlgSolution:
             )
 
         return cmd
+
+    def get_video_overlay_lines(self) -> list[str]:
+        """Short HUD lines for video overlay (nav state + last velocity command)."""
+        if self.x_est is None:
+            return []
+        lines = [
+            f"x={self.x_est[0, 0].item():.2f}  "
+            f"y={self.y_est[0, 0].item():+.3f}  "
+            f"yaw={self.yaw_est[0, 0].item():+.3f}",
+        ]
+        if hasattr(self, "_last_nav_cmd"):
+            vx, vy, yaw = self._last_nav_cmd
+            lines.append(f"cmd=({vx:.2f}, {vy:+.3f}, {yaw:+.3f})")
+        if hasattr(self, "_last_gravity_y"):
+            lines.append(
+                f"grav_y={self._last_gravity_y:+.3f}  grav_x={self._last_gravity_x:+.3f}"
+            )
+        lidar = getattr(self, "_last_lidar_dbg", None)
+        if lidar:
+            lines.append(
+                "hs f/fl/fr/l/r=("
+                f"{lidar['front_val']:.2f}/"
+                f"{lidar['front_left_val']:.2f}/"
+                f"{lidar['front_right_val']:.2f}/"
+                f"{lidar['left_val']:.2f}/"
+                f"{lidar['right_val']:.2f})"
+            )
+            lines.append(
+                f"lidar vx_sc={lidar['vx_scale']:.2f}  vy_co={lidar['vy_corr']:+.3f}"
+            )
+        return lines
 
     def _extract_policy_obs(self, obs, action_dim) -> torch.Tensor:
         proprio = obs["proprio"].to(self.device)
@@ -615,29 +661,24 @@ class AlgSolution:
         proprio = obs["proprio"].to(self.device)
         action_dim = (int(proprio.shape[-1]) - 12) // 3
 
-        # Cache extero only when any LiDAR guard is enabled.
-        if self.use_lidar_vx_guard or self.use_lidar_vy_guard:
-            raw_extero = obs.get("extero", None)
-            if raw_extero is not None:
-                self._extero = raw_extero.to(self.device, dtype=torch.float32)
-                # Sanity check on first step: upper-pointing rays that miss terrain
-                # return -inf. Filter out non-finite values and inspect downward rays.
-                if self._debug_step == 0:
-                    ch0_vals = self._extero[0, :360]
-                    finite_mask = torch.isfinite(ch0_vals)
-                    if finite_mask.any():
-                        mean_val = ch0_vals[finite_mask].mean().item()
-                        if mean_val > 1.5:
-                            print(
-                                f"[lidar WARNING] ch0 mean={mean_val:.2f} — rays may be missing terrain "
-                                f"(check mesh_prim_paths=['/World/ground'] in envs_base_cfg.py)"
-                            )
-                        else:
-                            print(f"[lidar OK] ch0 mean on init={mean_val:.3f} (flat terrain ≈ 0.10)")
+        # Cache extero whenever available (LiDAR guard + video HUD debug).
+        raw_extero = obs.get("extero", None)
+        if raw_extero is not None:
+            self._extero = raw_extero.to(self.device, dtype=torch.float32)
+            if self._debug_step == 0:
+                ch0_vals = self._extero[0, :360]
+                finite_mask = torch.isfinite(ch0_vals)
+                if finite_mask.any():
+                    mean_val = ch0_vals[finite_mask].mean().item()
+                    if mean_val > 1.5:
+                        print(
+                            f"[lidar WARNING] ch0 mean={mean_val:.2f} — rays may be missing terrain "
+                            f"(check mesh_prim_paths=['/World/ground'] in envs_base_cfg.py)"
+                        )
                     else:
-                        print("[lidar WARNING] all ch0 rays returned inf — terrain mesh not found")
-            else:
-                self._extero = None
+                        print(f"[lidar OK] ch0 mean on init={mean_val:.3f} (flat terrain ≈ 0.10)")
+                else:
+                    print("[lidar WARNING] all ch0 rays returned inf — terrain mesh not found")
         else:
             self._extero = None
 
