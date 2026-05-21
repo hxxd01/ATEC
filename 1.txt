@@ -20,9 +20,15 @@ python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper
 python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_3200.pt   --headless
 
 #demo里面评分
-cd /home/ubuntu/ATEC2026_Simulation_Challenge && python scripts/play_atec_task.py   --task ATEC-TaskA-B2Piper   --headless   --enable_cameras  --video --video_length 20000 --debug
+cd /home/ubuntu/ATEC2026_Simulation_Challenge && python scripts/play_atec_task.py   --task ATEC-TaskA-B2Piper   --headless   --enable_cameras  --video --video_length 20000 --debug  
+
+
+python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --headless --debug --device cuda:1 --video --video_length 2000
 
 
 #看tensorboard
 ssh -L 6007:127.0.0.1:6007 ubuntu@117.50.75.119
 tensorboard --logdir=/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl
+
+
+--device cuda:1

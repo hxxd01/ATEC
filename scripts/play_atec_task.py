@@ -75,6 +75,9 @@ if args_cli.video:
 # -----------------------------------------------------------------------------
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+if hasattr(solution, "set_device"):
+    solution.set_device(args_cli.device)
+    print(f"[play] AlgSolution device -> {args_cli.device}", flush=True)
 
 # -----------------------------------------------------------------------------
 # Imports AFTER simulation_app is created (IsaacLab pattern)
@@ -228,7 +231,7 @@ def play() -> tuple[float, float]:
     obs, _ = env.reset()
     print("[play] env.reset() done, entering control loop.", flush=True)
     if hasattr(solution, "reset"):
-        solution.reset()
+        solution.reset(task=args_cli.task)
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
@@ -251,7 +254,7 @@ def play() -> tuple[float, float]:
             if giveup:
                 break
             actions = resp["action"]
-            actions = torch.tensor(actions, dtype=torch.float32, device='cuda').view(1, -1)
+            actions = torch.tensor(actions, dtype=torch.float32, device=args_cli.device).view(1, -1)
 
             if overlay_wrapper is not None:
                 overlay_wrapper.set_overlay_lines(
