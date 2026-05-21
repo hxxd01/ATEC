@@ -26,6 +26,12 @@ parser = argparse.ArgumentParser(description="Play Atec Tasks (ENV only, no RL).
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--no-video-overlay",
+    action="store_true",
+    default=False,
+    help="Disable HUD text (vel/reward/time) on recorded videos.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
@@ -81,7 +87,7 @@ from isaaclab.utils.dict import print_dict  # noqa: E402
 
 import atec_rl_lab.tasks  # noqa: F401, E402 (register your tasks)
 from isaaclab_tasks.utils import parse_env_cfg
-from rl_utils import camera_follow
+from rl_utils import camera_follow, RenderOverlayWrapper
 
 
 def _disable_heavy_sensors(env_cfg) -> None:
@@ -96,6 +102,44 @@ def _disable_heavy_sensors(env_cfg) -> None:
         env_cfg.observations.extero = None
         env_cfg.observations.image = None
     print("[play] --fast: disabled cameras + lidar (proprio-only).", flush=True)
+
+
+def _build_video_overlay_lines(
+    obs,
+    env,
+    solution,
+    timestep: int,
+    total_episode_reward: float,
+    total_elapsed_time: float,
+) -> list[str]:
+    """Build HUD lines matching --debug terminal output."""
+    lines = [
+        f"step={timestep}",
+        f"score={total_episode_reward:.2f}",
+        f"time={total_elapsed_time:.2f}s",
+    ]
+
+    proprio = obs.get("proprio") if isinstance(obs, dict) else None
+    if proprio is not None:
+        pr = proprio[0] if isinstance(proprio, torch.Tensor) and proprio.ndim == 2 else proprio.flatten()
+        if isinstance(pr, torch.Tensor):
+            pr = pr.detach().cpu()
+            bv = pr[:3].tolist()
+            lines.append(f"body_v=({bv[0]:+.3f},{bv[1]:+.3f},{bv[2]:+.3f})")
+
+    try:
+        robot = env.unwrapped.scene.articulations["robot"]
+        wv = robot.data.root_lin_vel_w[0].detach().cpu().tolist()
+        speed_xy = (wv[0] ** 2 + wv[1] ** 2) ** 0.5
+        lines.append(f"world_v=({wv[0]:+.3f},{wv[1]:+.3f},{wv[2]:+.3f})")
+        lines.append(f"speed_xy={speed_xy:.3f}")
+    except (AttributeError, KeyError):
+        pass
+
+    if hasattr(solution, "get_video_overlay_lines"):
+        lines.extend(solution.get_video_overlay_lines())
+
+    return lines
 
 
 def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_time: float) -> None:
@@ -152,10 +196,18 @@ def play() -> tuple[float, float]:
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
+    overlay_wrapper = None
+    use_video_overlay = args_cli.video and not args_cli.no_video_overlay
+
     # -------------------------------------------------------------------------
     # Optional: video wrapper
     # -------------------------------------------------------------------------
     if args_cli.video:
+        if use_video_overlay:
+            overlay_wrapper = RenderOverlayWrapper(env)
+            env = overlay_wrapper
+            print("[INFO] Video HUD overlay enabled (top-left corner).", flush=True)
+
         # Put videos in ./logs/videos/play by default (edit as you like)
         video_kwargs = {
             "video_folder": os.path.abspath(os.path.join("logs", "videos", args_cli.task, "play")),
@@ -200,6 +252,19 @@ def play() -> tuple[float, float]:
                 break
             actions = resp["action"]
             actions = torch.tensor(actions, dtype=torch.float32, device='cuda').view(1, -1)
+
+            if overlay_wrapper is not None:
+                overlay_wrapper.set_overlay_lines(
+                    _build_video_overlay_lines(
+                        obs,
+                        env,
+                        solution,
+                        timestep,
+                        total_episode_reward,
+                        total_elapsed_time,
+                    )
+                )
+
             obs, reward, terminated, truncated, info = env.step(actions)
             if not is_task_e:
                 camera_follow(env)
