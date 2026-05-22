@@ -231,11 +231,7 @@ class AlgSolution:
 
         front_val, box_lidar = self._front_lidar_metric(self._extero)
         box_geom = self._box_in_front_geometric(x, y, yaw, box_x, box_y)
-        # Local Isaac Lab RayCaster only hits ground; eval may include box in mesh.
-        if self._box is not None:
-            box_in_front = bool(box_geom.all())
-        else:
-            box_in_front = box_lidar
+        box_in_front = box_lidar or bool(box_geom.all())
         self._last_front_lidar = front_val
         self._last_box_lidar = bool(box_lidar)
         self._last_box_geom = bool(box_geom.all())

@@ -99,7 +99,7 @@ class AlgSolution:
         self.nav_init_world_x = -141.0
         self.nav_goal_x = 145.0
         self.nav_goal_slow_x = 125.0  # start easing vx before the finish strip
-        self.nav_k_lat = 1.0  # y_est lateral P gain (0=off; was 1.0, unreliable on slopes/stairs)
+        self.nav_k_lat = 1.0  # y_est lateral P gain on flat; scaled down on slopes/stairs
         self.nav_y_leak_len = 2.0  # leaky y_est: ~37% memory left after 2 m forward travel
         self.nav_vy_lim = 0.45 #横向速度命令限幅
         self.nav_k_yaw = 0.8 #角度反馈
@@ -133,15 +133,27 @@ class AlgSolution:
 
         # Target vx per terrain category (tune freely)
         self.nav_vx_by_terrain_kind = dict(
-            flat=2.0,
-            random_rough=1.2,
+            flat=3.0,
+            random_rough=2.0,
             hf_pyramid_slope=1.0,
             hf_pyramid_slope_inv=1.0,
             pyramid_stairs=0.7,
             pyramid_stairs_inv=0.7,
         )
+        # y_est P gain multiplier per strip (slopes/stairs: integration drift → lower weight).
+        self.nav_k_lat_by_terrain_kind = dict(
+            flat=1.0,
+            random_rough=1.0,
+            hf_pyramid_slope=0.0,
+            hf_pyramid_slope_inv=0.0,
+            pyramid_stairs=0.0,
+            pyramid_stairs_inv=0.0,
+        )
         vx_per_strip = [
             float(self.nav_vx_by_terrain_kind[k]) for k in self._TASK_A_STRIP_TERRAINS
+        ]
+        k_lat_per_strip = [
+            float(self.nav_k_lat_by_terrain_kind[k]) for k in self._TASK_A_STRIP_TERRAINS
         ]
         strip_starts = [
             self._TASK_A_STRIP_X0 + i * self._TASK_A_STRIP_DX for i in range(len(vx_per_strip))
@@ -156,9 +168,17 @@ class AlgSolution:
             device=self.device,
             dtype=torch.float32,
         ).view(1, -1)
-        # 1.0 on pyramid_stairs_inv strips (x≈80, 120): flip gravity + LiDAR lateral sign.
-        self._task_a_strip_is_stairs_inv_t = torch.tensor(
-            [1.0 if k == "pyramid_stairs_inv" else 0.0 for k in self._TASK_A_STRIP_TERRAINS],
+        self._task_a_strip_k_lat_t = torch.tensor(
+            k_lat_per_strip,
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, -1)
+        # 1.0 on inverted strips: hf_pyramid_slope_inv (x≈0,40) + pyramid_stairs_inv (x≈80,120)
+        self._task_a_strip_is_inv_t = torch.tensor(
+            [
+                1.0 if k in ("pyramid_stairs_inv", "hf_pyramid_slope_inv") else 0.0
+                for k in self._TASK_A_STRIP_TERRAINS
+            ],
             device=self.device,
             dtype=torch.float32,
         ).view(1, -1)
@@ -320,7 +340,7 @@ class AlgSolution:
 
         # Lateral steering: diff > 0 → right dropped more → push left (vy_corr < 0)
         diff = left_val - right_val
-        vy_corr = (-diff * 0.55).clamp(-0.35, 0.35)
+        vy_corr = (-diff * 0.6).clamp(-0.5, 0.5)
 
         return {
             "vx_scale":  vx_scale,
@@ -430,25 +450,29 @@ class AlgSolution:
 
         vx_cmd = self._vx_cmd_from_strip(self.x_est, dtype).to(device=device)
         strip_idx = self._task_a_strip_indices(self.x_est).long().reshape(-1)
-        stairs_inv_mask = (
-            self._task_a_strip_is_stairs_inv_t.to(device=device, dtype=dtype)
+        k_lat_scale = (
+            self._task_a_strip_k_lat_t.to(device=device, dtype=dtype)
             .squeeze(0)[strip_idx]
             .view(b, 1)
         )
-        # +1 on normal strips; −1 on pyramid_stairs_inv (right-wall geometry → flip corrections).
+        stairs_inv_mask = (
+        self._task_a_strip_is_inv_t.to(device=device, dtype=dtype)
+        .squeeze(0)[strip_idx]
+        .view(b, 1)
+        )
+        # +1 on normal strips; −1 on inverted pyramid / inverted stairs (flip grav + LiDAR vy).
         grav_sign = 1.0 - 2.0 * stairs_inv_mask
 
         # Three-term lateral correction:
         #   1. y_est position feedback (unreliable on slopes, but still useful on flat)
         #   2. vy_body velocity damping (direct, no integration error)
-        #   3. gravity_y feed-forward (sign flipped on pyramid_stairs_inv)
+        #   3. gravity_y feed-forward (sign flipped when grav_sign = −1)
         vy_cmd = (
-            -self.nav_k_lat * self.y_est
+            -self.nav_k_lat * k_lat_scale * self.y_est
             - 0.4 * vy_body
             #- grav_sign * gravity_y
         ).clamp(-self.nav_vy_lim, self.nav_vy_lim)
-        # +yaw_cmd = turn left. Normal: left lean → subtract yaw_grav → turn right.
-        # pyramid_stairs_inv: grav_sign=−1 → add yaw_grav → turn left toward centre.
+        # +yaw_cmd = turn left. inverted strips: grav_sign=−1 flips yaw_grav correction.
         yaw_grav = (0.4 * gravity_y).clamp(-0.1, 0.1)
         yaw_grav = torch.where(gravity_y.abs() > 0.03, yaw_grav, torch.zeros_like(yaw_grav))
         yaw_cmd = (
@@ -549,6 +573,7 @@ class AlgSolution:
                 f"wz={wz[0,0].item():+5.3f}  "
                 f"| cmd=({vx_cmd[0,0].item():.2f}, {vy_cmd[0,0].item():+.3f}, {yaw_cmd[0,0].item():+.3f})"
                 f"  inv={stairs_inv_mask[0,0].item():.0f}"
+                f"  k_lat={k_lat_scale[0,0].item():.2f}"
                 + lidar_str
             )
 

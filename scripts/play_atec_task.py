@@ -62,9 +62,11 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 _is_task_b = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
+_is_task_d = isinstance(args_cli.task, str) and "TaskD" in args_cli.task
 if args_cli.fast is None:
     # Task B: fast by default (proprio-only). Use --full-obs to keep 4 cameras + lidar.
-    args_cli.fast = _is_task_b and not args_cli.full_obs
+    # Task D: need extero (LiDAR) for box approach — do not strip sensors unless --fast.
+    args_cli.fast = _is_task_b and not args_cli.full_obs and not _is_task_d
 
 # RecordVideo needs Kit rendering; does NOT need 4× observation cameras (those slow reset).
 if args_cli.video:
@@ -105,6 +107,17 @@ def _disable_heavy_sensors(env_cfg) -> None:
         env_cfg.observations.extero = None
         env_cfg.observations.image = None
     print("[play] --fast: disabled cameras + lidar (proprio-only).", flush=True)
+
+
+def _disable_cameras_keep_lidar(env_cfg) -> None:
+    """Task D: keep LiDAR extero but skip 4 observation cameras (faster reset, no Kit cameras)."""
+    if hasattr(env_cfg, "scene"):
+        env_cfg.scene.head_camera = None
+        env_cfg.scene.ee_camera = None
+        env_cfg.scene.ee_dual_camera = None
+    if hasattr(env_cfg, "observations"):
+        env_cfg.observations.image = None
+    print("[play] Task D: cameras off, lidar kept (use --full-obs for all sensors).", flush=True)
 
 
 def _build_video_overlay_lines(
@@ -190,6 +203,8 @@ def play() -> tuple[float, float]:
 
     if args_cli.fast:
         _disable_heavy_sensors(env_cfg)
+    elif _is_task_d and not args_cli.full_obs:
+        _disable_cameras_keep_lidar(env_cfg)
     else:
         print("[play] full-obs: 4 cameras + lidar enabled (reset may take several minutes).", flush=True)
 
@@ -226,12 +241,20 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     # Reset
     # -------------------------------------------------------------------------
-    fast_hint = "fast/proprio-only" if args_cli.fast else "full-obs (4 cameras + lidar, SLOW)"
+    if args_cli.fast:
+        fast_hint = "fast/proprio-only"
+    elif _is_task_d and not args_cli.full_obs:
+        fast_hint = "Task D lidar-only (no obs cameras)"
+    else:
+        fast_hint = "full-obs (4 cameras + lidar, SLOW)"
     print(f"[play] env.reset() starting ({fast_hint}) ...", flush=True)
     obs, _ = env.reset()
     print("[play] env.reset() done, entering control loop.", flush=True)
     if hasattr(solution, "reset"):
         solution.reset(task=args_cli.task)
+    if isinstance(args_cli.task, str) and "TaskD" in args_cli.task and hasattr(solution, "bind_env"):
+        solution.bind_env(env)
+        print("[play] Task D: bind_env() — nav uses sim robot/box pose.", flush=True)
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
@@ -269,7 +292,7 @@ def play() -> tuple[float, float]:
                 )
 
             obs, reward, terminated, truncated, info = env.step(actions)
-            if not is_task_e:
+            if not is_task_e and not args_cli.headless:
                 camera_follow(env)
 
             sim_dt = info["Step_dt"]

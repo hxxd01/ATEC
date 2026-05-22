@@ -29,8 +29,14 @@ def command_levels_lin_vel(
     if env.common_step_counter == 0:
         env._original_vel_x = torch.tensor(base_velocity_ranges.lin_vel_x, device=env.device)
         env._original_vel_y = torch.tensor(base_velocity_ranges.lin_vel_y, device=env.device)
-        env._initial_vel_x = env._original_vel_x * range_multiplier[0]
-        env._final_vel_x = env._original_vel_x * range_multiplier[1]
+        env._initial_vel_x = torch.tensor(
+            [env._original_vel_x[0], env._original_vel_x[1] * range_multiplier[0]],
+            device=env.device,
+        )
+        env._final_vel_x = torch.tensor(
+            [env._original_vel_x[0], env._original_vel_x[1] * range_multiplier[1]],
+            device=env.device,
+        )
         env._initial_vel_y = env._original_vel_y * range_multiplier[0]
         env._final_vel_y = env._original_vel_y * range_multiplier[1]
 
@@ -46,12 +52,30 @@ def command_levels_lin_vel(
 
         # If the tracking reward is above 80% of the maximum, increase the range of commands
         if torch.mean(episode_sums[env_ids]) / env.max_episode_length_s > 0.8 * reward_term_cfg.weight:
-            new_vel_x = torch.tensor(base_velocity_ranges.lin_vel_x, device=env.device) + delta_command
-            new_vel_y = torch.tensor(base_velocity_ranges.lin_vel_y, device=env.device) + delta_command
+            cur_vel_x = torch.tensor(base_velocity_ranges.lin_vel_x, device=env.device)
+            cur_vel_y = torch.tensor(base_velocity_ranges.lin_vel_y, device=env.device)
 
-            # Clamp to ensure we don't exceed final ranges
-            new_vel_x = torch.clamp(new_vel_x, min=env._final_vel_x[0], max=env._final_vel_x[1])
-            new_vel_y = torch.clamp(new_vel_y, min=env._final_vel_y[0], max=env._final_vel_y[1])
+            # Forward-only vx (min >= 0): pin min, only expand max toward final upper bound
+            if env._final_vel_x[0].item() >= 0.0:
+                new_vel_x = cur_vel_x.clone()
+                new_vel_x[0] = env._final_vel_x[0]
+                new_vel_x[1] = torch.clamp(
+                    cur_vel_x[1] + delta_command[1],
+                    min=env._final_vel_x[0],
+                    max=env._final_vel_x[1],
+                )
+            else:
+                new_vel_x = torch.clamp(
+                    cur_vel_x + delta_command,
+                    min=env._final_vel_x[0],
+                    max=env._final_vel_x[1],
+                )
+
+            new_vel_y = torch.clamp(
+                cur_vel_y + delta_command,
+                min=env._final_vel_y[0],
+                max=env._final_vel_y[1],
+            )
 
             # Update ranges
             base_velocity_ranges.lin_vel_x = new_vel_x.tolist()
