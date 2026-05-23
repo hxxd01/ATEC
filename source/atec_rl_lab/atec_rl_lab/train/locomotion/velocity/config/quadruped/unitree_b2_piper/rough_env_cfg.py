@@ -127,9 +127,9 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.terminations.illegal_contact = None
 
         # Commands: train directly on full range (no velocity curriculum)
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 4.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-1, 1)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1, 1)
 
         self.curriculum.command_levels_lin_vel = None
         self.curriculum.command_levels_ang_vel = None

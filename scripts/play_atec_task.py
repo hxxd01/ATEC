@@ -250,6 +250,8 @@ def play() -> tuple[float, float]:
     print(f"[play] env.reset() starting ({fast_hint}) ...", flush=True)
     obs, _ = env.reset()
     print("[play] env.reset() done, entering control loop.", flush=True)
+    if args_cli.video and not is_task_e:
+        camera_follow(env)
     if hasattr(solution, "reset"):
         solution.reset(task=args_cli.task)
     if isinstance(args_cli.task, str) and "TaskD" in args_cli.task and hasattr(solution, "bind_env"):
@@ -292,7 +294,7 @@ def play() -> tuple[float, float]:
                 )
 
             obs, reward, terminated, truncated, info = env.step(actions)
-            if not is_task_e and not args_cli.headless:
+            if not is_task_e and (args_cli.video or not args_cli.headless):
                 camera_follow(env)
 
             sim_dt = info["Step_dt"]
