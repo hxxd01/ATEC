@@ -81,3 +81,16 @@ python scripts/train_nav_taskd_student.py \
   --max_iter 8000 \
   --device cuda:0 \
   --headless
+
+python scripts/collect_train_bc.py \
+  --task ATEC-TaskD-B2Piper \
+  --num_envs 32 \
+  --total_steps 4000 \
+  --train_every_steps 5 \
+  --batch_envs 32 \
+  --replay_capacity 128 \
+  --min_episode_score 0.0 \
+  --min_episode_len 8 \
+  --device cuda:0 \
+  --headless \
+  --enable_cameras

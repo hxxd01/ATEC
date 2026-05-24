@@ -144,6 +144,15 @@ def _disable_cameras_keep_lidar(env_cfg) -> None:
     print("[play] Task D: cameras off, lidar kept (use --full-obs for all sensors).", flush=True)
 
 
+def _disable_lidar_keep_cameras(env_cfg) -> None:
+    """Task D: keep camera observations, disable LiDAR extero."""
+    if hasattr(env_cfg, "scene"):
+        env_cfg.scene.lidar_sensor = None
+    if hasattr(env_cfg, "observations"):
+        env_cfg.observations.extero = None
+    print("[play] Task D: lidar off, observation cameras kept.", flush=True)
+
+
 def _build_video_overlay_lines(
     obs,
     env,
@@ -182,7 +191,7 @@ def _build_video_overlay_lines(
     return lines
 
 
-def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_time: float) -> None:
+def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_time: float, solution=None) -> None:
     """Print reward/time and measured velocities (after env.step)."""
     print(f"total_episode_reward:{total_episode_reward: .2f}")
     print(f"total_elapsed_time:{total_elapsed_time: .2f}")
@@ -208,6 +217,12 @@ def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_tim
         print(f"horizontal_speed_xy (world): {speed_xy: .3f}")
     except (AttributeError, KeyError):
         pass
+    if solution is not None and hasattr(solution, "get_video_overlay_lines"):
+        try:
+            for line in solution.get_video_overlay_lines():
+                print(f"[policy] {line}")
+        except Exception:
+            pass
 
 
 def _print_done_reason(terminated, truncated, info, env=None) -> None:
@@ -390,7 +405,12 @@ def play() -> tuple[float, float]:
     if args_cli.fast:
         _disable_heavy_sensors(env_cfg)
     elif _is_task_d and not args_cli.full_obs:
-        _disable_cameras_keep_lidar(env_cfg)
+        # Task D default previously kept LiDAR only for scripted navigation.
+        # For vision policies, if cameras are enabled, prefer camera obs and disable LiDAR.
+        if args_cli.enable_cameras:
+            _disable_lidar_keep_cameras(env_cfg)
+        else:
+            _disable_cameras_keep_lidar(env_cfg)
     else:
         print("[play] full-obs: 4 cameras + lidar enabled (reset may take several minutes).", flush=True)
 
@@ -430,7 +450,10 @@ def play() -> tuple[float, float]:
     if args_cli.fast:
         fast_hint = "fast/proprio-only"
     elif _is_task_d and not args_cli.full_obs:
-        fast_hint = "Task D lidar-only (no obs cameras)"
+        if args_cli.enable_cameras:
+            fast_hint = "Task D camera-only (obs cameras, no lidar)"
+        else:
+            fast_hint = "Task D lidar-only (no obs cameras)"
     else:
         fast_hint = "full-obs (4 cameras + lidar, SLOW)"
     print(f"[play] env.reset() starting ({fast_hint}) ...", flush=True)
@@ -510,7 +533,7 @@ def play() -> tuple[float, float]:
                 total_elapsed_time += dt  # wall clock time as fallback
 
             if args_cli.debug:
-                _debug_print_motion(obs, env, total_episode_reward, total_elapsed_time)
+                _debug_print_motion(obs, env, total_episode_reward, total_elapsed_time, solution=solution)
 
             done = (terminated.item() or truncated.item())
             if done:

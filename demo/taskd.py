@@ -7,6 +7,8 @@ class AlgSolution:
 
     ROBOT_SPAWN_XY = (-3.0, 0.0)
     BOX_SPAWN_XY = (-3.0, 1.6)
+    BOX_SPAWN_Z = 0.5
+    FALL_MIN_HEIGHT = 0.25
     PUSH_YAW = 0.0
     BOX_HALF_X = 0.40
     BOX_HALF_Y = 0.50
@@ -57,6 +59,7 @@ class AlgSolution:
         )
 
         self.dt = 0.02
+        self.high_level_hz = 10.0
         self.nav_k_yaw = 1.2
         self.nav_k_wz = 0.25
         self.nav_wz_lim = 0.35
@@ -67,10 +70,12 @@ class AlgSolution:
         self.push_k_yaw = 0.9          # follow box heading (rad/s per rad error)
         self.push_k_lidar_skew = 0.5   # forward push: (fl - fr) → yaw
         self.push_k_lateral = 0.35     # forward push: body y offset → vy
+        self.push_k_world_y_align = 0.6  # forward push: keep robot_y close to box_y
         self.push_k_lateral_sidestep = 0.45  # lateral push: body y offset → vy
         self.push_k_lidar_right = 0.35  # lateral push: right radar (fallback, no sim box)
         self.push_k_lidar_lat_skew = 0.4  # lateral push: (fr - fl) → yaw
         self.push_k_longitudinal = 0.35   # lateral push: keep box alongside → vx
+        self.push_k_world_x_align = 0.6   # lateral push: keep robot_x close to box_x
         self.push_lateral_lidar_target = 0.14  # desired (right - ground) when in contact
         self.push_target_bx_body = 0.35  # want box slightly ahead during lateral push
         self.push_lateral_vy_min = 0.75  # never drop below this |vy| during lateral push
@@ -89,24 +94,75 @@ class AlgSolution:
         #   lateral push (axis y): box yaw + geom; optional fr/fl/right lidar
         # ------------------------------------------------------------------
         self.nav_steps = [
-            dict(name="retreat",         axis="x", sign=-1, dist=1.0, vx=-2.0, vy=0.0),
-            dict(name="sidestep_left",  axis="y", sign=+1, dist=2.0, vx=0.0,  vy=1.0),
-            dict(name="advance",        axis="x", sign=+1, dist=1.0, vx=2.0,  vy=0.0),
-            dict(name="sidestep_right", axis="y", sign=-1, dist=3.0, vx=1.0,  vy=-1.0, push=True),
+            dict(name="retreat",         axis="x", sign=-0.7, dist=1.0, vx=-2.0, vy=0.0),
+            dict(name="sidestep_left",  axis="y", sign=+1, dist=2.1, vx=0.0,  vy=1.0),
+            # match_box_x_tol: move until |robot_x - box_x| <= tol (dist ignored for this step)
+            dict(name="advance",        axis="x", sign=+0.7, dist=1.0, vx=2.0,  vy=0.0, match_box_x_tol=0.15),
+            dict(
+                name="sidestep_right",
+                axis="y",
+                sign=-1,
+                dist=2.0,
+                vx=0.0,
+                vy=-1.0,
+                push=True,
+                align_x_with_box=True,
+            ),
             dict(name="retreat2",       axis="x", sign=-1, dist=1.0, vx=-2.0, vy=0.0),
             dict(name="sidestep_right2", axis="y", sign=-1, dist=0.6, vx=0.0, vy=-1.0),
-            dict(name="advance2", axis="x", sign=+1, dist=4.0, vx=1.5, vy=0.0, push=True),
+            dict(
+                name="advance2",
+                axis="x",
+                sign=+1,
+                dist=4.0,
+                vx=1.5,
+                vy=0.0,
+                push=True,
+                align_y_with_box=True,
+                # Keep this push conservative; stop earlier to avoid over-dropping the box.
+                box_x_slow_start=-1.7,  # start slowing down when robot pos.x approaches this value
+                box_x_stop=-1.25,       # stop/push-ready when robot pos.x reaches this value
+                stop_tol=0.08,
+                wait_after_box_drop_z=-0.35,  # transition only after box drops below this z.
+                wait_after_box_drop_s=1.0,    # then hold still >= 1s before entering final stages.
+            ),
+
+            dict(
+                name="final",
+                axis="x",
+                sign=+1,
+                dist=3.0,
+                vx=0.3,
+                vy=0.0,
+                # Crossing step: do NOT use push correction here, just go straight and slow.
+                push=False,
+            ),
         ]
+        '''self.nav_steps = [
+            dict(name="retreat1",         axis="xy", sign=-1, dist=2.23, vx=-1.0, vy=2.0),
+            #dict(name="sidestep_left",  axis="y", sign=+1, dist=2.0, vx=0.0,  vy=1.0),
+            #dict(name="advance",        axis="x", sign=+1, dist=1.0, vx=2.0,  vy=0.0), 
+            #dict(name="sidestep_right", axis="y", sign=-1, dist=3.0, vx=1.0,  vy=-1.0, push=True),
+            #dict(name="retreat2",       axis="x", sign=-1, dist=1.0, vx=-2.0, vy=0.0),
+            #dict(name="sidestep_right2", axis="y", sign=-1, dist=0.6, vx=0.0, vy=-1.0),
+            #dict(name="advance2", axis="x", sign=+1, dist=4.0, vx=1.5, vy=0.0, push=True),
+        ]'''
 
         self._reset_nav_state()
 
     def _reset_nav_state(self) -> None:
-        self.phase = "push_ready" if not self.nav_steps else self.nav_steps[0]["name"]
-        self._nav_step_idx = 0
+        # Per-env navigation state (allocated lazily on first batch).
+        self._pe_batch_size = 0
+        self._nav_step_idx = None
+        self._nav_step_steps = None
         self._nav_origin = None
-        self._nav_step_steps = 0
+        self._nav_origin_valid = None
+        self._nav_step_target = None
+        self._step_wait_counter = None
+        self._step_wait_armed = None
+        self._approach_done_batch = None
+        self.phase = "push_ready" if not self.nav_steps else self.nav_steps[0]["name"]
         self._nav_step_progress = 0.0
-        self._nav_step_target = 0.0
 
         self.x_est = None
         self.y_est = None
@@ -117,7 +173,15 @@ class AlgSolution:
         self._extero = None
         self._debug_step = 0
         self._last_nav_cmd = (0.0, 0.0, 0.0)
+        self._last_high_level_cmd_batch = None
+        self._hl_cmd_step_counter = 0
+        self._hl_cmd_hold_steps = max(1, int(round(1.0 / (self.high_level_hz * self.dt))))
+        self._hl_cmd_cached = None
+        self._hl_cmd_force_refresh = True
+        self._last_pos_xy = (self.ROBOT_SPAWN_XY[0], self.ROBOT_SPAWN_XY[1])
         self._last_box_xy = (0.0, 0.0)
+        self._last_box_z = self.BOX_SPAWN_Z
+        self._last_root_z = self.FALL_MIN_HEIGHT
         self._last_front_lidar = 0.0
         self._last_box_in_front = False
         self._last_box_geom = False
@@ -131,8 +195,56 @@ class AlgSolution:
         self._last_box_rel_yaw = 0.0
         self._last_push_skew = 0.0
         self._last_push_right_err = 0.0
+        self._last_align_x_err = 0.0
+        self._last_align_x_delta = 0.0
+        self._last_align_y_delta = 0.0
         self._push_mode = "none"
-        self._approach_done = False
+        self._last_stage_idx_batch = None
+
+    def _ensure_pe_state(self, batch_size: int, device, dtype) -> None:
+        if (
+            self._nav_step_idx is not None
+            and self._pe_batch_size == batch_size
+            and self._nav_step_idx.device == device
+        ):
+            return
+        self._pe_batch_size = batch_size
+        self._nav_step_idx = torch.zeros((batch_size,), device=device, dtype=torch.long)
+        self._nav_step_steps = torch.zeros((batch_size,), device=device, dtype=torch.long)
+        self._nav_origin = torch.zeros((batch_size, 2), device=device, dtype=dtype)
+        self._nav_origin_valid = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+        self._nav_step_target = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        self._step_wait_counter = torch.zeros((batch_size,), device=device, dtype=torch.long)
+        self._step_wait_armed = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+        self._approach_done_batch = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+
+    @property
+    def _approach_done(self) -> bool:
+        if self._approach_done_batch is None:
+            return False
+        return bool(self._approach_done_batch.all().item())
+
+    def get_stage_batch(self) -> list[int] | None:
+        if self._nav_step_idx is None:
+            return None
+        return self._nav_step_idx.detach().cpu().tolist()
+
+    def _phase_name_for_env(self, env_idx: int) -> str:
+        if self._nav_step_idx is None:
+            return self.phase
+        step_idx = int(self._nav_step_idx[env_idx].item())
+        if step_idx >= len(self.nav_steps):
+            return "push_ready"
+        return self.nav_steps[step_idx]["name"]
+
+    def _sync_phase_from_env0(self) -> None:
+        if self._nav_step_idx is None:
+            return
+        self.phase = self._phase_name_for_env(0)
+        if self._nav_step_idx.numel() > 1:
+            unique = self._nav_step_idx.unique()
+            if unique.numel() > 1:
+                self.phase = f"{self.phase}+mixed"
 
     def set_device(self, device: str) -> None:
         self.device = device
@@ -149,6 +261,25 @@ class AlgSolution:
 
     def reset(self, **kwargs):
         self._reset_nav_state()
+
+    def reset_env_batch(self, env_mask: torch.Tensor) -> None:
+        """Reset navigation state for env indices that finished and auto-reset in sim."""
+        if self._nav_step_idx is None or env_mask is None:
+            return
+        if not isinstance(env_mask, torch.Tensor):
+            env_mask = torch.as_tensor(env_mask, device=self._nav_step_idx.device, dtype=torch.bool)
+        env_mask = env_mask.view(-1).to(device=self._nav_step_idx.device, dtype=torch.bool)
+        if env_mask.shape[0] != self._nav_step_idx.shape[0]:
+            return
+        if not bool(env_mask.any()):
+            return
+        self._nav_step_idx[env_mask] = 0
+        self._nav_step_steps[env_mask] = 0
+        self._nav_origin_valid[env_mask] = False
+        self._step_wait_counter[env_mask] = 0
+        self._step_wait_armed[env_mask] = False
+        self._approach_done_batch[env_mask] = False
+        self._hl_cmd_force_refresh = True
 
     @staticmethod
     def _yaw_from_quat_wxyz(quat: torch.Tensor) -> torch.Tensor:
@@ -198,53 +329,217 @@ class AlgSolution:
         return self.x_est, self.y_est, self.yaw_est
 
     def _current_nav_step(self) -> dict | None:
-        if self._nav_step_idx >= len(self.nav_steps):
+        """Step config for env-0 (debug / overlay)."""
+        if self._nav_step_idx is None:
+            return self.nav_steps[0] if self.nav_steps else None
+        step_idx = int(self._nav_step_idx[0].item())
+        if step_idx >= len(self.nav_steps):
             return None
-        return self.nav_steps[self._nav_step_idx]
+        return self.nav_steps[step_idx]
 
-    def _begin_nav_step(
+    def _begin_nav_step_batch(
         self,
+        mask: torch.Tensor,
         step: dict,
         x: torch.Tensor,
         y: torch.Tensor,
-        box_x: torch.Tensor | None = None,
-        box_y: torch.Tensor | None = None,
+        box_x: torch.Tensor,
+        box_y: torch.Tensor,
     ) -> None:
-        self.phase = step["name"]
-        if self._is_push_step(step) and box_x is not None and box_y is not None:
-            self._nav_origin = box_x.clone() if step["axis"] == "x" else box_y.clone()
+        if not bool(mask.any()):
+            return
+        axis = step.get("axis", "x")
+        if self._is_push_step(step):
+            ox, oy = box_x, box_y
         else:
-            self._nav_origin = x.clone() if step["axis"] == "x" else y.clone()
-        self._nav_step_target = float(step["dist"])
-        self._nav_step_steps = 0
-        self._nav_step_progress = 0.0
+            ox, oy = x, y
+        origin = torch.cat([ox, oy], dim=-1)
+        self._nav_origin[mask] = origin[mask]
+        self._nav_step_target[mask] = float(step["dist"])
+        self._nav_step_steps[mask] = 0
+        self._step_wait_counter[mask] = 0
+        self._step_wait_armed[mask] = False
+        self._nav_origin_valid[mask] = True
 
-    def _nav_progress(
+    def _nav_progress_batch(
         self,
         step: dict,
         x: torch.Tensor,
         y: torch.Tensor,
-        box_x: torch.Tensor | None = None,
-        box_y: torch.Tensor | None = None,
+        box_x: torch.Tensor,
+        box_y: torch.Tensor,
     ) -> torch.Tensor:
-        if self._is_push_step(step) and box_x is not None and box_y is not None:
-            coord = box_x if step["axis"] == "x" else box_y
+        axis = step.get("axis", "x")
+        if self._is_push_step(step):
+            cx, cy = box_x, box_y
         else:
-            coord = x if step["axis"] == "x" else y
-        if step["sign"] > 0:
-            return coord - self._nav_origin
-        return self._nav_origin - coord
+            cx, cy = x, y
 
-    def _advance_nav_step(self) -> None:
-        self._nav_step_idx += 1
-        self._nav_origin = None
-        self._nav_step_steps = 0
-        next_step = self._current_nav_step()
-        if next_step is None:
-            self.phase = "push_ready"
-            self._approach_done = True
+        if axis == "xy":
+            coord = torch.cat([cx, cy], dim=-1)
+            origin = self._nav_origin
+            return torch.linalg.norm(coord - origin, dim=-1, keepdim=True)
+        if axis == "x":
+            coord = cx
+            origin = self._nav_origin[:, 0:1]
         else:
-            self.phase = next_step["name"]
+            coord = cy
+            origin = self._nav_origin[:, 1:2]
+
+        if step["sign"] > 0:
+            return coord - origin
+        return origin - coord
+
+    def _advance_nav_step_batch(self, mask: torch.Tensor) -> None:
+        if not bool(mask.any()):
+            return
+        self._nav_step_idx[mask] += 1
+        self._nav_origin_valid[mask] = False
+        self._nav_step_steps[mask] = 0
+        self._step_wait_counter[mask] = 0
+        self._step_wait_armed[mask] = False
+        finished = mask & (self._nav_step_idx >= len(self.nav_steps))
+        if bool(finished.any()):
+            self._approach_done_batch[finished] = True
+
+    def _compute_drop_wait_reached(
+        self,
+        mask: torch.Tensor,
+        step: dict,
+        box_z: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (reached, holding) per-env for wait_after_box_drop_* steps."""
+        wait_z = step.get("wait_after_box_drop_z", None)
+        wait_s = step.get("wait_after_box_drop_s", None)
+        if wait_z is None or wait_s is None:
+            return torch.zeros_like(mask), torch.zeros_like(mask)
+
+        dropped = box_z[:, 0] <= float(wait_z)
+        reached = torch.zeros_like(mask)
+        holding = torch.zeros_like(mask)
+
+        active = mask & dropped
+        if bool(active.any()):
+            newly_armed = active & (~self._step_wait_armed)
+            self._step_wait_armed[newly_armed] = True
+            self._step_wait_counter[newly_armed] = 0
+
+        not_dropped = mask & (~dropped)
+        if bool(not_dropped.any()):
+            self._step_wait_counter[not_dropped] = 0
+            self._step_wait_armed[not_dropped] = False
+
+        armed = mask & self._step_wait_armed
+        if bool(armed.any()):
+            wait_steps = max(1, int(round(float(wait_s) / self.dt)))
+            self._step_wait_counter[armed] += 1
+            reached = reached | (armed & (self._step_wait_counter >= wait_steps))
+            holding = holding | (armed & (self._step_wait_counter < wait_steps))
+
+        return reached, holding
+
+    def _compute_step_commands(
+        self,
+        step: dict,
+        mask: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        box_x: torch.Tensor,
+        box_y: torch.Tensor,
+        box_z: torch.Tensor,
+        device,
+        dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute vx/vy/reached/holding/progress for envs on this nav step."""
+        b = x.shape[0]
+        vx = torch.zeros((b, 1), device=device, dtype=dtype)
+        vy = torch.zeros((b, 1), device=device, dtype=dtype)
+        reached = torch.zeros((b,), device=device, dtype=torch.bool)
+        holding = torch.zeros((b,), device=device, dtype=torch.bool)
+        progress = torch.zeros((b, 1), device=device, dtype=dtype)
+
+        if not bool(mask.any()):
+            return vx, vy, reached, holding, progress
+
+        if self._is_match_box_x_step(step):
+            tol = float(step["match_box_x_tol"])
+            align_delta = box_x - x
+            align_err = align_delta.abs()
+            progress = align_err
+            reached = (align_err[:, 0] <= tol) & mask
+            vmax = abs(float(step["vx"]))
+            kx = float(step.get("match_box_x_k", 1.0))
+            min_speed = float(step.get("match_box_x_min_speed", 0.15))
+            vx = (kx * (box_x - x)).clamp(-vmax, vmax)
+            slow_mask = vx.abs() < min_speed
+            vx = torch.where(
+                slow_mask,
+                torch.sign(vx).clamp(min=-1.0, max=1.0) * min_speed,
+                vx,
+            )
+            vy = torch.full((b, 1), float(step["vy"]), device=device, dtype=dtype)
+        elif self._is_match_box_y_step(step):
+            tol = float(step["match_box_y_tol"])
+            align_delta = box_y - y
+            align_err = align_delta.abs()
+            progress = align_err
+            reached = (align_err[:, 0] <= tol) & mask
+            vmax = abs(float(step["vy"]))
+            ky = float(step.get("match_box_y_k", 1.0))
+            min_speed = float(step.get("match_box_y_min_speed", 0.12))
+            vy = (ky * (box_y - y)).clamp(-vmax, vmax)
+            slow_mask = vy.abs() < min_speed
+            vy = torch.where(
+                slow_mask,
+                torch.sign(vy).clamp(min=-1.0, max=1.0) * min_speed,
+                vy,
+            )
+            vx = torch.full((b, 1), float(step["vx"]), device=device, dtype=dtype)
+        else:
+            progress = self._nav_progress_batch(step, x, y, box_x, box_y)
+            reached = (progress[:, 0] >= self._nav_step_target[:, 0]) & mask
+            vx = torch.full((b, 1), float(step["vx"]), device=device, dtype=dtype)
+            box_x_slow_start = step.get("box_x_slow_start", None)
+            box_x_stop = step.get("box_x_stop", None)
+            if (
+                box_x_slow_start is not None
+                and box_x_stop is not None
+                and step.get("axis") == "x"
+            ):
+                slow_start = float(box_x_slow_start)
+                stop_x = float(box_x_stop)
+                denom = max(abs(stop_x - slow_start), 1e-6)
+                if step["sign"] > 0:
+                    scale = ((stop_x - x) / denom).clamp(0.0, 1.0)
+                else:
+                    scale = ((x - stop_x) / denom).clamp(0.0, 1.0)
+                vx = vx * scale
+            vy = torch.full((b, 1), float(step["vy"]), device=device, dtype=dtype)
+
+        box_x_stop = step.get("box_x_stop", None)
+        if box_x_stop is not None and step.get("axis") == "x":
+            stop_x = float(box_x_stop)
+            stop_tol = float(step.get("stop_tol", 0.1))
+            if step["sign"] > 0:
+                reached = reached | ((x[:, 0] >= (stop_x - stop_tol)) & mask)
+            else:
+                reached = reached | ((x[:, 0] <= (stop_x + stop_tol)) & mask)
+
+        drop_reached, drop_holding = self._compute_drop_wait_reached(mask, step, box_z)
+        reached = reached | drop_reached
+        holding = holding | drop_holding
+
+        require_box_z_below = step.get("require_box_z_below", None)
+        if require_box_z_below is not None:
+            not_ready = mask & (box_z[:, 0] > float(require_box_z_below))
+            holding = holding | not_ready
+            reached = reached & (~not_ready)
+
+        # Only apply commands on active envs for this step.
+        m = mask.unsqueeze(-1)
+        vx = torch.where(m, vx, torch.zeros_like(vx))
+        vy = torch.where(m, vy, torch.zeros_like(vy))
+        return vx, vy, reached, holding, progress
 
     def _sector_mean(self, ch0, ch1, ch2, center: int, half_width: int) -> torch.Tensor:
         h = self._LIDAR_H
@@ -319,6 +614,12 @@ class AlgSolution:
             return mode
         return "lateral" if step.get("axis") == "y" else "forward"
 
+    def _is_match_box_x_step(self, step: dict | None) -> bool:
+        return step is not None and ("match_box_x_tol" in step)
+
+    def _is_match_box_y_step(self, step: dict | None) -> bool:
+        return step is not None and ("match_box_y_tol" in step)
+
     def _box_relative_yaw(
         self, yaw: torch.Tensor, device, dtype
     ) -> torch.Tensor | None:
@@ -376,6 +677,7 @@ class AlgSolution:
         vx_cmd: torch.Tensor,
         vy_cmd: torch.Tensor,
         yaw_cmd: torch.Tensor,
+        step: dict,
         yaw: torch.Tensor,
         x: torch.Tensor,
         y: torch.Tensor,
@@ -386,6 +688,7 @@ class AlgSolution:
         dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Keep robot aligned behind the box while pushing forward."""
+        rel_yaw = self._box_relative_yaw(yaw, device, dtype)
         yaw_corr = self._yaw_correction_from_box(yaw_cmd, yaw, device, dtype)
         skew = 0.0
         if self.push_enable_lidar_correction and lidar.get("has_extero"):
@@ -400,14 +703,24 @@ class AlgSolution:
 
         by_body = self._box_lateral_offset_body(x, y, yaw, box_x, box_y)
         vy_corr = (-self.push_k_lateral * by_body).clamp(-0.35, 0.35)
+        if bool(step.get("align_y_with_box", False)):
+            # World-y alignment: keep robot and box y close during forward push.
+            y_err_world = (box_y - y).clamp(-0.4, 0.4)
+            self._last_align_y_delta = float(y_err_world[0, 0].item())
+            vy_corr = vy_corr + (self.push_k_world_y_align * y_err_world).clamp(-0.35, 0.35)
+        else:
+            self._last_align_y_delta = 0.0
 
         yaw_cmd = (yaw_cmd + yaw_corr).clamp(-self.push_yaw_lim, self.push_yaw_lim)
         vy_cmd = (vy_cmd + vy_corr).clamp(-0.35, 0.35)
 
-        yaw_mag = abs(self._last_box_rel_yaw)
-        vx_scale = max(
-            self.push_vx_min_scale,
+        if rel_yaw is not None:
+            yaw_mag = rel_yaw.abs()
+        else:
+            yaw_mag = torch.zeros_like(yaw)
+        vx_scale = torch.clamp(
             1.0 - self.push_skew_slowdown * yaw_mag,
+            min=self.push_vx_min_scale,
         )
         vx_cmd = vx_cmd * vx_scale
         return vx_cmd, vy_cmd, yaw_cmd
@@ -432,6 +745,7 @@ class AlgSolution:
         vy_lim = max(abs(base_vy), 1.0)
         vy_sign = 1.0 if base_vy >= 0.0 else -1.0
 
+        rel_yaw = self._box_relative_yaw(yaw, device, dtype)
         yaw_corr = self._yaw_correction_from_box(yaw_cmd, yaw, device, dtype)
 
         right_signal = self._LIDAR_GROUND_REF
@@ -462,21 +776,35 @@ class AlgSolution:
             vy_corr = vy_corr + self.push_k_lidar_right * right_err * vy_sign
 
         vx_corr = (self.push_k_longitudinal * (self.push_target_bx_body - bx_body)).clamp(-0.35, 0.35)
+        if bool(step.get("align_x_with_box", False)):
+            # During lateral push, allow slight forward/backward correction to keep robot x aligned with box x.
+            x_err_world = (box_x - x).clamp(-0.4, 0.4)
+            self._last_align_x_delta = float(x_err_world[0, 0].item())
+            vx_corr = vx_corr + (self.push_k_world_x_align * x_err_world).clamp(-0.35, 0.35)
 
         yaw_cmd = (yaw_cmd + yaw_corr).clamp(-self.push_yaw_lim, self.push_yaw_lim)
         vy_cmd = (vy_cmd + vy_corr).clamp(-vy_lim, vy_lim)
         vx_cmd = (vx_cmd + vx_corr).clamp(-0.5, 0.5)
 
-        yaw_mag = abs(self._last_box_rel_yaw)
-        vy_scale = max(
-            self.push_vy_min_scale,
+        if rel_yaw is not None:
+            yaw_mag = rel_yaw.abs()
+            self._last_box_rel_yaw = float(rel_yaw[0, 0].item())
+        else:
+            yaw_mag = torch.zeros_like(yaw)
+            self._last_box_rel_yaw = 0.0
+        vy_scale = torch.clamp(
             1.0 - self.push_skew_slowdown * yaw_mag,
+            min=self.push_vy_min_scale,
         )
         vy_cmd = vy_cmd * vy_scale
 
         min_vy = self.push_lateral_vy_min * vy_sign
-        if abs(float(vy_cmd[0, 0].item())) < self.push_lateral_vy_min:
-            vy_cmd = torch.full_like(vy_cmd, min_vy * vy_scale, device=device, dtype=dtype)
+        slow_mask = vy_cmd.abs() < self.push_lateral_vy_min
+        vy_cmd = torch.where(
+            slow_mask,
+            torch.full_like(vy_cmd, min_vy) * vy_scale,
+            vy_cmd,
+        )
         return vx_cmd, vy_cmd, yaw_cmd
 
     def _apply_push_box_correction(
@@ -515,6 +843,7 @@ class AlgSolution:
             vx_cmd,
             vy_cmd,
             yaw_cmd,
+            step,
             yaw,
             x,
             y,
@@ -538,10 +867,23 @@ class AlgSolution:
         device, dtype = proprio.device, proprio.dtype
         b = proprio.shape[0]
         wz = proprio[:, 5:6]
+        self._ensure_pe_state(b, device, dtype)
 
         x, y, yaw = self._robot_xy_yaw(proprio)
+        if self._robot is not None:
+            root_z = self._robot.data.root_pos_w[:, 2:3].to(device=device, dtype=dtype)
+        else:
+            root_z = torch.full((b, 1), self.FALL_MIN_HEIGHT, device=device, dtype=dtype)
         box_x, box_y = self._box_pose_xy(device, dtype)
+        self._last_pos_xy = (float(x[0, 0].item()), float(y[0, 0].item()))
+        self._last_root_z = float(root_z[0, 0].item())
+        if self._box is not None:
+            box_z = self._box.data.root_pos_w[:, 2:3].to(device=device, dtype=dtype)
+        else:
+            box_z = torch.full((b, 1), self.BOX_SPAWN_Z, device=device, dtype=dtype)
         self._last_box_xy = (float(box_x[0, 0].item()), float(box_y[0, 0].item()))
+        self._last_box_z = float(box_z[0, 0].item())
+        self._last_stage_idx_batch = self._nav_step_idx.detach().clone()
 
         lidar = self._lidar_sectors_and_box(self._extero)
         front_val = lidar["front"]
@@ -566,43 +908,72 @@ class AlgSolution:
         self._last_box_det_src = box_det_src
 
         yaw_cmd = self._yaw_hold_cmd(yaw, wz, device, dtype)
-        step = self._current_nav_step()
+        vx_cmd = torch.zeros((b, 1), device=device, dtype=dtype)
+        vy_cmd = torch.zeros((b, 1), device=device, dtype=dtype)
 
-        if step is None or self.phase == "push_ready":
-            vx_cmd = torch.zeros((b, 1), device=device, dtype=dtype)
-            vy_cmd = torch.zeros((b, 1), device=device, dtype=dtype)
-        else:
-            if self._nav_origin is None:
-                self._begin_nav_step(step, x, y, box_x, box_y)
+        push_ready_mask = (self._nav_step_idx >= len(self.nav_steps)) | self._approach_done_batch
+        active_mask = ~push_ready_mask
 
-            self._nav_step_steps += 1
-            progress = self._nav_progress(step, x, y, box_x, box_y)
-            self._nav_step_progress = float(progress[0, 0].item())
+        need_begin = active_mask & (~self._nav_origin_valid)
+        if bool(need_begin.any()):
+            for s_idx, step in enumerate(self.nav_steps):
+                begin_mask = need_begin & (self._nav_step_idx == s_idx)
+                if bool(begin_mask.any()):
+                    self._begin_nav_step_batch(begin_mask, step, x, y, box_x, box_y)
 
-            reached = bool((progress >= self._nav_step_target).all())
-            timed_out = self._nav_step_steps >= self.nav_max_steps
-            if reached or timed_out:
-                self._advance_nav_step()
-                vx_cmd = torch.zeros((b, 1), device=device, dtype=dtype)
-                vy_cmd = torch.zeros((b, 1), device=device, dtype=dtype)
-            else:
-                vx_cmd = torch.full((b, 1), float(step["vx"]), device=device, dtype=dtype)
-                vy_cmd = torch.full((b, 1), float(step["vy"]), device=device, dtype=dtype)
-                if self._is_push_step(step):
-                    vx_cmd, vy_cmd, yaw_cmd = self._apply_push_box_correction(
-                        vx_cmd,
-                        vy_cmd,
-                        yaw_cmd,
-                        step,
-                        yaw,
-                        x,
-                        y,
-                        box_x,
-                        box_y,
-                        lidar,
-                        device,
-                        dtype,
-                    )
+        self._nav_step_steps[active_mask] += 1
+
+        advance_mask = torch.zeros((b,), device=device, dtype=torch.bool)
+        for s_idx, step in enumerate(self.nav_steps):
+            mask = active_mask & (self._nav_step_idx == s_idx)
+            if not bool(mask.any()):
+                continue
+
+            vx_s, vy_s, reached, holding, progress = self._compute_step_commands(
+                step, mask, x, y, box_x, box_y, box_z, device, dtype
+            )
+            timed_out = mask & (self._nav_step_steps >= self.nav_max_steps)
+            to_advance = (reached | timed_out) & mask
+            advance_mask = advance_mask | to_advance
+
+            move_mask = mask & (~to_advance) & (~holding)
+            m_move = move_mask.unsqueeze(-1)
+            vx_step = vx_s
+            vy_step = vy_s
+            if self._is_push_step(step):
+                vx_p, vy_p, yaw_p = self._apply_push_box_correction(
+                    vx_step,
+                    vy_step,
+                    yaw_cmd,
+                    step,
+                    yaw,
+                    x,
+                    y,
+                    box_x,
+                    box_y,
+                    lidar,
+                    device,
+                    dtype,
+                )
+                m = mask.unsqueeze(-1)
+                vx_step = torch.where(m, vx_p, vx_step)
+                vy_step = torch.where(m, vy_p, vy_step)
+                yaw_cmd = torch.where(m, yaw_p, yaw_cmd)
+            vx_cmd = torch.where(m_move, vx_step, vx_cmd)
+            vy_cmd = torch.where(m_move, vy_step, vy_cmd)
+
+            if bool((self._nav_step_idx == s_idx)[0]):
+                    self._nav_step_progress = float(progress[0, 0].item())
+                    if self._is_match_box_x_step(step):
+                        self._last_align_x_delta = float((box_x - x)[0, 0].item())
+                        self._last_align_x_err = float(progress[0, 0].item())
+                    elif self._is_match_box_y_step(step):
+                        self._last_align_y_delta = float((box_y - y)[0, 0].item())
+
+        if bool(advance_mask.any()):
+            self._advance_nav_step_batch(advance_mask)
+
+        self._sync_phase_from_env0()
 
         cmd = torch.cat([vx_cmd, vy_cmd, yaw_cmd], dim=-1)
         self._last_nav_cmd = (
@@ -614,18 +985,37 @@ class AlgSolution:
         if self._debug_step % 50 == 1:
             step_info = ""
             cur = self._current_nav_step()
-            if cur is not None and self._nav_origin is not None:
-                step_info = (
-                    f" [{self._nav_step_idx + 1}/{len(self.nav_steps)} "
-                    f"{cur['name']} prog={self._nav_step_progress:.2f}/{cur['dist']:.2f} "
-                    f"cmd=({cur['vx']:.1f},{cur['vy']:+.1f})]"
-                )
+            step_idx0 = int(self._nav_step_idx[0].item())
+            if cur is not None and bool(self._nav_origin_valid[0].item()):
+                if self._is_match_box_x_step(cur):
+                    step_info = (
+                        f" [{step_idx0 + 1}/{len(self.nav_steps)} "
+                        f"{cur['name']} dx={self._last_align_x_delta:+.3f} x_err={self._last_align_x_err:.3f}"
+                        f"/tol={float(cur['match_box_x_tol']):.3f} "
+                        f"cmd=({cur['vx']:.1f},{cur['vy']:+.1f})]"
+                    )
+                elif self._is_match_box_y_step(cur):
+                    step_info = (
+                        f" [{step_idx0 + 1}/{len(self.nav_steps)} "
+                        f"{cur['name']} dy={self._last_align_y_delta:+.3f} y_err={self._nav_step_progress:.3f}"
+                        f"/tol={float(cur['match_box_y_tol']):.3f} "
+                        f"cmd=({cur['vx']:.1f},{cur['vy']:+.1f})]"
+                    )
+                else:
+                    step_info = (
+                        f" [{step_idx0 + 1}/{len(self.nav_steps)} "
+                        f"{cur['name']} prog={self._nav_step_progress:.2f}/{cur['dist']:.2f} "
+                        f"cmd=({cur['vx']:.1f},{cur['vy']:+.1f})]"
+                    )
+            mixed = ""
+            if self._nav_step_idx.unique().numel() > 1:
+                mixed = f" mixed_steps={self._nav_step_idx.unique().numel()}"
             print(
                 f"[taskd {self.phase} step={self._debug_step:5d}] "
                 f"pos=({x[0,0].item():+.2f},{y[0,0].item():+.2f}) "
-                f"box=({box_x[0,0].item():+.2f},{box_y[0,0].item():+.2f}) "
+                f"box=({box_x[0,0].item():+.2f},{box_y[0,0].item():+.2f},{box_z[0,0].item():+.2f}) "
                 f"done={int(self._approach_done)}"
-                f"{step_info} "
+                f"{mixed}{step_info} "
                 f"out=({vx_cmd[0,0].item():.2f},{vy_cmd[0,0].item():+.2f},{yaw_cmd[0,0].item():+.2f})"
             )
             if self._is_push_step(cur):
@@ -633,25 +1023,45 @@ class AlgSolution:
                     print(
                         f"  push[lateral] box_yaw_rel={self._last_box_rel_yaw:+.3f} "
                         f"right_err={self._last_push_right_err:+.3f} "
+                        f"dx={self._last_align_x_delta:+.3f} "
                         f"fr-fl={self._last_push_skew:+.3f} "
                         f"right={self._last_lidar_right:.2f}"
                     )
                 else:
                     print(
                         f"  push[forward] box_yaw_rel={self._last_box_rel_yaw:+.3f} "
+                        f"dy={self._last_align_y_delta:+.3f} "
                         f"skew={self._last_push_skew:+.3f}"
                     )
         return cmd
 
+    def _get_velocity_commands_held(self, proprio: torch.Tensor) -> torch.Tensor:
+        """Update high-level cmd at high_level_hz; hold between updates."""
+        b = proprio.shape[0]
+        need_refresh = (
+            bool(getattr(self, "_hl_cmd_force_refresh", False))
+            or self._hl_cmd_cached is None
+            or (not isinstance(self._hl_cmd_cached, torch.Tensor))
+            or self._hl_cmd_cached.shape[0] != b
+            or (self._hl_cmd_step_counter % self._hl_cmd_hold_steps == 0)
+        )
+        if need_refresh:
+            self._hl_cmd_cached = self._get_velocity_commands(proprio)
+            self._hl_cmd_force_refresh = False
+        self._hl_cmd_step_counter += 1
+        return self._hl_cmd_cached
+
     def get_video_overlay_lines(self) -> list[str]:
         lines = [
             f"phase={self.phase}  done={int(self._approach_done)}",
-            f"box=({self._last_box_xy[0]:+.2f},{self._last_box_xy[1]:+.2f})",
+            f"pos=({self._last_pos_xy[0]:+.2f},{self._last_pos_xy[1]:+.2f})",
+            f"box=({self._last_box_xy[0]:+.2f},{self._last_box_xy[1]:+.2f},{self._last_box_z:+.2f})",
         ]
         cur = self._current_nav_step()
         if cur is not None:
+            step_idx0 = int(self._nav_step_idx[0].item()) if self._nav_step_idx is not None else 0
             lines.append(
-                f"nav [{self._nav_step_idx + 1}/{len(self.nav_steps)}] {cur['name']} "
+                f"nav [{step_idx0 + 1}/{len(self.nav_steps)}] {cur['name']} "
                 f"{self._nav_step_progress:.2f}/{cur['dist']:.2f}m "
                 f"cmd=({cur['vx']:.1f},{cur['vy']:+.1f})"
             )
@@ -663,14 +1073,20 @@ class AlgSolution:
                 lines.append(
                     f"push[lateral] lidar={lidar_flag} rel_yaw={self._last_box_rel_yaw:+.3f} "
                     f"right_err={self._last_push_right_err:+.3f} "
+                    f"dx={self._last_align_x_delta:+.3f} "
                     f"fr-fl={self._last_push_skew:+.3f} "
                     f"right={self._last_lidar_right:.2f}"
                 )
             else:
                 lines.append(
                     f"push[forward] lidar={lidar_flag} rel_yaw={self._last_box_rel_yaw:+.3f} "
+                    f"dy={self._last_align_y_delta:+.3f} "
                     f"skew={self._last_push_skew:+.3f}"
                 )
+        if self.phase == "final":
+            lines.append(
+                f"final z: root_z={self._last_root_z:+.3f} fall_thresh={self.FALL_MIN_HEIGHT:+.3f}"
+            )
         vx, vy, yaw = self._last_nav_cmd
         lines.append(f"out=({vx:.2f},{vy:+.2f},{yaw:+.2f})")
         return lines
@@ -697,7 +1113,9 @@ class AlgSolution:
         actions_env_leg = actions_all[:, self.leg_joint_indices]
         actions_train_leg = actions_env_leg * self.env_to_train_action_scale.to(dtype=proprio.dtype)
 
-        velocity_commands = self._get_velocity_commands(proprio)
+        velocity_commands = self._get_velocity_commands_held(proprio)
+        # Cache per-env high-level command batch for dataset collection/debugging.
+        self._last_high_level_cmd_batch = velocity_commands.detach().clone()
 
         return torch.cat(
             [
@@ -746,4 +1164,8 @@ class AlgSolution:
             action_train = action_train.unsqueeze(0)
 
         action_env = self._map_policy_action_to_env_action(action_train, action_dim)
-        return {"action": action_env.cpu().numpy().tolist(), "giveup": False}
+        return {
+            "action": action_env.detach().cpu().numpy().tolist(),
+            "action_tensor": action_env.detach(),
+            "giveup": False,
+        }
