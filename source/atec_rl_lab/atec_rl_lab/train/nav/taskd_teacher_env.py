@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import gymnasium as gym
 import numpy as np
 import torch
@@ -18,6 +19,37 @@ _LIDAR_H = 360
 
 _TRAIN_TO_ENV = torch.tensor([0.25, 0.5, 0.5] * 4, dtype=torch.float32)
 _ENV_TO_TRAIN = torch.tensor([4.0, 2.0, 2.0] * 4, dtype=torch.float32)
+
+_ROBOT_SPAWN_XY = (-3.0, 0.0)
+_BOX_SPAWN_XY = (-3.0, 1.6)
+
+
+def _build_nominal_waypoints(stage_specs: list[dict]) -> list[tuple[float, float]]:
+    """Build a nominal world-frame polyline from scripted stage specs."""
+    x, y = float(_ROBOT_SPAWN_XY[0]), float(_ROBOT_SPAWN_XY[1])
+    box_x, box_y = float(_BOX_SPAWN_XY[0]), float(_BOX_SPAWN_XY[1])
+    waypoints = [(x, y)]
+    for spec in stage_specs:
+        if spec.get("match_box_x_tol") is not None:
+            x = box_x
+        elif spec.get("match_box_y_tol") is not None:
+            y = box_y
+        elif spec.get("box_x_stop") is not None:
+            x = float(spec["box_x_stop"])
+        else:
+            axis = spec.get("axis", "x")
+            sign = float(spec.get("sign", 1.0))
+            dist = float(spec.get("dist", 0.0))
+            if axis == "xy":
+                d = dist / math.sqrt(2.0)
+                x += d if sign > 0 else -d
+                y += d if sign > 0 else -d
+            elif axis == "x":
+                x += dist if sign > 0 else -dist
+            else:
+                y += dist if sign > 0 else -dist
+        waypoints.append((x, y))
+    return waypoints
 
 
 class TaskDTeacherEnv(gym.Wrapper):
@@ -72,9 +104,27 @@ class TaskDTeacherEnv(gym.Wrapper):
                 dist=2.0,
                 push=True,
                 sparse_bonus=1.2,
+                align_x_with_box=True,
+                relative_robot_target=True,
             ),
-            dict(name="retreat2", axis="x", sign=-1, dist=1.0, push=False, sparse_bonus=0.8),
-            dict(name="sidestep_right2", axis="y", sign=-1, dist=0.6, push=False, sparse_bonus=0.8),
+            dict(
+                name="retreat2",
+                axis="x",
+                sign=-1,
+                dist=1.0,
+                push=False,
+                sparse_bonus=0.8,
+                relative_robot_target=True,
+            ),
+            dict(
+                name="sidestep_right2",
+                axis="y",
+                sign=-1,
+                dist=0.6,
+                push=False,
+                sparse_bonus=0.8,
+                relative_robot_target=True,
+            ),
             dict(
                 name="advance2",
                 axis="x",
@@ -82,13 +132,23 @@ class TaskDTeacherEnv(gym.Wrapper):
                 dist=4.0,
                 push=True,
                 sparse_bonus=1.6,
+                align_y_with_box=True,
+                relative_robot_target=True,
                 box_x_slow_start=-1.7,
                 box_x_stop=-1.25,
                 stop_tol=0.08,
                 wait_after_box_drop_z=-0.35,
                 wait_after_box_drop_s=1.0,
             ),
-            dict(name="final", axis="x", sign=+1, dist=3.0, push=False, sparse_bonus=1.0),
+            dict(
+                name="final",
+                axis="x",
+                sign=+1,
+                dist=3.0,
+                push=False,
+                sparse_bonus=1.0,
+                relative_robot_target=True,
+            ),
         ]
         self._num_stages = len(self.stage_specs)
         self._stage_names = [spec["name"] for spec in self.stage_specs]
@@ -98,23 +158,86 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._stage_push = torch.tensor(
             [bool(spec["push"]) for spec in self.stage_specs], device=self._device, dtype=torch.bool
         )
+        self._stage_relative_target = torch.tensor(
+            [bool(spec.get("relative_robot_target", False)) for spec in self.stage_specs],
+            device=self._device,
+            dtype=torch.bool,
+        )
         self._stage_sign = torch.tensor([float(spec["sign"]) for spec in self.stage_specs], device=self._device, dtype=torch.float32)
         self._stage_dist = torch.tensor([float(spec["dist"]) for spec in self.stage_specs], device=self._device, dtype=torch.float32)
 
         self._stage_idx_buf: torch.Tensor | None = None
         self._active_stage_count_buf: torch.Tensor | None = None
         self._curriculum_level_buf: torch.Tensor | None = None
-        self._stage_origin_buf: torch.Tensor | None = None
+        self._stage_origin_x_buf: torch.Tensor | None = None
+        self._stage_origin_y_buf: torch.Tensor | None = None
         self._stage_progress_buf: torch.Tensor | None = None
         self._nav_step_count_buf: torch.Tensor | None = None
         self._step_wait_counter: torch.Tensor | None = None
         self._step_wait_armed: torch.Tensor | None = None
-        self._stage_complete_bonus = 0.5
         self._current_obs: dict | None = None
         self._done_total = 0
         self._done_fall = 0
         self._done_timeout = 0
         self._done_x_reached = 0
+        self._done_traj = 0
+        self._done_stage_target = 0
+        self._done_no_motion = 0
+
+        # Stage indices aligned with demo/solution.py nav_steps.
+        self._idx_retreat = 0
+        self._idx_sidestep_left = 1
+        self._idx_advance_match = 2
+        self._idx_sidestep_right = 3
+        self._idx_retreat2 = 4
+        self._idx_sidestep_right2 = 5
+        self._idx_advance2 = 6
+        self._idx_final = 7
+
+        # Reward: progress toward stage target (bounded) + sparse bonus on reach.
+        self._w_nav_dist = 3.0
+        self._nav_dist_delta_clip = 0.05
+        self._stage_reach_tol = 0.15
+        self._r_stage_complete = 1.0
+        self._r_stage_complete_final = 2.0
+        # Small per-step penalty to encourage reaching targets quickly.
+        self._r_step_penalty = -0.01
+        # sidestep_right: reward shrinking |robot_x - box_x| (progress-based).
+        self._w_push_x_align = 6.0
+        self._push_x_align_delta_clip = 0.05
+        # advance2: reward shrinking |robot_y - box_y| (progress-based).
+        self._w_push_y_align = 6.0
+        self._push_y_align_delta_clip = 0.05
+
+        self._traj_waypoints = _build_nominal_waypoints(self.stage_specs)
+        stage_targets = self._traj_waypoints[1 : self._num_stages + 1]
+        stage_starts = self._traj_waypoints[: self._num_stages]
+        self._stage_start_x = torch.tensor([p[0] for p in stage_starts], device=self._device, dtype=torch.float32)
+        self._stage_start_y = torch.tensor([p[1] for p in stage_starts], device=self._device, dtype=torch.float32)
+        self._stage_target_x = torch.tensor([p[0] for p in stage_targets], device=self._device, dtype=torch.float32)
+        self._stage_target_y = torch.tensor([p[1] for p in stage_targets], device=self._device, dtype=torch.float32)
+        self._traj_seg_x0 = None
+        self._traj_seg_y0 = None
+        self._traj_seg_dx = None
+        self._traj_seg_dy = None
+        self._traj_seg_len2 = None
+        self._traj_prefix_len = None
+        self._traj_total_len = 0.0
+        self._build_traj_segments()
+        self._prev_robot_s = None
+        self._prev_rel_progress = None
+        self._prev_dist_to_target: torch.Tensor | None = None
+        self._prev_x_align_err: torch.Tensor | None = None
+        self._prev_y_align_err: torch.Tensor | None = None
+
+        self._post_push_anchor_rx: torch.Tensor | None = None
+        self._post_push_anchor_ry: torch.Tensor | None = None
+        self._post_push_anchor_bx: torch.Tensor | None = None
+        self._post_push_anchor_by: torch.Tensor | None = None
+        self._pre_adv2_anchor_rx: torch.Tensor | None = None
+        self._pre_adv2_anchor_ry: torch.Tensor | None = None
+        self._pre_adv2_anchor_bx: torch.Tensor | None = None
+        self._pre_adv2_anchor_by: torch.Tensor | None = None
 
         self._prev_robot_x = None
         self._prev_robot_y = None
@@ -221,6 +344,66 @@ class TaskDTeacherEnv(gym.Wrapper):
         by_body = -sy * dx + cy * dy
         return bx_body, by_body
 
+    def _build_traj_segments(self) -> None:
+        if len(self._traj_waypoints) < 2:
+            self._traj_seg_x0 = torch.zeros(1, device=self._device, dtype=torch.float32)
+            self._traj_seg_y0 = torch.zeros(1, device=self._device, dtype=torch.float32)
+            self._traj_seg_dx = torch.zeros(1, device=self._device, dtype=torch.float32)
+            self._traj_seg_dy = torch.zeros(1, device=self._device, dtype=torch.float32)
+            self._traj_seg_len2 = torch.ones(1, device=self._device, dtype=torch.float32)
+            self._traj_prefix_len = torch.zeros(1, device=self._device, dtype=torch.float32)
+            self._traj_total_len = 0.0
+            return
+
+        x0 = []
+        y0 = []
+        dx = []
+        dy = []
+        len2 = []
+        prefix = []
+        running = 0.0
+        for i in range(len(self._traj_waypoints) - 1):
+            ax, ay = self._traj_waypoints[i]
+            bx, by = self._traj_waypoints[i + 1]
+            vx = bx - ax
+            vy = by - ay
+            l2 = max(vx * vx + vy * vy, 1.0e-12)
+            x0.append(ax)
+            y0.append(ay)
+            dx.append(vx)
+            dy.append(vy)
+            len2.append(l2)
+            prefix.append(running)
+            running += math.sqrt(l2)
+
+        self._traj_seg_x0 = torch.tensor(x0, device=self._device, dtype=torch.float32)
+        self._traj_seg_y0 = torch.tensor(y0, device=self._device, dtype=torch.float32)
+        self._traj_seg_dx = torch.tensor(dx, device=self._device, dtype=torch.float32)
+        self._traj_seg_dy = torch.tensor(dy, device=self._device, dtype=torch.float32)
+        self._traj_seg_len2 = torch.tensor(len2, device=self._device, dtype=torch.float32)
+        self._traj_prefix_len = torch.tensor(prefix, device=self._device, dtype=torch.float32)
+        self._traj_total_len = running
+
+    def _project_to_traj(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (arc-length projection s, minimum distance d) for each env."""
+        px = x.squeeze(-1).to(device=self._device, dtype=torch.float32)
+        py = y.squeeze(-1).to(device=self._device, dtype=torch.float32)
+        seg = self._traj_seg_x0.shape[0]
+        if seg == 1 and float(self._traj_seg_len2[0].item()) <= 1.0e-12:
+            d = torch.hypot(px - self._traj_seg_x0[0], py - self._traj_seg_y0[0])
+            return torch.zeros_like(d), d
+
+        rx = px.unsqueeze(-1) - self._traj_seg_x0.unsqueeze(0)
+        ry = py.unsqueeze(-1) - self._traj_seg_y0.unsqueeze(0)
+        t = (rx * self._traj_seg_dx.unsqueeze(0) + ry * self._traj_seg_dy.unsqueeze(0)) / self._traj_seg_len2.unsqueeze(0)
+        t = torch.clamp(t, 0.0, 1.0)
+        proj_x = self._traj_seg_x0.unsqueeze(0) + t * self._traj_seg_dx.unsqueeze(0)
+        proj_y = self._traj_seg_y0.unsqueeze(0) + t * self._traj_seg_dy.unsqueeze(0)
+        dist = torch.hypot(px.unsqueeze(-1) - proj_x, py.unsqueeze(-1) - proj_y)
+        min_dist, idx = dist.min(dim=-1)
+        s = self._traj_prefix_len[idx] + t.gather(1, idx.unsqueeze(-1)).squeeze(-1) * torch.sqrt(self._traj_seg_len2[idx])
+        return s, min_dist
+
     def _ensure_state_buffers(self, batch: int) -> None:
         if self._stage_idx_buf is not None and int(self._stage_idx_buf.shape[0]) == int(batch):
             return
@@ -229,11 +412,25 @@ class TaskDTeacherEnv(gym.Wrapper):
             (batch,), min(2, self._num_stages), device=self._device, dtype=torch.long
         )
         self._curriculum_level_buf = torch.zeros(batch, device=self._device, dtype=torch.long)
-        self._stage_origin_buf = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._stage_origin_x_buf = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._stage_origin_y_buf = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._stage_progress_buf = torch.zeros(batch, device=self._device, dtype=torch.float32)
         self._nav_step_count_buf = torch.zeros(batch, device=self._device, dtype=torch.long)
         self._step_wait_counter = torch.zeros(batch, device=self._device, dtype=torch.long)
         self._step_wait_armed = torch.zeros(batch, device=self._device, dtype=torch.bool)
+        self._prev_robot_s = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._prev_rel_progress = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._prev_dist_to_target = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._prev_x_align_err = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._prev_y_align_err = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._post_push_anchor_rx = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._post_push_anchor_ry = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._post_push_anchor_bx = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._post_push_anchor_by = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._pre_adv2_anchor_rx = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._pre_adv2_anchor_ry = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._pre_adv2_anchor_bx = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._pre_adv2_anchor_by = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
 
     def _reset_env_state(self, reset_mask: torch.Tensor, rx, ry, bx, by) -> None:
         if not bool(reset_mask.any()):
@@ -241,7 +438,8 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._stage_idx_buf[reset_mask] = 0
         self._curriculum_level_buf[reset_mask] = 0
         self._active_stage_count_buf[reset_mask] = min(2, self._num_stages)
-        self._stage_origin_buf[reset_mask] = float("nan")
+        self._stage_origin_x_buf[reset_mask] = float("nan")
+        self._stage_origin_y_buf[reset_mask] = float("nan")
         self._stage_progress_buf[reset_mask] = 0.0
         self._nav_step_count_buf[reset_mask] = 0
         self._step_wait_counter[reset_mask] = 0
@@ -250,6 +448,19 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._prev_robot_y[reset_mask] = ry[reset_mask]
         self._prev_box_x[reset_mask] = bx[reset_mask]
         self._prev_box_y[reset_mask] = by[reset_mask]
+        self._prev_robot_s[reset_mask] = float("nan")
+        self._prev_rel_progress[reset_mask] = float("nan")
+        self._prev_dist_to_target[reset_mask] = float("nan")
+        self._prev_x_align_err[reset_mask] = float("nan")
+        self._prev_y_align_err[reset_mask] = float("nan")
+        self._post_push_anchor_rx[reset_mask] = float("nan")
+        self._post_push_anchor_ry[reset_mask] = float("nan")
+        self._post_push_anchor_bx[reset_mask] = float("nan")
+        self._post_push_anchor_by[reset_mask] = float("nan")
+        self._pre_adv2_anchor_rx[reset_mask] = float("nan")
+        self._pre_adv2_anchor_ry[reset_mask] = float("nan")
+        self._pre_adv2_anchor_bx[reset_mask] = float("nan")
+        self._pre_adv2_anchor_by[reset_mask] = float("nan")
 
     def _current_stage_params(self):
         idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
@@ -316,6 +527,43 @@ class TaskDTeacherEnv(gym.Wrapper):
         critic = self._build_critic_obs(policy)
         return {"policy": policy, "critic": critic}
 
+    def _termination_term_flags(self) -> dict[str, torch.Tensor]:
+        tm = getattr(self.env.unwrapped, "termination_manager", None)
+        if tm is None:
+            return {}
+        out: dict[str, torch.Tensor] = {}
+        for name in ("fall", "x_reached", "time_out", "stage_target_deviation", "trajectory_deviation", "no_motion_timeout"):
+            try:
+                out[name] = tm.get_term(name).view(-1)[: self.num_envs].to(
+                    device=self._device, dtype=torch.bool
+                )
+            except Exception:
+                pass
+        return out
+
+    def _count_done_terms(self, done_now: torch.Tensor) -> None:
+        term_flags = self._termination_term_flags()
+        if term_flags:
+            if "fall" in term_flags:
+                self._done_fall += int((done_now & term_flags["fall"]).sum().item())
+            if "time_out" in term_flags:
+                self._done_timeout += int((done_now & term_flags["time_out"]).sum().item())
+            if "x_reached" in term_flags:
+                self._done_x_reached += int((done_now & term_flags["x_reached"]).sum().item())
+            if "trajectory_deviation" in term_flags:
+                self._done_traj += int((done_now & term_flags["trajectory_deviation"]).sum().item())
+            if "stage_target_deviation" in term_flags:
+                self._done_stage_target += int((done_now & term_flags["stage_target_deviation"]).sum().item())
+            if "no_motion_timeout" in term_flags:
+                self._done_no_motion += int((done_now & term_flags["no_motion_timeout"]).sum().item())
+            return
+
+        # Fallback when termination manager is unavailable.
+        rx, _, _ = self._robot_pose()
+        x_reached_now = done_now & (rx.squeeze(-1) > 3.5)
+        self._done_x_reached += int(x_reached_now.sum().item())
+        self._done_fall += int((done_now & (~x_reached_now)).sum().item())
+
     def get_observations(self):
         return self._obs_dict(self._current_obs), {}
 
@@ -326,6 +574,9 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_fall = 0
         self._done_timeout = 0
         self._done_x_reached = 0
+        self._done_traj = 0
+        self._done_stage_target = 0
+        self._done_no_motion = 0
         rx, ry, _ = self._robot_pose()
         bx, by, _ = self._box_pose()
         self._ensure_state_buffers(rx.shape[0])
@@ -333,6 +584,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._prev_box_x, self._prev_box_y = bx.clone(), by.clone()
         full_reset = torch.ones(rx.shape[0], device=self._device, dtype=torch.bool)
         self._reset_env_state(full_reset, rx, ry, bx, by)
+        self._sync_nav_stage_idx()
         return self._obs_dict(obs), info
 
     def _update_curriculum(self):
@@ -372,80 +624,218 @@ class TaskDTeacherEnv(gym.Wrapper):
                 holding = holding | (armed & (self._step_wait_counter < wait_steps))
         return reached, holding
 
-    def _reward_stage(self, rx, ry, bx, by, box_z, by_body, box_yaw, robot_yaw, contact_on):
-        axis_is_x, push, sign, dist, valid = self._current_stage_params()
-        coord_now = self._stage_coord(axis_is_x, push, rx, ry, bx, by)
-        need_init = torch.isnan(self._stage_origin_buf) & valid
-        self._stage_origin_buf = torch.where(need_init, coord_now, self._stage_origin_buf)
+    def _update_stage_anchors(
+        self,
+        reached: torch.Tensor,
+        stage_idx: torch.Tensor,
+        rx: torch.Tensor,
+        ry: torch.Tensor,
+        bx: torch.Tensor,
+        by: torch.Tensor,
+    ) -> None:
+        rx1 = rx.squeeze(-1)
+        ry1 = ry.squeeze(-1)
+        bx1 = bx.squeeze(-1)
+        by1 = by.squeeze(-1)
+        finish_push1 = reached & (stage_idx == self._idx_sidestep_right)
+        self._post_push_anchor_rx = torch.where(finish_push1, rx1, self._post_push_anchor_rx)
+        self._post_push_anchor_ry = torch.where(finish_push1, ry1, self._post_push_anchor_ry)
+        self._post_push_anchor_bx = torch.where(finish_push1, bx1, self._post_push_anchor_bx)
+        self._post_push_anchor_by = torch.where(finish_push1, by1, self._post_push_anchor_by)
 
-        progress = torch.where(sign > 0, coord_now - self._stage_origin_buf, self._stage_origin_buf - coord_now)
-        progress = torch.where(valid, progress, torch.zeros_like(progress))
+        finish_sidestep2 = reached & (stage_idx == self._idx_sidestep_right2)
+        self._pre_adv2_anchor_rx = torch.where(finish_sidestep2, rx1, self._pre_adv2_anchor_rx)
+        self._pre_adv2_anchor_ry = torch.where(finish_sidestep2, ry1, self._pre_adv2_anchor_ry)
+        self._pre_adv2_anchor_bx = torch.where(finish_sidestep2, bx1, self._pre_adv2_anchor_bx)
+        self._pre_adv2_anchor_by = torch.where(finish_sidestep2, by1, self._pre_adv2_anchor_by)
+
+    def _relative_axis_progress(
+        self,
+        sign: torch.Tensor,
+        coord_now: torch.Tensor,
+        anchor: torch.Tensor,
+    ) -> torch.Tensor:
+        delta = coord_now - anchor
+        signed = torch.where(sign > 0, delta, -delta)
+        return torch.clamp(signed, min=0.0)
+
+    def _sync_nav_stage_idx(self) -> None:
+        """Expose current stage index and segment endpoints to base env termination manager."""
+        base = self.env.unwrapped
+        if (
+            not hasattr(base, "_nav_stage_idx")
+            or not isinstance(base._nav_stage_idx, torch.Tensor)
+            or int(base._nav_stage_idx.shape[0]) != int(self.num_envs)
+        ):
+            base._nav_stage_idx = torch.zeros(self.num_envs, device=base.device, dtype=torch.long)
         stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+        base._nav_stage_idx.copy_(stage_idx)
 
-        reached = (progress >= dist) & valid
-        # match_box_x_tol step: reached when |robot_x - box_x| <= tol
-        match_mask = torch.zeros_like(valid)
-        match_err = torch.zeros_like(progress)
-        for i, spec in enumerate(self.stage_specs):
-            tol = spec.get("match_box_x_tol", None)
-            if tol is None:
-                continue
-            m = valid & (stage_idx == i)
-            if not bool(m.any()):
-                continue
-            err = (bx - rx).abs().squeeze(-1)
-            match_mask = match_mask | m
-            match_err = torch.where(m, err, match_err)
-            reached = torch.where(m, err <= float(tol), reached)
+        sx = self._stage_start_x[stage_idx]
+        sy = self._stage_start_y[stage_idx]
+        relative_stage = self._stage_relative_target[stage_idx]
+        has_origin = (~torch.isnan(self._stage_origin_x_buf)) & (~torch.isnan(self._stage_origin_y_buf))
+        use_relative = relative_stage & has_origin
+        sx = torch.where(use_relative, self._stage_origin_x_buf, sx)
+        sy = torch.where(use_relative, self._stage_origin_y_buf, sy)
+        dx = torch.where(self._stage_axis_is_x[stage_idx], self._stage_sign[stage_idx] * self._stage_dist[stage_idx], 0.0)
+        dy = torch.where(self._stage_axis_is_x[stage_idx], 0.0, self._stage_sign[stage_idx] * self._stage_dist[stage_idx])
+        ex = sx + dx
+        ey = sy + dy
 
-        # stop-by-x step (advance2)
-        for i, spec in enumerate(self.stage_specs):
-            stop_x = spec.get("box_x_stop", None)
-            if stop_x is None or spec.get("axis") != "x":
-                continue
-            m = valid & (stage_idx == i)
-            if not bool(m.any()):
-                continue
-            stop_tol = float(spec.get("stop_tol", 0.1))
-            if float(spec.get("sign", 1.0)) > 0:
-                reached = reached | (m & (rx[:, 0] >= (float(stop_x) - stop_tol)))
-            else:
-                reached = reached | (m & (rx[:, 0] <= (float(stop_x) + stop_tol)))
+        for name in ("_nav_seg_x0", "_nav_seg_y0", "_nav_seg_x1", "_nav_seg_y1"):
+            if (
+                not hasattr(base, name)
+                or not isinstance(getattr(base, name), torch.Tensor)
+                or int(getattr(base, name).shape[0]) != int(self.num_envs)
+            ):
+                setattr(base, name, torch.zeros(self.num_envs, device=base.device, dtype=torch.float32))
+        base._nav_seg_x0.copy_(sx.to(device=base.device, dtype=torch.float32))
+        base._nav_seg_y0.copy_(sy.to(device=base.device, dtype=torch.float32))
+        base._nav_seg_x1.copy_(ex.to(device=base.device, dtype=torch.float32))
+        base._nav_seg_y1.copy_(ey.to(device=base.device, dtype=torch.float32))
 
-        drop_reached, drop_holding = self._compute_drop_wait_reached(valid, stage_idx, box_z)
-        reached = reached | drop_reached
-        reached = reached & (~drop_holding)
+    def _ensure_relative_stage_origin(
+        self,
+        stage_idx: torch.Tensor,
+        valid: torch.Tensor,
+        rx: torch.Tensor,
+        ry: torch.Tensor,
+    ) -> None:
+        rel_stage = valid & self._stage_relative_target[stage_idx]
+        origin_init = torch.isnan(self._stage_origin_y_buf)
+        arm = rel_stage & origin_init
+        if bool(arm.any()):
+            self._stage_origin_x_buf = torch.where(arm, rx.squeeze(-1), self._stage_origin_x_buf)
+            self._stage_origin_y_buf = torch.where(arm, ry.squeeze(-1), self._stage_origin_y_buf)
 
-        self._stage_progress_buf = torch.where(match_mask, match_err, progress)
+    def _relative_stage_target(self, stage_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tx = self._stage_origin_x_buf.clone()
+        ty = self._stage_origin_y_buf.clone()
+        axis_is_x = self._stage_axis_is_x[stage_idx]
+        sign = self._stage_sign[stage_idx]
+        dist = self._stage_dist[stage_idx]
+        tx = torch.where(axis_is_x, tx + sign * dist, tx)
+        ty = torch.where(axis_is_x, ty, ty + sign * dist)
+        return tx, ty
 
-        dbox_x = (bx - self._prev_box_x).squeeze(-1)
-        dbox_y = (by - self._prev_box_y).squeeze(-1)
-        push_dir = torch.where(axis_is_x, dbox_x, torch.where(sign < 0, -dbox_y, dbox_y))
-        r_progress_push = 8.0 * torch.clamp(push_dir, -0.03, 0.03)
+    def _compute_stage_reached(self, rx, ry) -> tuple[torch.Tensor, torch.Tensor]:
+        stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+        valid = self._stage_idx_buf < self._active_stage_count_buf
+        rx1 = rx.squeeze(-1)
+        ry1 = ry.squeeze(-1)
 
-        prev_coord = self._stage_coord(axis_is_x, push, self._prev_robot_x, self._prev_robot_y, self._prev_box_x, self._prev_box_y)
-        prev_prog = torch.where(sign > 0, prev_coord - self._stage_origin_buf, self._stage_origin_buf - prev_coord)
-        # For match_box_x_tol step, reward reducing the alignment error.
-        prev_match_err = (self._prev_box_x - self._prev_robot_x).abs().squeeze(-1)
-        r_progress_nav = torch.where(
-            match_mask,
-            4.0 * torch.clamp(prev_match_err - match_err, -0.05, 0.05),
-            4.0 * torch.clamp(progress - prev_prog, -0.05, 0.05),
+        self._ensure_relative_stage_origin(stage_idx, valid, rx, ry)
+
+        target_x = self._stage_target_x[stage_idx]
+        target_y = self._stage_target_y[stage_idx]
+        rel_stage = valid & self._stage_relative_target[stage_idx] & (~torch.isnan(self._stage_origin_y_buf))
+        if bool(rel_stage.any()):
+            rel_tx, rel_ty = self._relative_stage_target(stage_idx)
+            target_x = torch.where(rel_stage, rel_tx, target_x)
+            target_y = torch.where(rel_stage, rel_ty, target_y)
+
+        dist_to_target = torch.hypot(rx1 - target_x, ry1 - target_y)
+        reached = valid & (dist_to_target <= self._stage_reach_tol)
+        self._stage_progress_buf = dist_to_target
+        return reached, dist_to_target
+
+    def _compute_push_x_align_reward(
+        self,
+        stage_idx: torch.Tensor,
+        valid: torch.Tensor,
+        rx: torch.Tensor,
+        bx: torch.Tensor,
+        done_now: torch.Tensor,
+        reached: torch.Tensor,
+    ) -> torch.Tensor:
+        align_stage = valid & (stage_idx == self._idx_sidestep_right)
+        x_err = (rx.squeeze(-1) - bx.squeeze(-1)).abs()
+        prev_init = torch.isnan(self._prev_x_align_err)
+        self._prev_x_align_err = torch.where(prev_init, x_err, self._prev_x_align_err)
+        delta_x = torch.clamp(
+            self._prev_x_align_err - x_err,
+            -self._push_x_align_delta_clip,
+            self._push_x_align_delta_clip,
         )
-        r_progress = torch.where(push, r_progress_push, r_progress_nav)
+        align_dense = self._w_push_x_align * delta_x
+        reset_prev = done_now | reached
+        self._prev_x_align_err = torch.where(
+            reset_prev,
+            torch.full_like(self._prev_x_align_err, float("nan")),
+            x_err,
+        )
+        return torch.where(align_stage, align_dense, torch.zeros_like(align_dense))
 
-        yaw_err = torch.atan2(torch.sin(box_yaw - robot_yaw), torch.cos(box_yaw - robot_yaw))
-        r_yaw = -0.15 * yaw_err.squeeze(-1).abs()
-        r_lat = -0.2 * by_body.squeeze(-1).abs()
-        r_contact = 0.02 * contact_on.float()
-        r_step = torch.full_like(r_progress, -0.002)
-        r_reach_penalty = torch.where(reached, torch.full_like(r_progress, -0.2), torch.zeros_like(r_progress))
-        r_sparse_bonus = torch.where(reached, torch.full_like(r_progress, self._stage_complete_bonus), torch.zeros_like(r_progress))
+    def _compute_push_y_align_reward(
+        self,
+        stage_idx: torch.Tensor,
+        valid: torch.Tensor,
+        ry: torch.Tensor,
+        by: torch.Tensor,
+        done_now: torch.Tensor,
+        reached: torch.Tensor,
+    ) -> torch.Tensor:
+        align_stage = valid & (stage_idx == self._idx_advance2)
+        y_err = (ry.squeeze(-1) - by.squeeze(-1)).abs()
+        prev_init = torch.isnan(self._prev_y_align_err)
+        self._prev_y_align_err = torch.where(prev_init, y_err, self._prev_y_align_err)
+        delta_y = torch.clamp(
+            self._prev_y_align_err - y_err,
+            -self._push_y_align_delta_clip,
+            self._push_y_align_delta_clip,
+        )
+        align_dense = self._w_push_y_align * delta_y
+        reset_prev = done_now | reached
+        self._prev_y_align_err = torch.where(
+            reset_prev,
+            torch.full_like(self._prev_y_align_err, float("nan")),
+            y_err,
+        )
+        return torch.where(align_stage, align_dense, torch.zeros_like(align_dense))
 
-        reward = r_progress + r_step + r_reach_penalty + r_sparse_bonus
-        reward = reward + torch.where(push, r_yaw + r_lat + r_contact, torch.zeros_like(reward))
-        reward = torch.where(valid, reward, torch.zeros_like(reward))
-        return reward, reached
+    def _compute_reward(
+        self,
+        dist_to_target: torch.Tensor,
+        done_now: torch.Tensor,
+        reached: torch.Tensor,
+        rx: torch.Tensor,
+        ry: torch.Tensor,
+        bx: torch.Tensor,
+        by: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+        valid = self._stage_idx_buf < self._active_stage_count_buf
+        prev_init = torch.isnan(self._prev_dist_to_target)
+        self._prev_dist_to_target = torch.where(prev_init, dist_to_target, self._prev_dist_to_target)
+        delta_dist = torch.clamp(
+            self._prev_dist_to_target - dist_to_target,
+            -self._nav_dist_delta_clip,
+            self._nav_dist_delta_clip,
+        )
+        dense = self._w_nav_dist * delta_dist
+        dense = dense + self._compute_push_x_align_reward(stage_idx, valid, rx, bx, done_now, reached)
+        dense = dense + self._compute_push_y_align_reward(stage_idx, valid, ry, by, done_now, reached)
+        step_penalty = torch.full_like(dense, self._r_step_penalty)
+        reward = torch.where(valid, dense + step_penalty, torch.zeros_like(dense))
+        reset_prev = done_now | reached
+        self._prev_dist_to_target = torch.where(
+            reset_prev,
+            torch.full_like(self._prev_dist_to_target, float("nan")),
+            dist_to_target,
+        )
+        return reward, dense, torch.where(valid, step_penalty, torch.zeros_like(step_penalty))
+
+    def _stage_sparse_bonus(self, reached: torch.Tensor) -> torch.Tensor:
+        stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+        final_reach = reached & (stage_idx == self._idx_final)
+        bonus = torch.where(
+            final_reach,
+            torch.full((self.num_envs,), self._r_stage_complete_final, device=self._device, dtype=torch.float32),
+            torch.full((self.num_envs,), self._r_stage_complete, device=self._device, dtype=torch.float32),
+        )
+        bonus = torch.where(reached, bonus, torch.zeros_like(bonus))
+        return bonus
 
     def step(self, nav_action: torch.Tensor):
         if not isinstance(nav_action, torch.Tensor):
@@ -458,11 +848,16 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._update_curriculum()
 
         total_reward = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_dense = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_sparse = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_time_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         terminated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         truncated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         last_info = {}
+        episode_log: dict = {}
 
         for _ in range(self.inner_steps):
+            self._sync_nav_stage_idx()
             ll_obs = self._build_ll_obs(self._current_obs, nav_action)
             with torch.inference_mode():
                 ll_act = self.ll_policy(ll_obs)
@@ -478,44 +873,43 @@ class TaskDTeacherEnv(gym.Wrapper):
             terminated |= step_term_1d
             truncated |= step_trunc_1d
             last_info = info
+            if done_now.any():
+                step_log = info.get("log", {}) if isinstance(info, dict) else {}
+                if step_log:
+                    episode_log = step_log
 
-            rx, ry, robot_yaw = self._robot_pose()
-            bx, by, box_yaw = self._box_pose()
-            box = self.env.unwrapped.scene["box"]
-            box_z = box.data.root_pos_w.to(device=self._device, dtype=torch.float32)[:, 2:3]
-            _, by_body = self._relative_box_body(rx, ry, robot_yaw, bx, by)
-            cf = self.env.unwrapped.scene["contact_sensor"].data.net_forces_w
-            contact_on = cf.norm(dim=-1).max(dim=1).values > 2.0
+            rx, ry, _ = self._robot_pose()
+            bx, by, _ = self._box_pose()
 
-            x_reached_now = step_term_1d & (rx.squeeze(-1) > 3.5)
-            timeout_now = step_trunc_1d
-            fall_now = step_term_1d & (~x_reached_now)
-            self._done_x_reached += int(x_reached_now.sum().item())
-            self._done_timeout += int(timeout_now.sum().item())
-            self._done_fall += int(fall_now.sum().item())
+            if done_now.any():
+                self._count_done_terms(done_now)
             self._done_total += int(done_now.sum().item())
 
-            shaped, reached = self._reward_stage(rx, ry, bx, by, box_z, by_body, box_yaw, robot_yaw, contact_on)
-            if isinstance(base_rew, torch.Tensor):
-                base_rew_1d = base_rew.to(self._device)
-                if base_rew_1d.ndim > 1:
-                    base_rew_1d = base_rew_1d.squeeze(-1)
-                shaped = shaped + 0.10 * base_rew_1d
-            else:
-                base_rew_1d = torch.as_tensor(base_rew, device=self._device, dtype=torch.float32)
-                if base_rew_1d.ndim > 1:
-                    base_rew_1d = base_rew_1d.squeeze(-1)
-                shaped = shaped + 0.10 * base_rew_1d
+            reached, dist_to_target = self._compute_stage_reached(rx, ry)
+            shaped, dense, time_pen = self._compute_reward(dist_to_target, done_now, reached, rx, ry, bx, by)
             total_reward += shaped
+            total_dense += dense
+            total_time_pen += time_pen
 
             if bool(reached.any()):
-                self._stage_idx_buf = torch.where(reached, self._stage_idx_buf + 1, self._stage_idx_buf)
-                self._stage_origin_buf = torch.where(
-                    reached, torch.full_like(self._stage_origin_buf, float("nan")), self._stage_origin_buf
+                stage_idx_now = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+                self._update_stage_anchors(reached, stage_idx_now, rx, ry, bx, by)
+                stage_bonus = self._stage_sparse_bonus(reached)
+                total_reward = total_reward + stage_bonus
+                total_sparse += stage_bonus
+                next_stage_idx = torch.clamp(self._stage_idx_buf + 1, min=0, max=self._num_stages - 1)
+                next_rel = self._stage_relative_target[next_stage_idx]
+                set_next_origin = reached & next_rel
+                self._stage_origin_x_buf = torch.where(
+                    set_next_origin, rx.squeeze(-1), torch.full_like(self._stage_origin_x_buf, float("nan"))
                 )
-                completed = reached & (self._stage_idx_buf >= self._active_stage_count_buf)
-                if bool(completed.any()):
-                    total_reward[completed] += 2.0
+                self._stage_origin_y_buf = torch.where(
+                    set_next_origin, ry.squeeze(-1), torch.full_like(self._stage_origin_y_buf, float("nan"))
+                )
+                self._stage_idx_buf = torch.where(reached, self._stage_idx_buf + 1, self._stage_idx_buf)
+                self._prev_rel_progress = torch.where(
+                    reached, torch.full_like(self._prev_rel_progress, float("nan")), self._prev_rel_progress
+                )
 
             self._prev_robot_x, self._prev_robot_y = rx.clone(), ry.clone()
             self._prev_box_x, self._prev_box_y = bx.clone(), by.clone()
@@ -533,13 +927,19 @@ class TaskDTeacherEnv(gym.Wrapper):
                 f"[TaskDTeacher] nav={nav0:5d} curriculum={level0} "
                 f"active={active0} stage={min(idx0 + 1, active0)}/{active0}({stage_name}) "
                 f"prog={float(self._stage_progress_buf[0].item()):.2f} rew={total_reward.mean().item():+.4f} "
-                f"done[f/t/x]={self._done_fall}/{self._done_timeout}/{self._done_x_reached} "
-                f"ratio={self._done_fall/denom:.2f}/{self._done_timeout/denom:.2f}/{self._done_x_reached/denom:.2f}",
+                f"nav[dense/sparse/time]={total_dense.mean().item():+.3f}/"
+                f"{total_sparse.mean().item():+.3f}/{total_time_pen.mean().item():+.3f} "
+                f"done[f/t/x/stg/nm]={self._done_fall}/{self._done_timeout}/{self._done_x_reached}/"
+                f"{self._done_stage_target}/{self._done_no_motion} "
+                f"ratio={self._done_fall/denom:.2f}/{self._done_timeout/denom:.2f}/"
+                f"{self._done_x_reached/denom:.2f}/{self._done_stage_target/denom:.2f}/{self._done_no_motion/denom:.2f}",
                 flush=True,
             )
 
         obs_dict = self._obs_dict(self._current_obs)
         last_info = dict(last_info) if isinstance(last_info, dict) else {}
+        if episode_log:
+            last_info["log"] = episode_log
         last_info["teacher_stage"] = stage_name
         last_info["teacher_stage_idx"] = idx0
         last_info["teacher_curriculum_level"] = level0

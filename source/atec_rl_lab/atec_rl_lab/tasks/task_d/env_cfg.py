@@ -82,6 +82,15 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         },
         time_out=False,
     )
+    stage_target_deviation = DoneTerm(
+        func=atec_mdp.StageTargetDeviationTermination,
+        params={
+            "robot_asset_cfg": SceneEntityCfg("robot"),
+            "max_dist": 1.2,
+            "stage_idx_attr": "_nav_stage_idx",
+        },
+        time_out=False,
+    )
 
 @configclass
 class TaskDEnvCfg(BaseEnvCfg):

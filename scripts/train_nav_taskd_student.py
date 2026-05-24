@@ -21,6 +21,8 @@ parser.add_argument("--camera_hw", type=int, default=64)
 parser.add_argument("--depth_max", type=float, default=5.0)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+# Student policy always reads head/ee camera buffers.
+args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)

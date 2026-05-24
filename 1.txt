@@ -31,7 +31,14 @@ source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaa
 
 
 --device cuda:1
-
+python scripts/train_nav_taskd_student.py \
+  --ll_policy demo/policy.pt \
+  --num_envs 32 \
+  --steps_per_env 16 \
+  --camera_hw 64 \
+  --device cuda:0 \
+  --headless \
+  --enable_cameras
 
 python scripts/rsl_rl/train.py \
   --task ATEC-Isaac-Velocity-Flat-Unitree-B2Piper-v0 \
@@ -74,11 +81,10 @@ python scripts/bc/train_taskd_bc.py \
 
 python scripts/train_nav_taskd_student.py \
   --task ATEC-TaskD-B2Piper \
-  --ll_policy /path/to/low_level_policy.pt \
-  --bc_ckpt /path/to/logs/bc/taskd_run1/best.pt \
-  --num_envs 128 \
-  --inner_steps 25 \
-  --max_iter 8000 \
+  --ll_policy demo/policy.pt \
+  --num_envs 32 \
+  --inner_steps 5 \
+  --max_iter 10000 \
   --device cuda:0 \
   --headless
 

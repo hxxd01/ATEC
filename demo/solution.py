@@ -1,5 +1,96 @@
+import math
 import os
+
 import torch
+
+
+def build_taskd_nominal_waypoints(
+    nav_steps: list[dict],
+    start_xy: tuple[float, float] = (-3.0, 0.0),
+    box_spawn_xy: tuple[float, float] = (-3.0, 1.6),
+) -> list[tuple[float, float]]:
+    """Build nominal world-frame polyline from scripted nav_steps."""
+    x, y = float(start_xy[0]), float(start_xy[1])
+    box_x, box_y = float(box_spawn_xy[0]), float(box_spawn_xy[1])
+    waypoints: list[tuple[float, float]] = [(x, y)]
+    for step in nav_steps:
+        if step.get("match_box_x_tol") is not None:
+            x = box_x
+        elif step.get("match_box_y_tol") is not None:
+            y = box_y
+        elif step.get("box_x_stop") is not None:
+            x = float(step["box_x_stop"])
+        else:
+            axis = step.get("axis", "x")
+            sign = float(step.get("sign", 1.0))
+            dist = float(step.get("dist", 0.0))
+            if axis == "xy":
+                # Legacy diagonal step: dist along combined axis.
+                scale = math.sqrt(2.0)
+                dx = dist / scale
+                dy = dist / scale
+                x += dx if sign > 0 else -dx
+                y += dy if sign > 0 else -dy
+            elif axis == "x":
+                x += dist if sign > 0 else -dist
+            else:
+                y += dist if sign > 0 else -dist
+        waypoints.append((x, y))
+    return waypoints
+
+
+def _point_to_segment_distance(px: float, py: float, x0: float, y0: float, x1: float, y1: float) -> float:
+    vx, vy = x1 - x0, y1 - y0
+    seg_len_sq = vx * vx + vy * vy
+    if seg_len_sq <= 1.0e-12:
+        return math.hypot(px - x0, py - y0)
+    t = ((px - x0) * vx + (py - y0) * vy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    proj_x = x0 + t * vx
+    proj_y = y0 + t * vy
+    return math.hypot(px - proj_x, py - proj_y)
+
+
+def distance_to_reference_trajectory(
+    x: float,
+    y: float,
+    waypoints: list[tuple[float, float]],
+) -> float:
+    if len(waypoints) < 2:
+        return 0.0
+    return min(
+        _point_to_segment_distance(x, y, waypoints[i][0], waypoints[i][1], waypoints[i + 1][0], waypoints[i + 1][1])
+        for i in range(len(waypoints) - 1)
+    )
+
+
+def trajectory_deviation_batch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    waypoints: list[tuple[float, float]],
+) -> torch.Tensor:
+    """Minimum distance from each env position to the nominal trajectory polyline."""
+    if len(waypoints) < 2:
+        return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+    dev = torch.full((x.shape[0],), float("inf"), device=x.device, dtype=x.dtype)
+    px = x.squeeze(-1)
+    py = y.squeeze(-1)
+    for i in range(len(waypoints) - 1):
+        x0, y0 = waypoints[i]
+        x1, y1 = waypoints[i + 1]
+        vx = x1 - x0
+        vy = y1 - y0
+        seg_len_sq = vx * vx + vy * vy
+        if seg_len_sq <= 1.0e-12:
+            dist = torch.hypot(px - x0, py - y0)
+        else:
+            t = ((px - x0) * vx + (py - y0) * vy) / seg_len_sq
+            t = torch.clamp(t, 0.0, 1.0)
+            proj_x = x0 + t * vx
+            proj_y = y0 + t * vy
+            dist = torch.hypot(px - proj_x, py - proj_y)
+        dev = torch.minimum(dev, dist)
+    return dev
 
 
 class AlgSolution:
@@ -12,6 +103,8 @@ class AlgSolution:
     PUSH_YAW = 0.0
     BOX_HALF_X = 0.40
     BOX_HALF_Y = 0.50
+    ENABLE_TRAJECTORY_TERMINATION = True
+    TRAJECTORY_DEVIATION_TOL = 1.50  # meters, <=0 disables
 
     _LIDAR_H = 360
     _LIDAR_FRONT_HALF = 25
@@ -148,6 +241,11 @@ class AlgSolution:
             #dict(name="advance2", axis="x", sign=+1, dist=4.0, vx=1.5, vy=0.0, push=True),
         ]'''
 
+        self._reference_waypoints = build_taskd_nominal_waypoints(
+            self.nav_steps,
+            start_xy=self.ROBOT_SPAWN_XY,
+            box_spawn_xy=self.BOX_SPAWN_XY,
+        )
         self._reset_nav_state()
 
     def _reset_nav_state(self) -> None:
@@ -200,6 +298,8 @@ class AlgSolution:
         self._last_align_y_delta = 0.0
         self._push_mode = "none"
         self._last_stage_idx_batch = None
+        self._trajectory_deviated_batch = None
+        self._last_trajectory_dev = 0.0
 
     def _ensure_pe_state(self, batch_size: int, device, dtype) -> None:
         if (
@@ -217,6 +317,7 @@ class AlgSolution:
         self._step_wait_counter = torch.zeros((batch_size,), device=device, dtype=torch.long)
         self._step_wait_armed = torch.zeros((batch_size,), device=device, dtype=torch.bool)
         self._approach_done_batch = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+        self._trajectory_deviated_batch = torch.zeros((batch_size,), device=device, dtype=torch.bool)
 
     @property
     def _approach_done(self) -> bool:
@@ -279,6 +380,8 @@ class AlgSolution:
         self._step_wait_counter[env_mask] = 0
         self._step_wait_armed[env_mask] = False
         self._approach_done_batch[env_mask] = False
+        if self._trajectory_deviated_batch is not None:
+            self._trajectory_deviated_batch[env_mask] = False
         self._hl_cmd_force_refresh = True
 
     @staticmethod
@@ -884,6 +987,13 @@ class AlgSolution:
         self._last_box_xy = (float(box_x[0, 0].item()), float(box_y[0, 0].item()))
         self._last_box_z = float(box_z[0, 0].item())
         self._last_stage_idx_batch = self._nav_step_idx.detach().clone()
+        if self.ENABLE_TRAJECTORY_TERMINATION and self.TRAJECTORY_DEVIATION_TOL > 0.0:
+            dev = trajectory_deviation_batch(x, y, self._reference_waypoints)
+            self._last_trajectory_dev = float(dev[0].item())
+            self._trajectory_deviated_batch = dev > float(self.TRAJECTORY_DEVIATION_TOL)
+        else:
+            self._last_trajectory_dev = 0.0
+            self._trajectory_deviated_batch = torch.zeros((b,), device=device, dtype=torch.bool)
 
         lidar = self._lidar_sectors_and_box(self._extero)
         front_val = lidar["front"]
@@ -913,6 +1023,8 @@ class AlgSolution:
 
         push_ready_mask = (self._nav_step_idx >= len(self.nav_steps)) | self._approach_done_batch
         active_mask = ~push_ready_mask
+        if self._trajectory_deviated_batch is not None:
+            active_mask = active_mask & (~self._trajectory_deviated_batch)
 
         need_begin = active_mask & (~self._nav_origin_valid)
         if bool(need_begin.any()):
@@ -1057,6 +1169,10 @@ class AlgSolution:
             f"pos=({self._last_pos_xy[0]:+.2f},{self._last_pos_xy[1]:+.2f})",
             f"box=({self._last_box_xy[0]:+.2f},{self._last_box_xy[1]:+.2f},{self._last_box_z:+.2f})",
         ]
+        if self.ENABLE_TRAJECTORY_TERMINATION and self.TRAJECTORY_DEVIATION_TOL > 0.0:
+            lines.append(
+                f"traj_dev={self._last_trajectory_dev:.2f}m / tol={self.TRAJECTORY_DEVIATION_TOL:.2f}m"
+            )
         cur = self._current_nav_step()
         if cur is not None:
             step_idx0 = int(self._nav_step_idx[0].item()) if self._nav_step_idx is not None else 0
@@ -1164,8 +1280,11 @@ class AlgSolution:
             action_train = action_train.unsqueeze(0)
 
         action_env = self._map_policy_action_to_env_action(action_train, action_dim)
+        giveup = False
+        if self.ENABLE_TRAJECTORY_TERMINATION and self._trajectory_deviated_batch is not None:
+            giveup = bool(self._trajectory_deviated_batch.any().item())
         return {
             "action": action_env.detach().cpu().numpy().tolist(),
             "action_tensor": action_env.detach(),
-            "giveup": False,
+            "giveup": giveup,
         }
