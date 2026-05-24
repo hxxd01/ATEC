@@ -13,22 +13,71 @@ python scripts/rsl_rl/play.py \
 python scripts/rsl_rl/play.py --task ATEC-Isaac-Velocity-Rough-Unitree-B2-v0 --video --headless --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_rough/2026-05-17_03-41-56/model_7200.pt --video_length 400
 
 #转为jit
-python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_2400.pt   --headless
+python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-23_13-44-21/model_9500.pt   --headless
 
 
 #测试
 python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_3200.pt   --headless
 
 #demo里面评分
-cd /home/ubuntu/ATEC2026_Simulation_Challenge && python scripts/play_atec_task.py   --task ATEC-TaskA-B2Piper   --headless   --enable_cameras  --video --video_length 20000 --debug  
+cd /home/ubuntu/ATEC2026_Simulation_Challenge && python scripts/play_atec_task.py   --task ATEC-TaskD-B2Piper   --headless   --enable_cameras  --video --video_length 1500 --debug  
 
 
-python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --headless --debug --device cuda:1 --video --video_length 2000
+python scripts/play_atec_task.py --task ATEC-TaskA-B2Piper --headless --debug  --video --video_length 2000
 
 
 #看tensorboard
-ssh -L 6007:127.0.0.1:6007 ubuntu@117.50.75.119
-tensorboard --logdir=/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl
+source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && tensorboard --logdir=/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl --host 127.0.0.1 --port 6010
 
 
 --device cuda:1
+
+
+python scripts/rsl_rl/train.py \
+  --task ATEC-Isaac-Velocity-Flat-Unitree-B2Piper-v0 \
+  --headless
+
+
+
+python scripts/rsl_rl/play.py \
+  --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0 \
+  --checkpoint logs/rsl_rl/unitree_b2_piper_rough/2026-05-22_22-16-08/model_3300.pt \
+  --headless --video --video_length 2000
+
+
+python scripts/rsl_rl/train.py \
+  --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0 \
+  --headless \
+  --resume \
+  --load_run 2026-05-18_14-45-46 \
+  --checkpoint model_7700.pt
+
+python scripts/collect_taskd_trajectories.py \
+  --task ATEC-TaskD-B2Piper \
+  --num_envs 32 \
+  --total_steps 5000 \
+  --device cuda:0 \
+  --store_images \
+  --no-store_uint8_images \
+  --headless \
+  --collect_hz 10
+
+
+python scripts/bc/train_taskd_bc.py \
+  --data /home/ubuntu/ATEC2026_Simulation_Challenge/logs/datasets/ATEC-TaskD-B2Piper/2026-05-24_16-12-51/trajectories.pkl \
+  --save_dir logs/bc/taskd_run1 \
+  --device cuda:0 \
+  --seq_len 24 \
+  --stride 4 \
+  --batch_size 32 \
+  --epochs 100
+
+python scripts/train_nav_taskd_student.py \
+  --task ATEC-TaskD-B2Piper \
+  --ll_policy /path/to/low_level_policy.pt \
+  --bc_ckpt /path/to/logs/bc/taskd_run1/best.pt \
+  --num_envs 128 \
+  --inner_steps 25 \
+  --max_iter 8000 \
+  --device cuda:0 \
+  --headless

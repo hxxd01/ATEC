@@ -5,8 +5,10 @@ Implementation of Task D environment configuration with different robots.
 """
 
 import copy
+import torch
 from isaaclab.utils import configclass
 import atec_rl_lab.tasks.task_d.mdp as atec_mdp
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import SceneEntityCfg
@@ -16,6 +18,24 @@ import isaaclab.sim as sim_utils
 from atec_rl_lab.tasks.task_base import BaseEnvCfg
 from atec_rl_lab.tasks.task_base.envs_base_cfg import TerminationsCfg as BaseTerminationsCfg
 from .terrain import TASK_D_TERRAIN_CFG, PitAndPlatformTerrainCfg
+
+
+def reset_root_state_absolute(
+    env,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    world_pos: tuple[float, float, float] = (-3.0, 0.0, 0.8),
+):
+    """Reset asset root pose to a fixed world position (ignore env_origin offset)."""
+    asset = env.scene[asset_cfg.name]
+    n = len(env_ids)
+    root_states = asset.data.default_root_state[env_ids].clone()
+    positions = torch.tensor(world_pos, device=asset.device, dtype=root_states.dtype).view(1, 3).repeat(n, 1)
+    orientations = root_states[:, 3:7]
+    velocities = torch.zeros(n, 6, device=asset.device, dtype=root_states.dtype)
+    asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
 
 @configclass
 class RewardsCfg:
@@ -50,6 +70,15 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "x_threshold": 3.5,
+        },
+        time_out=False,
+    )
+    no_motion_timeout = DoneTerm(
+        func=atec_mdp.NoMotionTimeout,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "stuck_time_s": 1.5,
+            "speed_eps": 0.03,
         },
         time_out=False,
     )
@@ -107,6 +136,24 @@ class TaskDEnvCfg(BaseEnvCfg):
         # Trun off terminations
         self.terminations.illegal_contact = None
         self.terminations.fall.params["minimum_height"] = 0.25
+
+        # Reset in world frame to avoid default_root_state + env_origin double-offset.
+        self.events.reset_robot_root = EventTerm(
+            func=reset_root_state_absolute,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "world_pos": (-3.0, 0.0, 0.8),
+            },
+        )
+        self.events.reset_box_root = EventTerm(
+            func=reset_root_state_absolute,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("box"),
+                "world_pos": (-3.0, 1.6, 0.5),
+            },
+        )
 
 @configclass
 class TaskDEnvG1Cfg(TaskDEnvCfg):

@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 # Repo root contains package `demo/`; running `python scripts/...` only puts scripts/ on sys.path.
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -55,6 +56,24 @@ parser.add_argument(
     default=False,
     help="Keep all sensors (4 cameras + lidar); reset/step will be very slow.",
 )
+parser.add_argument(
+    "--save-camera-views",
+    action="store_true",
+    default=False,
+    help="Save each stream in obs['image'] as a separate mp4 file.",
+)
+parser.add_argument(
+    "--camera-video-dir",
+    type=str,
+    default=None,
+    help="Output directory for camera-view mp4 files. Defaults to logs/videos/<task>/camera_views/<timestamp>.",
+)
+parser.add_argument(
+    "--camera-video-fps",
+    type=int,
+    default=25,
+    help="FPS for saved camera-view videos.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -85,7 +104,12 @@ if hasattr(solution, "set_device"):
 # Imports AFTER simulation_app is created (IsaacLab pattern)
 # -----------------------------------------------------------------------------
 import gymnasium as gym  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
+try:  # noqa: E402
+    import imageio.v2 as imageio
+except ImportError:  # pragma: no cover
+    imageio = None
 
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent  # noqa: E402
 from isaaclab.utils.dict import print_dict  # noqa: E402
@@ -186,6 +210,168 @@ def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_tim
         pass
 
 
+def _print_done_reason(terminated, truncated, info, env=None) -> None:
+    """Print done flags and best-effort termination cause."""
+    term_val = bool(terminated.item() if hasattr(terminated, "item") else terminated)
+    trunc_val = bool(truncated.item() if hasattr(truncated, "item") else truncated)
+    print(f"[play] done: terminated={int(term_val)} truncated={int(trunc_val)}", flush=True)
+    if not isinstance(info, dict):
+        return
+
+    # Common structured fields used by env wrappers/managers.
+    for key in ("termination_terms", "terminations", "done_reasons", "episode_end"):
+        if key in info:
+            print(f"[play] {key}: {info[key]}", flush=True)
+
+    # Fallback: surface likely termination-related true flags.
+    true_flags: list[str] = []
+    for key, value in info.items():
+        key_l = str(key).lower()
+        if not any(tok in key_l for tok in ("term", "done", "fall", "timeout", "trunc", "reach")):
+            continue
+        flag = None
+        if isinstance(value, bool):
+            flag = value
+        elif isinstance(value, (int, float)):
+            flag = bool(value)
+        elif hasattr(value, "numel") and hasattr(value, "view"):
+            try:
+                if value.numel() > 0:
+                    flag = bool(value.view(-1)[0].item())
+            except Exception:
+                flag = None
+        if flag:
+            true_flags.append(f"{key}={value}")
+
+    if true_flags:
+        print("[play] true termination-related flags:", flush=True)
+        for line in true_flags:
+            print(f"  - {line}", flush=True)
+
+    # Final fallback: infer common Task D termination terms directly from env state.
+    try:
+        if env is None:
+            return
+        robot = env.unwrapped.scene.articulations["robot"]
+        root_pos = robot.data.root_pos_w
+        root_x = float(root_pos[0, 0].item())
+        root_z = float(root_pos[0, 2].item())
+
+        fall_thresh = 0.25
+        x_thresh = 3.5
+        try:
+            cfg = env.unwrapped.cfg
+            if getattr(cfg, "terminations", None) is not None:
+                fall_cfg = getattr(cfg.terminations, "fall", None)
+                x_cfg = getattr(cfg.terminations, "x_reached", None)
+                if fall_cfg is not None and isinstance(getattr(fall_cfg, "params", None), dict):
+                    fall_thresh = float(fall_cfg.params.get("minimum_height", fall_thresh))
+                if x_cfg is not None and isinstance(getattr(x_cfg, "params", None), dict):
+                    x_thresh = float(x_cfg.params.get("x_threshold", x_thresh))
+        except Exception:
+            pass
+
+        fall_flag = root_z < fall_thresh
+        x_reached_flag = root_x > x_thresh
+        time_out_flag = False
+        try:
+            # episode_length_buf is per-env step counter in Isaac Lab envs.
+            step_count = int(env.unwrapped.episode_length_buf[0].item())
+            max_steps = int(env.unwrapped.max_episode_length)
+            time_out_flag = step_count >= max_steps
+            print(
+                f"[play] infer: step={step_count}/{max_steps} "
+                f"root_x={root_x:+.3f} (x_thresh={x_thresh:+.3f}) "
+                f"root_z={root_z:+.3f} (fall_thresh={fall_thresh:+.3f})",
+                flush=True,
+            )
+        except Exception:
+            print(
+                f"[play] infer: root_x={root_x:+.3f} (x_thresh={x_thresh:+.3f}) "
+                f"root_z={root_z:+.3f} (fall_thresh={fall_thresh:+.3f})",
+                flush=True,
+            )
+
+        print(
+            f"[play] infer terms: fall={int(fall_flag)} x_reached={int(x_reached_flag)} time_out={int(time_out_flag)}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _to_uint8_hwc(frame) -> np.ndarray | None:
+    """Convert image tensor/array to uint8 HWC for video writing."""
+    if isinstance(frame, torch.Tensor):
+        arr = frame.detach().cpu().numpy()
+    else:
+        arr = np.asarray(frame)
+
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim != 3:
+        return None
+
+    # CHW -> HWC if needed
+    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.shape[-1] > 3:
+        arr = arr[..., :3]
+
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return None
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        max_v = float(arr.max())
+        min_v = float(arr.min())
+        if max_v <= 1.5 and min_v >= 0.0:
+            arr = arr * 255.0
+        elif max_v > min_v:
+            arr = (arr - min_v) / (max_v - min_v) * 255.0
+        arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+    return arr
+
+
+class CameraViewRecorder:
+    """Record obs['image'] streams to mp4 files."""
+
+    def __init__(self, out_dir: str, fps: int):
+        self.out_dir = out_dir
+        self.fps = int(fps)
+        self.writers: dict[str, object] = {}
+        os.makedirs(self.out_dir, exist_ok=True)
+        print(f"[play] camera views output: {self.out_dir}", flush=True)
+
+    def _get_writer(self, key: str):
+        if key not in self.writers:
+            path = os.path.join(self.out_dir, f"{key}.mp4")
+            self.writers[key] = imageio.get_writer(path, fps=self.fps)
+            print(f"[play] recording stream: {path}", flush=True)
+        return self.writers[key]
+
+    def write(self, obs: dict):
+        if not isinstance(obs, dict):
+            return
+        image_obs = obs.get("image")
+        if not isinstance(image_obs, dict):
+            return
+        for key, value in image_obs.items():
+            frame = _to_uint8_hwc(value)
+            if frame is None:
+                continue
+            self._get_writer(key).append_data(frame)
+
+    def close(self):
+        for writer in self.writers.values():
+            writer.close()
+        self.writers.clear()
+
+
 def play() -> tuple[float, float]:
     if args_cli.task is None:
         raise ValueError("Please provide --task, e.g. --task ATEC-TaskA-G1")
@@ -250,6 +436,18 @@ def play() -> tuple[float, float]:
     print(f"[play] env.reset() starting ({fast_hint}) ...", flush=True)
     obs, _ = env.reset()
     print("[play] env.reset() done, entering control loop.", flush=True)
+    camera_recorder = None
+    if args_cli.save_camera_views:
+        if imageio is None:
+            raise ImportError("imageio is required for --save-camera-views. Install with: pip install imageio")
+        if args_cli.camera_video_dir is not None:
+            out_dir = os.path.abspath(args_cli.camera_video_dir)
+        else:
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            out_dir = os.path.abspath(os.path.join("logs", "videos", args_cli.task, "camera_views", stamp))
+        camera_recorder = CameraViewRecorder(out_dir=out_dir, fps=args_cli.camera_video_fps)
+        camera_recorder.write(obs)
+
     if args_cli.video and not is_task_e:
         camera_follow(env)
     if hasattr(solution, "reset"):
@@ -294,6 +492,8 @@ def play() -> tuple[float, float]:
                 )
 
             obs, reward, terminated, truncated, info = env.step(actions)
+            if camera_recorder is not None:
+                camera_recorder.write(obs)
             if not is_task_e and (args_cli.video or not args_cli.headless):
                 camera_follow(env)
 
@@ -314,6 +514,7 @@ def play() -> tuple[float, float]:
 
             done = (terminated.item() or truncated.item())
             if done:
+                _print_done_reason(terminated, truncated, info, env=env)
                 break
 
             timestep += 1
@@ -327,6 +528,8 @@ def play() -> tuple[float, float]:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
+    if camera_recorder is not None:
+        camera_recorder.close()
     env.close()
 
     return total_episode_reward, total_elapsed_time

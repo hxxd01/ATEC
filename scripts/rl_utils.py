@@ -2,8 +2,6 @@ import numpy as np
 import torch
 import gymnasium as gym
 
-import isaaclab.utils.math as math_utils
-
 
 def draw_text_overlay(frame: np.ndarray, lines: list[str]) -> np.ndarray:
     """Draw semi-transparent HUD text on the top-left of an RGB frame."""
@@ -99,17 +97,10 @@ def camera_follow(env, robot_name: str = "robot", env_index: int = 0, alpha: flo
     device = unwrapped.device
 
     robot_pos = robot.data.root_pos_w[env_index]
-    robot_quat = robot.data.root_quat_w[env_index]
-
-    camera_offset = torch.tensor([-6.0, 0.0, 0.8], dtype=torch.float32, device=device)
-
-    target_camera_pos = math_utils.transform_points(
-        camera_offset.unsqueeze(0),
-        pos=robot_pos.unsqueeze(0),
-        quat=robot_quat.unsqueeze(0),
-    ).squeeze(0)
-
-    target_camera_pos[2] = torch.clamp(target_camera_pos[2], min=0.2)
+    # Top-down spectator view for precise foothold inspection.
+    top_offset = torch.tensor([-0.6, 0.0, 4.0], dtype=torch.float32, device=device)
+    target_camera_pos = robot_pos + top_offset
+    target_camera_pos[2] = torch.clamp(target_camera_pos[2], min=1.2)
 
     if not hasattr(camera_follow, "_smooth_pos"):
         camera_follow._smooth_pos = {}

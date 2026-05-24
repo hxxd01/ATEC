@@ -1,0 +1,135 @@
+"""Task D student wrapper: image(+depth)+proprio observations, no privileged critic."""
+
+from __future__ import annotations
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from .taskd_teacher_env import (
+    TaskDTeacherEnv,
+    _LIN_VEL_SLICE,
+    _ANG_VEL_SLICE,
+    _GRAVITY_SLICE,
+)
+
+
+class TaskDStudentEnv(TaskDTeacherEnv):
+    def __init__(
+        self,
+        env: gym.Env,
+        ll_policy_path: str,
+        device: str = "cuda",
+        inner_steps: int = 25,
+        vx_min: float = -2.0,
+        vx_max: float = 2.0,
+        image_hw: int = 64,
+        depth_max: float = 5.0,
+    ):
+        super().__init__(
+            env=env,
+            ll_policy_path=ll_policy_path,
+            device=device,
+            inner_steps=inner_steps,
+            lidar_bins=0,
+            vx_min=vx_min,
+            vx_max=vx_max,
+        )
+        self._image_hw = int(image_hw)
+        self._depth_max = float(depth_max)
+        self._student_img_flat = 8 * self._image_hw * self._image_hw
+        self._actor_dim = self._student_img_flat + 9
+        # privileged extras:
+        # robot pose(3) + box pose(3) + rel body(3) + r_vel(2) + b_vel(2) + rel_world(2) + contact(1)
+        # + stage onehot(num_stages) + stage_progress(1)
+        self._critic_extra_dim = 17 + self._num_stages
+        self._critic_dim = self._actor_dim + self._critic_extra_dim
+        self.observation_space = gym.spaces.Dict(
+            {
+                "policy": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self._actor_dim,), dtype=np.float32),
+                "critic": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self._critic_dim,), dtype=np.float32),
+            }
+        )
+        print(
+            f"[TaskDStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
+            f"(includes {self._critic_extra_dim} privileged dims)",
+            flush=True,
+        )
+
+    def _prep_rgb(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.float32:
+            x = x.float()
+        if x.max() > 1.5:
+            x = x / 255.0
+        x = x.permute(0, 3, 1, 2).contiguous()
+        if x.shape[-1] != self._image_hw or x.shape[-2] != self._image_hw:
+            x = F.interpolate(x, size=(self._image_hw, self._image_hw), mode="bilinear", align_corners=False)
+        return x
+
+    def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.float32:
+            x = x.float()
+        if x.ndim == 4 and x.shape[-1] == 1:
+            x = x[..., 0]
+        x = torch.nan_to_num(x, nan=self._depth_max, posinf=self._depth_max, neginf=0.0)
+        x = torch.clamp(x, 0.05, self._depth_max)
+        x = torch.log1p(x) / np.log1p(self._depth_max)
+        x = x.unsqueeze(1)
+        if x.shape[-1] != self._image_hw or x.shape[-2] != self._image_hw:
+            x = F.interpolate(x, size=(self._image_hw, self._image_hw), mode="bilinear", align_corners=False)
+        return x
+
+    def _camera_4ch(self, cam_name: str, batch: int) -> torch.Tensor:
+        try:
+            cam = self.env.unwrapped.scene[cam_name]
+            out = cam.data.output
+            rgb = self._prep_rgb(out["rgb"].to(device=self._device))
+            depth = self._prep_depth(out["depth"].to(device=self._device))
+            return torch.cat([rgb, depth], dim=1)
+        except Exception:
+            return torch.zeros(batch, 4, self._image_hw, self._image_hw, device=self._device, dtype=torch.float32)
+
+    def _build_actor_obs(self, env_obs: dict):
+        proprio = env_obs["proprio"].to(self._device, dtype=torch.float32)
+        batch = proprio.shape[0]
+        lin_vel = proprio[:, _LIN_VEL_SLICE]
+        ang_vel = proprio[:, _ANG_VEL_SLICE]
+        gravity = proprio[:, _GRAVITY_SLICE]
+        proprio_feat = torch.cat([lin_vel, ang_vel, gravity], dim=-1)
+
+        head = self._camera_4ch("head_camera", batch).reshape(batch, -1)
+        ee = self._camera_4ch("ee_camera", batch).reshape(batch, -1)
+        return torch.cat([head, ee, proprio_feat], dim=-1)
+
+    def _build_critic_obs(self, actor_obs: torch.Tensor):
+        robot = self.env.unwrapped.scene["robot"]
+        box = self.env.unwrapped.scene["box"]
+        r_vel = robot.data.root_lin_vel_w.to(device=self._device, dtype=torch.float32)[:, :2]
+        b_vel = box.data.root_lin_vel_w.to(device=self._device, dtype=torch.float32)[:, :2]
+        rx, ry, robot_yaw = self._robot_pose()
+        bx, by, box_yaw = self._box_pose()
+        bx_body, by_body = self._relative_box_body(rx, ry, robot_yaw, bx, by)
+        rel_yaw = torch.atan2(torch.sin(box_yaw - robot_yaw), torch.cos(box_yaw - robot_yaw))
+        rel_world = torch.cat([bx - rx, by - ry], dim=-1)
+        cf = self.env.unwrapped.scene["contact_sensor"].data.net_forces_w
+        contact_on = (cf.norm(dim=-1).max(dim=1).values > 2.0).to(dtype=torch.float32).unsqueeze(-1)
+        stage_oh = self._stage_onehot(actor_obs.shape[0])
+        stage_prog = self._stage_progress_buf.unsqueeze(-1)
+
+        priv = torch.cat(
+            [
+                torch.cat([rx, ry, robot_yaw], dim=-1),
+                torch.cat([bx, by, box_yaw], dim=-1),
+                torch.cat([bx_body, by_body, rel_yaw], dim=-1),
+                r_vel,
+                b_vel,
+                rel_world,
+                contact_on,
+                stage_oh,
+                stage_prog,
+            ],
+            dim=-1,
+        )
+        return torch.cat([actor_obs, priv], dim=-1)
+

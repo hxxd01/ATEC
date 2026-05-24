@@ -76,3 +76,57 @@ class NavCameraPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
     )
     algorithm = _PPO_ALG
+
+
+@configclass
+class TaskDTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """PPO config for Task D teacher training (asymmetric actor/critic obs)."""
+
+    num_steps_per_env = 24
+    max_iterations = 8000
+    save_interval = 100
+    experiment_name = "taskd_teacher_b2piper"
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=0.6,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="elu",
+    )
+    algorithm = _PPO_ALG
+
+
+@configclass
+class TaskDStudentActorCriticCfg(RslRlPpoActorCriticCfg):
+    class_name: str = "TaskDStudentActorCritic"
+    img_hw: int = 64
+    proprio_dim: int = 9
+    enc_dim: int = 128
+    fuse_dim: int = 256
+    rnn_type: str = "gru"
+    rnn_hidden_dim: int = 256
+    rnn_num_layers: int = 1
+
+
+@configclass
+class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """PPO config for Task D student fine-tuning (no privileged critic)."""
+
+    num_steps_per_env = 24
+    max_iterations = 8000
+    save_interval = 100
+    experiment_name = "taskd_student_b2piper"
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+
+    policy = TaskDStudentActorCriticCfg(
+        init_noise_std=0.6,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256],
+        critic_hidden_dims=[256, 128],
+        activation="elu",
+    )
+    algorithm = _PPO_ALG
