@@ -152,7 +152,7 @@ class AlgSolution:
         )
 
         self.dt = 0.02
-        self.high_level_hz = 2.0
+        self.high_level_hz = 10.0
         self.nav_k_yaw = 1.2
         self.nav_k_wz = 0.25
         self.nav_wz_lim = 0.35

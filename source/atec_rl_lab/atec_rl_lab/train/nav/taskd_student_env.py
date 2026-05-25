@@ -26,6 +26,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         vx_max: float = 2.0,
         image_hw: int = 64,
         depth_max: float = 5.0,
+        depth_only: bool = False,
         nav_log_interval: int = 10,
     ):
         super().__init__(
@@ -41,7 +42,9 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         self._nav_log_tag = "TaskDStudent"
         self._image_hw = int(image_hw)
         self._depth_max = float(depth_max)
-        self._student_img_flat = 8 * self._image_hw * self._image_hw
+        self._depth_only = bool(depth_only)
+        self._img_channels = 1 if self._depth_only else 4
+        self._student_img_flat = 2 * self._img_channels * self._image_hw * self._image_hw
         self._actor_dim = self._student_img_flat + 9
         # privileged extras:
         # robot pose(3) + box pose(3) + rel body(3) + r_vel(2) + b_vel(2) + rel_world(2) + contact(1)
@@ -56,6 +59,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         )
         print(
             f"[TaskDStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
+            f"img={self._img_channels}ch x2 cams depth_only={self._depth_only} "
             f"(includes {self._critic_extra_dim} privileged dims)",
             flush=True,
         )
@@ -71,27 +75,47 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         return x
 
     def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
+        src_is_int = not x.dtype.is_floating_point
         if x.dtype != torch.float32:
             x = x.float()
-        if x.ndim == 4 and x.shape[-1] == 1:
+        if x.ndim == 4 and x.shape[1] == 1:
+            x = x[:, 0]
+        elif x.ndim == 4 and x.shape[-1] == 1:
             x = x[..., 0]
         x = torch.nan_to_num(x, nan=self._depth_max, posinf=self._depth_max, neginf=0.0)
-        x = torch.clamp(x, 0.05, self._depth_max)
-        x = torch.log1p(x) / np.log1p(self._depth_max)
-        x = x.unsqueeze(1)
+        if src_is_int:
+            x = torch.clamp(x / 255.0, 0.0, 1.0)
+        elif x.max() > 1.5:
+            x = torch.clamp(x, 0.05, self._depth_max)
+            x = torch.log1p(x) / np.log1p(self._depth_max)
+        else:
+            x = torch.clamp(x, 0.0, 1.0)
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
         if x.shape[-1] != self._image_hw or x.shape[-2] != self._image_hw:
             x = F.interpolate(x, size=(self._image_hw, self._image_hw), mode="bilinear", align_corners=False)
         return x
 
-    def _camera_4ch(self, cam_name: str, batch: int) -> torch.Tensor:
+    def _camera_tensor(self, cam_name: str, batch: int) -> torch.Tensor:
         try:
             cam = self.env.unwrapped.scene[cam_name]
             out = cam.data.output
+            if self._depth_only:
+                if "depth" not in out:
+                    raise KeyError(f"{cam_name} missing depth output")
+                return self._prep_depth(out["depth"].to(device=self._device))
             rgb = self._prep_rgb(out["rgb"].to(device=self._device))
             depth = self._prep_depth(out["depth"].to(device=self._device))
             return torch.cat([rgb, depth], dim=1)
         except Exception:
-            return torch.zeros(batch, 4, self._image_hw, self._image_hw, device=self._device, dtype=torch.float32)
+            return torch.zeros(
+                batch,
+                self._img_channels,
+                self._image_hw,
+                self._image_hw,
+                device=self._device,
+                dtype=torch.float32,
+            )
 
     def _build_actor_obs(self, env_obs: dict):
         proprio = env_obs["proprio"].to(self._device, dtype=torch.float32)
@@ -101,8 +125,8 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         gravity = proprio[:, _GRAVITY_SLICE]
         proprio_feat = torch.cat([lin_vel, ang_vel, gravity], dim=-1)
 
-        head = self._camera_4ch("head_camera", batch).reshape(batch, -1)
-        ee = self._camera_4ch("ee_camera", batch).reshape(batch, -1)
+        head = self._camera_tensor("head_camera", batch).reshape(batch, -1)
+        ee = self._camera_tensor("ee_camera", batch).reshape(batch, -1)
         return torch.cat([head, ee, proprio_feat], dim=-1)
 
     def _build_critic_obs(self, actor_obs: torch.Tensor):

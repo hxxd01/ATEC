@@ -42,6 +42,7 @@ class TaskDStudentActorCritic(nn.Module):
         num_actions: int,
         *,
         img_hw: int = 64,
+        img_channels: int = 4,
         proprio_dim: int = 9,
         enc_dim: int = 128,
         fuse_dim: int = 256,
@@ -67,12 +68,13 @@ class TaskDStudentActorCritic(nn.Module):
 
         self.obs_groups = obs_groups
         self.img_hw = int(img_hw)
-        self.head_flat = 4 * self.img_hw * self.img_hw
-        self.ee_flat = 4 * self.img_hw * self.img_hw
+        self.img_channels = int(img_channels)
+        self.head_flat = self.img_channels * self.img_hw * self.img_hw
+        self.ee_flat = self.img_channels * self.img_hw * self.img_hw
         self.proprio_dim = int(proprio_dim)
 
-        self.head_encoder = ConvEncoder(in_ch=4, out_dim=enc_dim)
-        self.ee_encoder = ConvEncoder(in_ch=4, out_dim=enc_dim)
+        self.head_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
+        self.ee_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
         self.proprio_mlp = nn.Sequential(
             nn.Linear(self.proprio_dim, 64),
             nn.ReLU(inplace=True),
@@ -97,12 +99,14 @@ class TaskDStudentActorCritic(nn.Module):
             else nn.Identity()
         )
 
-        self.memory_a = Memory(fuse_dim, hidden_dim=rnn_hidden_dim, num_layers=rnn_num_layers, type=rnn_type)
+        self.memory_a = Memory(
+            fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim
+        )
         self.memory_c = Memory(
             fuse_dim + (64 if self._critic_priv_dim > 0 else 0),
-            hidden_dim=rnn_hidden_dim,
-            num_layers=rnn_num_layers,
             type=rnn_type,
+            num_layers=rnn_num_layers,
+            hidden_size=rnn_hidden_dim,
         )
 
         # Keep actor head shape BC-compatible: 256 -> 256 -> action_dim
@@ -154,11 +158,13 @@ class TaskDStudentActorCritic(nn.Module):
         return torch.cat([obs[g] for g in groups], dim=-1)
 
     def _encode_base(self, flat_obs: torch.Tensor) -> torch.Tensor:
-        # base layout: [head(4*H*W), ee(4*H*W), proprio(9)]
+        # base layout: [head(C*H*W), ee(C*H*W), proprio(9)]
         lead_shape = flat_obs.shape[:-1]
         x = flat_obs.reshape(-1, flat_obs.shape[-1])
-        head = x[:, : self.head_flat].view(-1, 4, self.img_hw, self.img_hw)
-        ee = x[:, self.head_flat : self.head_flat + self.ee_flat].view(-1, 4, self.img_hw, self.img_hw)
+        head = x[:, : self.head_flat].view(-1, self.img_channels, self.img_hw, self.img_hw)
+        ee = x[:, self.head_flat : self.head_flat + self.ee_flat].view(
+            -1, self.img_channels, self.img_hw, self.img_hw
+        )
         proprio = x[:, self.head_flat + self.ee_flat : self.head_flat + self.ee_flat + self.proprio_dim]
         h_feat = self.head_encoder(head)
         e_feat = self.ee_encoder(ee)
@@ -186,12 +192,10 @@ class TaskDStudentActorCritic(nn.Module):
             std = torch.exp(self.log_std).expand_as(mean)
         self.distribution = Normal(mean, std)
 
-    def act(self, obs: dict, **kwargs) -> torch.Tensor:
-        masks = kwargs.get("masks", None)
-        hidden_state = kwargs.get("hidden_state", None)
+    def act(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
         encoded = self._encode_actor(self._get_flat_obs(obs, self.obs_groups["policy"]))
         encoded = self.actor_obs_normalizer(encoded)
-        out_mem = self.memory_a(encoded, masks, hidden_state).squeeze(0)
+        out_mem = self.memory_a(encoded, masks, hidden_states).squeeze(0)
         self.update_distribution(out_mem)
         return self.distribution.sample()
 
@@ -201,12 +205,10 @@ class TaskDStudentActorCritic(nn.Module):
         out_mem = self.memory_a(encoded).squeeze(0)
         return self.actor(out_mem)
 
-    def evaluate(self, obs: dict, **kwargs) -> torch.Tensor:
-        masks = kwargs.get("masks", None)
-        hidden_state = kwargs.get("hidden_state", None)
+    def evaluate(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
         encoded = self._encode_critic(self._get_flat_obs(obs, self.obs_groups["critic"]))
         encoded = self.critic_obs_normalizer(encoded)
-        out_mem = self.memory_c(encoded, masks, hidden_state).squeeze(0)
+        out_mem = self.memory_c(encoded, masks, hidden_states).squeeze(0)
         return self.critic(out_mem)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -225,5 +227,9 @@ class TaskDStudentActorCritic(nn.Module):
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
 
     def get_hidden_states(self):
-        return self.memory_a.hidden_state, self.memory_c.hidden_state
+        return self.memory_a.hidden_states, self.memory_c.hidden_states
+
+    def detach_hidden_states(self, dones=None):
+        self.memory_a.detach_hidden_states(dones)
+        self.memory_c.detach_hidden_states(dones)
 

@@ -19,6 +19,16 @@ parser.add_argument("--vx_min", type=float, default=-2.0)
 parser.add_argument("--vx_max", type=float, default=2.0)
 parser.add_argument("--camera_hw", type=int, default=64)
 parser.add_argument("--depth_max", type=float, default=5.0)
+parser.add_argument(
+    "--depth_only",
+    action="store_true",
+    help="Use depth maps only (head+ee). Isaac cameras render depth only (no RGB).",
+)
+parser.add_argument(
+    "--tiled_cameras",
+    action="store_true",
+    help="Use TiledCameraCfg for head/ee (one tiled render product per camera type; scales to more envs).",
+)
 parser.add_argument("--ppo_no_train", action="store_true", help="Disable PPO updates; run rollout only.")
 parser.add_argument("--no_train_steps", type=int, default=300, help="High-level rollout steps for --ppo_no_train.")
 parser.add_argument("--video", action="store_true", default=False, help="Record a rollout video.")
@@ -156,12 +166,19 @@ def _run_no_train_rollout(vec_env: NavRslRlVecEnvWrapper, steps: int, policy=Non
             )
 
 
-def _load_bc_into_actor_critic(actor_critic, ckpt_path: str) -> None:
+def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool = False) -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu")
     bc_sd = ckpt.get("model", ckpt)
     model_sd = actor_critic.state_dict()
 
-    prefixes = ("head_encoder.", "ee_encoder.", "proprio_mlp.", "fuse.")
+    prefixes = ("proprio_mlp.", "fuse.")
+    if not depth_only:
+        prefixes = ("head_encoder.", "ee_encoder.",) + prefixes
+    else:
+        print(
+            "[WARN] depth_only=True: skipping BC head/ee encoder warm-start (in_ch mismatch).",
+            flush=True,
+        )
     loaded = 0
     skipped = []
     for k, v in bc_sd.items():
@@ -222,6 +239,36 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str) -> None:
         print(f"[INFO] Example skipped keys: {skipped[:5]}", flush=True)
 
 
+def _configure_student_cameras(
+    env_cfg,
+    camera_hw: int,
+    depth_only: bool,
+    tiled: bool,
+) -> None:
+    """Resize cameras; optionally depth-only and/or tiled rendering."""
+    from isaaclab.sensors import CameraCfg, TiledCameraCfg
+
+    cam_cfg_cls = TiledCameraCfg if tiled else CameraCfg
+    data_types = ["depth"] if depth_only else ["rgb", "depth"]
+    for cam_name in ("head_camera", "ee_camera"):
+        cam = getattr(env_cfg.scene, cam_name, None)
+        if cam is None:
+            continue
+        setattr(
+            env_cfg.scene,
+            cam_name,
+            cam_cfg_cls(
+                prim_path=cam.prim_path,
+                spawn=cam.spawn,
+                offset=cam.offset,
+                height=int(camera_hw),
+                width=int(camera_hw),
+                data_types=data_types,
+                update_period=cam.update_period,
+            ),
+        )
+
+
 def main():
     device = args_cli.device if args_cli.device else "cuda"
 
@@ -234,12 +281,22 @@ def main():
     if getattr(env_cfg.scene, "lidar_sensor", None) is not None:
         env_cfg.scene.lidar_sensor = None
     print("[INFO] Student sim: LiDAR disabled (extero obs + lidar_sensor off).", flush=True)
-    if getattr(env_cfg.scene, "head_camera", None) is not None:
-        env_cfg.scene.head_camera.height = args_cli.camera_hw
-        env_cfg.scene.head_camera.width = args_cli.camera_hw
-    if getattr(env_cfg.scene, "ee_camera", None) is not None:
-        env_cfg.scene.ee_camera.height = args_cli.camera_hw
-        env_cfg.scene.ee_camera.width = args_cli.camera_hw
+    _configure_student_cameras(
+        env_cfg,
+        args_cli.camera_hw,
+        args_cli.depth_only,
+        args_cli.tiled_cameras,
+    )
+    if args_cli.tiled_cameras:
+        print(
+            "[INFO] Student sim: tiled_cameras=True (TiledCameraCfg for head/ee; "
+            "one tiled render product per camera type).",
+            flush=True,
+        )
+    if args_cli.depth_only:
+        print("[INFO] Student sim: depth_only mode (cameras data_types=['depth']).", flush=True)
+    elif args_cli.video:
+        print("[WARN] Video recording uses RGB; run without --depth_only for meaningful video.", flush=True)
 
     # Render cameras once per nav step (not every physics substep).
     decimation = int(getattr(env_cfg, "decimation", 4))
@@ -251,7 +308,9 @@ def main():
             cam.update_period = nav_dt
     print(
         f"[INFO] Student sim: nav_dt={nav_dt:.3f}s ({1.0 / nav_dt:.1f}Hz), "
-        f"camera_hw={args_cli.camera_hw}, num_envs={args_cli.num_envs}, inner_steps={args_cli.inner_steps}",
+        f"camera_hw={args_cli.camera_hw}, depth_only={args_cli.depth_only}, "
+        f"tiled_cameras={args_cli.tiled_cameras}, "
+        f"num_envs={args_cli.num_envs}, inner_steps={args_cli.inner_steps}",
         flush=True,
     )
 
@@ -259,6 +318,9 @@ def main():
     agent_cfg.max_iterations = args_cli.max_iter
     agent_cfg.num_steps_per_env = args_cli.steps_per_env
     agent_cfg.policy.img_hw = args_cli.camera_hw
+    agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
+    if args_cli.depth_only:
+        agent_cfg.experiment_name = "taskd_student_b2piper_depth"
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     log_dir = os.path.join(log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
@@ -285,6 +347,7 @@ def main():
         vx_max=args_cli.vx_max,
         image_hw=args_cli.camera_hw,
         depth_max=args_cli.depth_max,
+        depth_only=args_cli.depth_only,
         nav_log_interval=args_cli.nav_log_interval,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
@@ -298,7 +361,11 @@ def main():
         _load_ppo_checkpoint(runner, args_cli.no_train_ckpt, load_optimizer=False)
 
     if args_cli.bc_ckpt:
-        _load_bc_into_actor_critic(_get_policy_module(runner.alg), args_cli.bc_ckpt)
+        _load_bc_into_actor_critic(
+            _get_policy_module(runner.alg),
+            args_cli.bc_ckpt,
+            depth_only=args_cli.depth_only,
+        )
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)

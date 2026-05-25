@@ -5,14 +5,35 @@ Implementation of Task A environment configuration with different robots.
 """
 
 from isaaclab.utils import configclass
+import torch
+
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from atec_rl_lab.tasks.task_base import TerminationsCfg
 from isaaclab.managers import SceneEntityCfg
 
 from atec_rl_lab.tasks.task_base import BaseEnvCfg
 from .terrain import TASK_A_TERRAIN_CFG
 import atec_rl_lab.tasks.task_a.mdp as atec_mdp
+
+
+def reset_root_state_absolute(
+    env,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    world_pos: tuple[float, float, float] = (-120.0, 0.0, 0.58),
+):
+    """Reset asset root pose to a fixed world position (ignore env_origin offset)."""
+    asset = env.scene[asset_cfg.name]
+    n = len(env_ids)
+    root_states = asset.data.default_root_state[env_ids].clone()
+    positions = torch.tensor(world_pos, device=asset.device, dtype=root_states.dtype).view(1, 3).repeat(n, 1)
+    orientations = root_states[:, 3:7]
+    velocities = torch.zeros(n, 6, device=asset.device, dtype=root_states.dtype)
+    asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
 
 @configclass
 class TaskATerminationsCfg(TerminationsCfg):
@@ -61,6 +82,17 @@ class TaskAEnvCfg(BaseEnvCfg):
         self.events.reset_robot_joints = None
 
         self.terminations.fall.params["minimum_height"] = -20.0
+
+        robot_init_pos = tuple(float(v) for v in self.scene.robot.init_state.pos)
+        # Reset in world frame to avoid default_root_state + env_origin double-offset.
+        self.events.reset_robot_root = EventTerm(
+            func=reset_root_state_absolute,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "world_pos": robot_init_pos,
+            },
+        )
 
 
 

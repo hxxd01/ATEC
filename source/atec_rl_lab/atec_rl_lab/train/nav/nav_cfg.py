@@ -103,6 +103,7 @@ class TaskDTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 class TaskDStudentActorCriticCfg(RslRlPpoActorCriticCfg):
     class_name: str = "TaskDStudentActorCritic"
     img_hw: int = 64
+    img_channels: int = 4  # 4 = rgb+depth per camera, 1 = depth only
     proprio_dim: int = 9
     enc_dim: int = 128
     fuse_dim: int = 256
