@@ -86,7 +86,8 @@ python scripts/train_nav_taskd_student.py \
   --inner_steps 5 \
   --max_iter 10000 \
   --device cuda:0 \
-  --headless
+  --headless \
+  --resume /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper/2026-05-25_05-21-46/model_600.pt
 
 python scripts/collect_train_bc.py \
   --task ATEC-TaskD-B2Piper \
@@ -100,3 +101,17 @@ python scripts/collect_train_bc.py \
   --device cuda:0 \
   --headless \
   --enable_cameras
+
+python scripts/train_nav_taskd_student.py \
+  --task ATEC-TaskD-B2Piper \
+  --ll_policy demo/policy.pt \
+  --num_envs 1 \
+  --inner_steps 5 \
+  --max_iter 10000 \
+  --device cuda:0 \
+  --headless \
+  --ppo_no_train \
+  --no_train_steps 2000 \
+  --video \
+  --video_length 100 \
+  --no_train_ckpt /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper/2026-05-25_05-21-46/model_600.pt 

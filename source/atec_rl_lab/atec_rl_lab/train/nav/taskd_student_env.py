@@ -26,6 +26,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         vx_max: float = 2.0,
         image_hw: int = 64,
         depth_max: float = 5.0,
+        nav_log_interval: int = 10,
     ):
         super().__init__(
             env=env,
@@ -35,7 +36,9 @@ class TaskDStudentEnv(TaskDTeacherEnv):
             lidar_bins=0,
             vx_min=vx_min,
             vx_max=vx_max,
+            nav_log_interval=nav_log_interval,
         )
+        self._nav_log_tag = "TaskDStudent"
         self._image_hw = int(image_hw)
         self._depth_max = float(depth_max)
         self._student_img_flat = 8 * self._image_hw * self._image_hw

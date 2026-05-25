@@ -65,10 +65,110 @@ class NoMotionTimeout(ManagerTermBase):
             self._stuck_counter[env_ids] = 0
 
 
+class NoTargetProgressTimeout(ManagerTermBase):
+    """Terminate when net progress toward stage target over a time window is too small."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._initialized = False
+        self._window_size = 1
+        self._progress_eps = 0.05
+        self._dist_history = None
+        self._head = 0
+        self._filled = None
+        self._prev_stage_idx = None
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        stuck_time_s: float = 1.0,
+        progress_eps: float = 0.05,
+        dist_attr: str = "_nav_dist_to_target",
+        stage_idx_attr: str = "_nav_stage_idx",
+        active_attr: str = "_nav_stage_active",
+    ) -> torch.Tensor:
+        if not self._initialized:
+            self._window_size = max(1, int(float(stuck_time_s) / env.step_dt))
+            self._progress_eps = float(progress_eps)
+            self._dist_history = torch.full(
+                (env.num_envs, self._window_size),
+                float("nan"),
+                device=env.device,
+                dtype=torch.float32,
+            )
+            self._filled = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+            self._prev_stage_idx = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
+            self._head = 0
+            self._initialized = True
+            self.reset()
+
+        root = env.unwrapped if hasattr(env, "unwrapped") else env
+        dist_t = getattr(root, dist_attr, None)
+        if dist_t is None or not isinstance(dist_t, torch.Tensor) or int(dist_t.shape[0]) != int(env.num_envs):
+            return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+
+        dist = dist_t.to(device=env.device, dtype=torch.float32).view(-1)
+        stage_idx = getattr(root, stage_idx_attr, None)
+        if stage_idx is None:
+            stage_idx = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        else:
+            stage_idx = stage_idx.to(device=env.device, dtype=torch.long).view(-1)
+
+        active_t = getattr(root, active_attr, None)
+        if active_t is None:
+            active = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+        else:
+            active = active_t.to(device=env.device, dtype=torch.bool).view(-1)
+
+        stage_changed = stage_idx != self._prev_stage_idx
+        reset_mask = stage_changed | (~active)
+        if bool(reset_mask.any()):
+            self._dist_history[reset_mask] = float("nan")
+            self._filled[reset_mask] = 0
+
+        oldest = self._head
+        dist_oldest = self._dist_history[:, oldest]
+        self._dist_history[:, self._head] = dist
+        self._head = (self._head + 1) % self._window_size
+        self._filled = torch.minimum(
+            self._filled + 1,
+            torch.full_like(self._filled, self._window_size),
+        )
+        self._prev_stage_idx = stage_idx.clone()
+
+        window_ready = self._filled >= self._window_size
+        net_progress = dist_oldest - dist
+        no_progress = window_ready & (~torch.isnan(dist_oldest)) & (net_progress <= self._progress_eps)
+        return active & no_progress
+
+    def reset(self, env_ids=None):
+        if not self._initialized:
+            return
+        if env_ids is None:
+            self._dist_history.fill_(float("nan"))
+            self._filled.zero_()
+            self._prev_stage_idx.fill_(-1)
+            self._head = 0
+        else:
+            self._dist_history[env_ids] = float("nan")
+            self._filled[env_ids] = 0
+            self._prev_stage_idx[env_ids] = -1
+
+
 class StageTargetDeviationTermination(ManagerTermBase):
     """Terminate when robot is too far from the current stage trajectory segment."""
 
-    # Fallback nominal stage targets if wrapper has not synchronized trajectory segments yet.
+    # Fallback nominal stage endpoints if wrapper has not synchronized trajectory segments yet.
+    _STAGE_STARTS = (
+        (-3.00, 0.00),   # retreat
+        (-4.00, 0.00),   # sidestep_left
+        (-4.00, 2.10),   # advance
+        (-3.00, 2.10),   # sidestep_right
+        (-3.00, 0.10),   # retreat2
+        (-4.00, 0.10),   # sidestep_right2
+        (-4.00, -0.50),  # advance2
+        (-1.25, -0.50),  # final
+    )
     _STAGE_TARGETS = (
         (-4.00, 0.00),   # retreat
         (-4.00, 2.10),   # sidestep_left
@@ -83,12 +183,16 @@ class StageTargetDeviationTermination(ManagerTermBase):
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self._initialized = False
+        self._start_x = None
+        self._start_y = None
         self._target_x = None
         self._target_y = None
 
     def _lazy_init(self, device: str | torch.device) -> None:
         if self._initialized:
             return
+        self._start_x = torch.tensor([p[0] for p in self._STAGE_STARTS], device=device, dtype=torch.float32)
+        self._start_y = torch.tensor([p[1] for p in self._STAGE_STARTS], device=device, dtype=torch.float32)
         xs = [p[0] for p in self._STAGE_TARGETS]
         ys = [p[1] for p in self._STAGE_TARGETS]
         self._target_x = torch.tensor(xs, device=device, dtype=torch.float32)
@@ -103,19 +207,20 @@ class StageTargetDeviationTermination(ManagerTermBase):
         stage_idx_attr: str = "_nav_stage_idx",
     ) -> torch.Tensor:
         self._lazy_init(env.device)
-        robot = env.scene[robot_asset_cfg.name]
+        root = env.unwrapped if hasattr(env, "unwrapped") else env
+        robot = root.scene[robot_asset_cfg.name]
         pos = robot.data.root_pos_w.to(device=env.device, dtype=torch.float32)
-        stage_idx = getattr(env, stage_idx_attr, None)
+        stage_idx = getattr(root, stage_idx_attr, None)
         if stage_idx is None:
             stage_idx = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
         else:
             stage_idx = stage_idx.to(device=env.device, dtype=torch.long).view(-1)
         stage_idx = torch.clamp(stage_idx, min=0, max=len(self._STAGE_TARGETS) - 1)
 
-        seg_x0 = getattr(env, "_nav_seg_x0", None)
-        seg_y0 = getattr(env, "_nav_seg_y0", None)
-        seg_x1 = getattr(env, "_nav_seg_x1", None)
-        seg_y1 = getattr(env, "_nav_seg_y1", None)
+        seg_x0 = getattr(root, "_nav_seg_x0", None)
+        seg_y0 = getattr(root, "_nav_seg_y0", None)
+        seg_x1 = getattr(root, "_nav_seg_x1", None)
+        seg_y1 = getattr(root, "_nav_seg_y1", None)
         has_synced_segments = all(
             isinstance(t, torch.Tensor) and int(t.shape[0]) == int(env.num_envs)
             for t in (seg_x0, seg_y0, seg_x1, seg_y1)
@@ -127,23 +232,24 @@ class StageTargetDeviationTermination(ManagerTermBase):
             x1 = seg_x1.to(device=env.device, dtype=torch.float32)
             y1 = seg_y1.to(device=env.device, dtype=torch.float32)
         else:
-            # Fallback to point-distance when segment sync is unavailable.
-            x0 = self._target_x[stage_idx]
-            y0 = self._target_y[stage_idx]
-            x1 = x0
-            y1 = y0
+            x0 = self._start_x[stage_idx]
+            y0 = self._start_y[stage_idx]
+            x1 = self._target_x[stage_idx]
+            y1 = self._target_y[stage_idx]
 
         vx = x1 - x0
         vy = y1 - y0
         wx = pos[:, 0] - x0
         wy = pos[:, 1] - y0
         seg_len2 = vx * vx + vy * vy
-        t = torch.where(seg_len2 > 1.0e-8, (wx * vx + wy * vy) / seg_len2, torch.zeros_like(seg_len2))
+        valid_seg = seg_len2 > 1.0e-6
+        t = torch.where(valid_seg, (wx * vx + wy * vy) / seg_len2, torch.zeros_like(seg_len2))
         t = torch.clamp(t, 0.0, 1.0)
         proj_x = x0 + t * vx
         proj_y = y0 + t * vy
         dist = torch.hypot(pos[:, 0] - proj_x, pos[:, 1] - proj_y)
-        return dist > float(max_dist)
+        too_far = dist > float(max_dist)
+        return valid_seg & too_far
 
 
 class TrajectoryDeviationTermination(ManagerTermBase):

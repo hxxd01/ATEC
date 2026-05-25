@@ -202,7 +202,7 @@ class AlgSolution:
                 align_x_with_box=True,
             ),
             dict(name="retreat2",       axis="x", sign=-1, dist=1.0, vx=-2.0, vy=0.0),
-            dict(name="sidestep_right2", axis="y", sign=-1, dist=0.6, vx=0.0, vy=-1.0),
+            dict(name="sidestep_right2", axis="y", sign=-1, dist=0.6, vx=0.0, vy=-1.0, match_box_y_tol=0.25),
             dict(
                 name="advance2",
                 axis="x",

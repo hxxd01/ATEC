@@ -86,8 +86,16 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         func=atec_mdp.StageTargetDeviationTermination,
         params={
             "robot_asset_cfg": SceneEntityCfg("robot"),
-            "max_dist": 1.2,
+            "max_dist": 0.8,
             "stage_idx_attr": "_nav_stage_idx",
+        },
+        time_out=False,
+    )
+    no_target_progress_timeout = DoneTerm(
+        func=atec_mdp.NoTargetProgressTimeout,
+        params={
+            "stuck_time_s": 2.0,
+            "progress_eps": 0.05,
         },
         time_out=False,
     )
@@ -145,6 +153,10 @@ class TaskDEnvCfg(BaseEnvCfg):
         # Trun off terminations
         self.terminations.illegal_contact = None
         self.terminations.fall.params["minimum_height"] = 0.25
+        # Disable navigation-related terminations during nav training/debug.
+        self.terminations.x_reached = None
+        self.terminations.no_motion_timeout = None
+        self.terminations.stage_target_deviation = None
 
         # Reset in world frame to avoid default_root_state + env_origin double-offset.
         self.events.reset_robot_root = EventTerm(

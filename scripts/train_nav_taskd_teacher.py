@@ -25,6 +25,7 @@ parser.add_argument("--vx_min", type=float, default=-2.0)
 parser.add_argument("--vx_max", type=float, default=2.0)
 parser.add_argument("--curriculum_warmup_nav_steps", type=int, default=1500)
 parser.add_argument("--curriculum_mid_nav_steps", type=int, default=3500)
+parser.add_argument("--nav_log_interval", type=int, default=50, help="Print [TaskDTeacher] nav log every N nav steps (0=off).")
 parser.add_argument(
     "--disable_extero",
     action="store_true",
@@ -70,9 +71,14 @@ parser.add_argument(
     default=400,
     help="Number of high-level env steps when --ppo_no_train is enabled.",
 )
+parser.add_argument("--video", action="store_true", default=False, help="Record a rollout video.")
+parser.add_argument("--video_length", type=int, default=300, help="Recorded video length in env steps.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
+# RecordVideo needs rendering enabled even in headless mode.
+if args_cli.video:
+    args_cli.enable_cameras = True
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -149,7 +155,18 @@ def main():
     log_dir = os.path.join(log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
 
-    env = gym.make("ATEC-TaskD-B2Piper", cfg=env_cfg, render_mode=None)
+    render_mode = "rgb_array" if args_cli.video else None
+    env = gym.make("ATEC-TaskD-B2Piper", cfg=env_cfg, render_mode=render_mode)
+    if args_cli.video:
+        video_dir = os.path.join(log_dir, "videos", "teacher")
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=video_dir,
+            step_trigger=lambda step: step == 0,
+            video_length=int(args_cli.video_length),
+            disable_logger=True,
+        )
+        print(f"[INFO] Recording video to: {video_dir}", flush=True)
     nav_env = TaskDTeacherEnv(
         env,
         ll_policy_path=args_cli.ll_policy,
@@ -160,6 +177,7 @@ def main():
         vx_max=args_cli.vx_max,
         curriculum_warmup_nav_steps=args_cli.curriculum_warmup_nav_steps,
         curriculum_mid_nav_steps=args_cli.curriculum_mid_nav_steps,
+        nav_log_interval=args_cli.nav_log_interval,
     )
     if args_cli.debug_lidar_runtime and not args_cli.disable_extero:
         try:
