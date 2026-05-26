@@ -82,15 +82,17 @@ python scripts/bc/train_taskd_bc.py \
 python scripts/train_nav_taskd_student.py \
   --task ATEC-TaskD-B2Piper \
   --ll_policy demo/policy.pt \
-  --num_envs 64 \
+  --num_envs 512 \
   --inner_steps 5 \
   --max_iter 10000 \
   --device cuda:0 \
   --headless \
   --camera_hw 24 \
   --tiled_cameras \
-  --depth_only
-  --resume /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper/2026-05-25_05-21-46/model_600.pt
+  --no_progress_s 2.0 \
+  --no_progress_eps 0.03 \
+  --depth_only \
+  --resume /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-26_07-23-10/model_700.pt
 
 python scripts/collect_train_bc.py \
   --task ATEC-TaskD-B2Piper \
@@ -114,11 +116,15 @@ python scripts/train_nav_taskd_student.py \
   --max_iter 10000 \
   --device cuda:0 \
   --headless \
+  --depth_only \
   --ppo_no_train \
+  --camera_hw 24 \
   --no_train_steps 2000 \
   --video \
-  --video_length 100 \
-  --no_train_ckpt /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper/2026-05-25_05-21-46/model_600.pt 
+  --video_length 300 \
+  --tiled_cameras \
+  --no_train_ckpt /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-26_07-23-10/model_700.pt  
+
 =======
 
 python scripts/train_nav_taska_student.py \

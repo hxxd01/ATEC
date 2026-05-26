@@ -10,24 +10,63 @@ from rsl_rl.networks import EmpiricalNormalization, MLP, Memory
 
 
 class ConvEncoder(nn.Module):
-    def __init__(self, in_ch: int = 4, out_dim: int = 128):
+    """Resolution-adaptive CNN: shallow for small maps (e.g. 24x24 depth), deeper for 64+."""
+
+    def __init__(self, in_ch: int, out_dim: int, img_hw: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 32, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(96, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.proj = nn.Linear(128, out_dim)
+        img_hw = int(img_hw)
+        if img_hw <= 32:
+            conv_out = 96
+            self.net = nn.Sequential(
+                nn.Conv2d(in_ch, 32, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, conv_out, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+        elif img_hw <= 48:
+            conv_out = 112
+            self.net = nn.Sequential(
+                nn.Conv2d(in_ch, 32, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, conv_out, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+        else:
+            conv_out = 128
+            self.net = nn.Sequential(
+                nn.Conv2d(in_ch, 32, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(96, conv_out, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+        self.conv_out = conv_out
+        self.proj = nn.Linear(conv_out, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.net(x).flatten(1)
         return self.proj(y)
+
+
+def _scaled_dims_for_img_hw(img_hw: int, enc_dim: int, fuse_dim: int, rnn_hidden_dim: int):
+    """Shrink fusion/GRU for small inputs when cfg still uses legacy 128/256 defaults."""
+    img_hw = int(img_hw)
+    if img_hw > 32:
+        return enc_dim, fuse_dim, rnn_hidden_dim
+    enc = min(int(enc_dim), 64)
+    fuse = min(int(fuse_dim), 128)
+    rnn = min(int(rnn_hidden_dim), 128)
+    return enc, fuse, rnn
 
 
 class TaskDStudentActorCritic(nn.Module):
@@ -43,7 +82,8 @@ class TaskDStudentActorCritic(nn.Module):
         *,
         img_hw: int = 64,
         img_channels: int = 4,
-        proprio_dim: int = 9,
+        proprio_dim: int = 12,
+        lidar_bins: int = 0,
         enc_dim: int = 128,
         fuse_dim: int = 256,
         rnn_type: str = "gru",
@@ -72,20 +112,50 @@ class TaskDStudentActorCritic(nn.Module):
         self.head_flat = self.img_channels * self.img_hw * self.img_hw
         self.ee_flat = self.img_channels * self.img_hw * self.img_hw
         self.proprio_dim = int(proprio_dim)
+        self.lidar_bins = int(lidar_bins)
 
-        self.head_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
-        self.ee_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
+        enc_dim, fuse_dim, rnn_hidden_dim = _scaled_dims_for_img_hw(
+            self.img_hw, enc_dim, fuse_dim, rnn_hidden_dim
+        )
+        self.enc_dim = enc_dim
+        self.fuse_dim = fuse_dim
+        self.rnn_hidden_dim = rnn_hidden_dim
+
+        cnn_variant = "small" if self.img_hw <= 32 else ("medium" if self.img_hw <= 48 else "large")
+        self.image_encoder = ConvEncoder(
+            in_ch=self.img_channels, out_dim=self.enc_dim, img_hw=self.img_hw
+        )
+        # Aliases for optional BC warm-start key names.
+        self.head_encoder = self.image_encoder
+        self.ee_encoder = self.image_encoder
+        print(
+            f"[TaskDStudentActorCritic] img={self.img_channels}x{self.img_hw}x{self.img_hw}, "
+            f"cnn={cnn_variant}, shared_enc=1, enc_dim={self.enc_dim}, fuse_dim={self.fuse_dim}, "
+            f"rnn_hidden={self.rnn_hidden_dim}",
+            flush=True,
+        )
+        self.lidar_mlp = (
+            nn.Sequential(
+                nn.Linear(self.lidar_bins, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, 64),
+                nn.ReLU(inplace=True),
+            )
+            if self.lidar_bins > 0
+            else None
+        )
         self.proprio_mlp = nn.Sequential(
             nn.Linear(self.proprio_dim, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 64),
             nn.ReLU(inplace=True),
         )
+        fuse_in = self.enc_dim + self.enc_dim + 64 + (64 if self.lidar_bins > 0 else 0)
         self.fuse = nn.Sequential(
-            nn.Linear(enc_dim + enc_dim + 64, fuse_dim),
+            nn.Linear(fuse_in, self.fuse_dim),
             nn.ReLU(inplace=True),
         )
-        self._base_obs_dim = self.head_flat + self.ee_flat + self.proprio_dim
+        self._base_obs_dim = self.lidar_bins + self.head_flat + self.ee_flat + self.proprio_dim
         raw_critic_dim = sum(obs[g].shape[-1] for g in obs_groups["critic"])
         self._critic_priv_dim = max(0, int(raw_critic_dim - self._base_obs_dim))
         self.critic_priv_mlp = (
@@ -100,25 +170,27 @@ class TaskDStudentActorCritic(nn.Module):
         )
 
         self.memory_a = Memory(
-            fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim
+            self.fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=self.rnn_hidden_dim
         )
         self.memory_c = Memory(
-            fuse_dim + (64 if self._critic_priv_dim > 0 else 0),
+            self.fuse_dim + (64 if self._critic_priv_dim > 0 else 0),
             type=rnn_type,
             num_layers=rnn_num_layers,
-            hidden_size=rnn_hidden_dim,
+            hidden_size=self.rnn_hidden_dim,
         )
 
-        # Keep actor head shape BC-compatible: 256 -> 256 -> action_dim
-        self.actor = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, num_actions),
-        )
-        critic_in_dim = fuse_dim + (64 if self._critic_priv_dim > 0 else 0)
-        self.critic = MLP(rnn_hidden_dim, 1, critic_hidden_dims, "elu")
+        if self.img_hw <= 32:
+            self.actor = nn.Linear(self.rnn_hidden_dim, num_actions)
+        else:
+            self.actor = nn.Sequential(
+                nn.Linear(self.rnn_hidden_dim, 256),
+                nn.ReLU(inplace=True),
+                nn.Linear(256, num_actions),
+            )
+        critic_in_dim = self.fuse_dim + (64 if self._critic_priv_dim > 0 else 0)
+        self.critic = MLP(self.rnn_hidden_dim, 1, critic_hidden_dims, "elu")
         self.actor_obs_normalizer = (
-            EmpiricalNormalization(fuse_dim) if actor_obs_normalization else nn.Identity()
+            EmpiricalNormalization(self.fuse_dim) if actor_obs_normalization else nn.Identity()
         )
         self.critic_obs_normalizer = (
             EmpiricalNormalization(critic_in_dim) if critic_obs_normalization else nn.Identity()
@@ -158,18 +230,22 @@ class TaskDStudentActorCritic(nn.Module):
         return torch.cat([obs[g] for g in groups], dim=-1)
 
     def _encode_base(self, flat_obs: torch.Tensor) -> torch.Tensor:
-        # base layout: [head(C*H*W), ee(C*H*W), proprio(9)]
+        # base layout: [lidar(bins)?, head(C*H*W), ee(C*H*W), proprio(12)]
         lead_shape = flat_obs.shape[:-1]
         x = flat_obs.reshape(-1, flat_obs.shape[-1])
-        head = x[:, : self.head_flat].view(-1, self.img_channels, self.img_hw, self.img_hw)
-        ee = x[:, self.head_flat : self.head_flat + self.ee_flat].view(
-            -1, self.img_channels, self.img_hw, self.img_hw
-        )
-        proprio = x[:, self.head_flat + self.ee_flat : self.head_flat + self.ee_flat + self.proprio_dim]
-        h_feat = self.head_encoder(head)
-        e_feat = self.ee_encoder(ee)
-        p_feat = self.proprio_mlp(proprio)
-        out = self.fuse(torch.cat([h_feat, e_feat, p_feat], dim=-1))
+        offset = 0
+        fuse_parts: list[torch.Tensor] = []
+        if self.lidar_bins > 0:
+            lidar = x[:, offset : offset + self.lidar_bins]
+            offset += self.lidar_bins
+            fuse_parts.append(self.lidar_mlp(lidar))
+        head = x[:, offset : offset + self.head_flat].view(-1, self.img_channels, self.img_hw, self.img_hw)
+        offset += self.head_flat
+        ee = x[:, offset : offset + self.ee_flat].view(-1, self.img_channels, self.img_hw, self.img_hw)
+        offset += self.ee_flat
+        proprio = x[:, offset : offset + self.proprio_dim]
+        fuse_parts.extend([self.image_encoder(head), self.image_encoder(ee), self.proprio_mlp(proprio)])
+        out = self.fuse(torch.cat(fuse_parts, dim=-1))
         return out.view(*lead_shape, -1)
 
     def _encode_actor(self, flat_obs: torch.Tensor) -> torch.Tensor:

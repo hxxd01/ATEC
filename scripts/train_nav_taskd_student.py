@@ -29,6 +29,47 @@ parser.add_argument(
     action="store_true",
     help="Use TiledCameraCfg for head/ee (one tiled render product per camera type; scales to more envs).",
 )
+parser.add_argument(
+    "--lidar_bins",
+    type=int,
+    default=0,
+    help="LiDAR bins in actor obs (0=off). With --lidar_bins 36, default pattern is 360 ring "
+    "at 36 rays/env (use --lidar_fast/--lidar_coarse to override).",
+)
+parser.add_argument(
+    "--lidar_horizontal_res",
+    type=float,
+    default=None,
+    help="Override LiDAR horizontal resolution (degrees). Larger means fewer rays.",
+)
+parser.add_argument(
+    "--lidar_channels",
+    type=int,
+    default=None,
+    help="Override LiDAR channel count. Smaller means fewer rays.",
+)
+parser.add_argument(
+    "--lidar_update_period",
+    type=float,
+    default=None,
+    help="Override LiDAR sensor update period (seconds). Larger means lower sensor rate.",
+)
+parser.add_argument(
+    "--lidar_fast",
+    action="store_true",
+    help="Low-ray LiDAR preset: front +/-30 deg, 3 deg res, 2 channels (~40 rays/env).",
+)
+parser.add_argument(
+    "--lidar_coarse",
+    action="store_true",
+    help="Coarse 360 deg LiDAR: 6 deg res, 4 channels (~240 rays/env vs default ~5760).",
+)
+parser.add_argument(
+    "--lidar_ring",
+    action="store_true",
+    help="360 ring LiDAR: horizontal_res=360/lidar_bins, 1 channel (rays/env == lidar_bins). "
+    "Default when --lidar_bins>0 unless --lidar_fast/--lidar_coarse is set.",
+)
 parser.add_argument("--ppo_no_train", action="store_true", help="Disable PPO updates; run rollout only.")
 parser.add_argument("--no_train_steps", type=int, default=300, help="High-level rollout steps for --ppo_no_train.")
 parser.add_argument("--video", action="store_true", default=False, help="Record a rollout video.")
@@ -40,6 +81,29 @@ parser.add_argument(
     help="Checkpoint used only for --ppo_no_train rollout inference.",
 )
 parser.add_argument("--nav_log_interval", type=int, default=50, help="Print [TaskDTeacher] nav log every N nav steps (0=off).")
+parser.add_argument(
+    "--no_progress_s",
+    type=float,
+    default=3.0,
+    help="no_target_progress_timeout window (seconds). Default 3.0 for student (env_cfg default is 2.0).",
+)
+parser.add_argument(
+    "--no_progress_eps",
+    type=float,
+    default=0.05,
+    help="Min net progress toward stage target (m) within the window to avoid termination.",
+)
+parser.add_argument(
+    "--disable_no_progress",
+    action="store_true",
+    help="Disable no_target_progress_timeout (not recommended for student RL).",
+)
+parser.add_argument(
+    "--depth_video_fps",
+    type=float,
+    default=0.0,
+    help="FPS for --ppo_no_train --video combined mp4 (0 = physics step rate, ~50Hz).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 # Student policy always reads head/ee camera buffers.
@@ -145,9 +209,53 @@ def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True)
         print(f"[INFO] Skipped keys (shape mismatch): {skipped_keys[:8]}", flush=True)
 
 
-def _run_no_train_rollout(vec_env: NavRslRlVecEnvWrapper, steps: int, policy=None, policy_nn=None) -> None:
+def _write_depth_video(frames: list, path: str, fps: float) -> None:
+    if not frames:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        import imageio.v2 as imageio
+
+        imageio.mimwrite(path, frames, fps=float(fps))
+    except Exception as exc:
+        print(f"[WARN] imageio depth video failed ({exc}); trying cv2...", flush=True)
+        try:
+            import cv2
+
+            h, w = frames[0].shape[:2]
+            writer = cv2.VideoWriter(
+                path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(fps),
+                (w, h),
+            )
+            for fr in frames:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+            writer.release()
+        except Exception as exc2:
+            print(f"[WARN] depth video not saved: {exc2}", flush=True)
+            return
+    print(f"[INFO] Video saved: {path} ({len(frames)} frames @ {fps:.1f} fps)", flush=True)
+
+
+def _run_no_train_rollout(
+    vec_env: NavRslRlVecEnvWrapper,
+    steps: int,
+    policy=None,
+    policy_nn=None,
+    *,
+    nav_env=None,
+    video_env: int = 0,
+) -> None:
     """Step the student env without PPO updates (optionally with policy inference)."""
+    num_envs = vec_env.num_envs
+    env_idx = max(0, min(int(video_env), num_envs - 1))
+    max_stage_1idx = torch.ones(num_envs, device=vec_env.device, dtype=torch.long)
+    ep_count = 0
+
     obs, _ = vec_env.reset()
+    if nav_env is not None and getattr(nav_env, "_stage_idx_buf", None) is not None:
+        max_stage_1idx = nav_env._stage_idx_buf.to(dtype=torch.long) + 1
     for i in range(int(steps)):
         if policy is not None:
             # Use no_grad (not inference_mode) so recurrent hidden state can be reset in-place.
@@ -158,10 +266,43 @@ def _run_no_train_rollout(vec_env: NavRslRlVecEnvWrapper, steps: int, policy=Non
         obs, rew, dones, _ = vec_env.step(actions)
         if policy_nn is not None and hasattr(policy_nn, "reset"):
             policy_nn.reset(dones)
+        if nav_env is not None and getattr(nav_env, "_stage_idx_buf", None) is not None:
+            cur_stage_1idx = nav_env._stage_idx_buf.to(dtype=torch.long) + 1
+            max_stage_1idx = torch.maximum(max_stage_1idx, cur_stage_1idx)
+            if bool(dones.any()):
+                done_ids = dones.nonzero(as_tuple=False).view(-1)
+                for ei in done_ids.tolist():
+                    si = int(nav_env._stage_idx_buf[ei].item())
+                    sn = nav_env._stage_names[si] if 0 <= si < nav_env._num_stages else "done"
+                    ep_count += 1
+                    print(
+                        f"[NO-TRAIN] episode_done #{ep_count} env{ei} "
+                        f"end_stage={si + 1}({sn}) max_stage={int(max_stage_1idx[ei].item())} "
+                        f"rew_step={rew[ei].item():+.3f}",
+                        flush=True,
+                    )
+                max_stage_1idx[done_ids] = nav_env._stage_idx_buf[done_ids].to(dtype=torch.long) + 1
+        step_no = i + 1
+        if (
+            nav_env is not None
+            and getattr(nav_env, "_combined_video_enabled", False)
+            and getattr(nav_env, "_combined_video_max_frames", None) is not None
+            and nav_env.combined_video_frame_count >= nav_env._combined_video_max_frames
+        ):
+            break
         if i % 50 == 0 or i == steps - 1:
+            stage_hint = ""
+            mix_hint = ""
+            if nav_env is not None and getattr(nav_env, "_stage_idx_buf", None) is not None:
+                si = int(nav_env._stage_idx_buf[env_idx].item())
+                sn = nav_env._stage_names[si] if 0 <= si < nav_env._num_stages else "?"
+                prog = float(nav_env._stage_progress_buf[env_idx].item())
+                stage_hint = f" env{env_idx}_stage={si + 1}({sn}) prog={prog:.2f} max={int(max_stage_1idx[env_idx].item())}"
+                if hasattr(nav_env, "format_stage_distribution_line"):
+                    mix_hint = " " + nav_env.format_stage_distribution_line()
             print(
-                f"[NO-TRAIN] step={i+1:4d}/{steps} mean_rew={rew.float().mean().item():+.4f} "
-                f"done_ratio={dones.float().mean().item():.2f}",
+                f"[NO-TRAIN] step={step_no:4d}/{steps} mean_rew={rew.float().mean().item():+.4f} "
+                f"done_ratio={dones.float().mean().item():.2f}{stage_hint}{mix_hint}",
                 flush=True,
             )
 
@@ -239,6 +380,85 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool
         print(f"[INFO] Example skipped keys: {skipped[:5]}", flush=True)
 
 
+def _estimate_lidar_rays(pattern_cfg) -> int:
+    """Approximate rays/sensor for LidarPatternCfg (degrees-based)."""
+    from isaaclab.sensors import patterns
+
+    if not isinstance(pattern_cfg, patterns.LidarPatternCfg):
+        return -1
+    h_min, h_max = pattern_cfg.horizontal_fov_range
+    hres = max(float(pattern_cfg.horizontal_res), 1.0e-6)
+    horiz = max(1, int(round((float(h_max) - float(h_min)) / hres)))
+    return horiz * int(pattern_cfg.channels)
+
+
+def _apply_ring_lidar_pattern(lidar_sensor, lidar_bins: int) -> None:
+    """360 deg ring with exactly one ray per policy bin (fastest full-ring mode)."""
+    from isaaclab.sensors import patterns
+
+    bins = max(1, int(lidar_bins))
+    horizontal_res = 360.0 / float(bins)
+    lidar_sensor.pattern_cfg = patterns.LidarPatternCfg(
+        vertical_fov_range=(-10.0, 10.0),
+        horizontal_fov_range=(-180.0, 180.0),
+        horizontal_res=horizontal_res,
+        channels=1,
+    )
+
+
+def _apply_student_lidar_cfg(env_cfg, args_cli, nav_dt: float) -> None:
+    from isaaclab.sensors import patterns
+
+    lidar_sensor = getattr(env_cfg.scene, "lidar_sensor", None)
+    if lidar_sensor is None:
+        raise ValueError("--lidar_bins > 0 but env_cfg.scene.lidar_sensor is missing.")
+
+    preset_flags = (args_cli.lidar_fast, args_cli.lidar_coarse, args_cli.lidar_ring)
+    if sum(int(x) for x in preset_flags) > 1:
+        raise ValueError("Use only one of --lidar_fast, --lidar_coarse, or --lidar_ring.")
+
+    lidar_mode = "ring360"
+    if args_cli.lidar_fast:
+        lidar_mode = "front_cone"
+        lidar_sensor.pattern_cfg = patterns.LidarPatternCfg(
+            vertical_fov_range=(-10.0, 10.0),
+            horizontal_fov_range=(-30.0, 30.0),
+            horizontal_res=3.0,
+            channels=2,
+        )
+    elif args_cli.lidar_coarse:
+        lidar_mode = "coarse360"
+        lidar_sensor.pattern_cfg = patterns.LidarPatternCfg(
+            vertical_fov_range=(-15.0, 15.0),
+            horizontal_fov_range=(-180.0, 180.0),
+            horizontal_res=6.0,
+            channels=4,
+        )
+    else:
+        _apply_ring_lidar_pattern(lidar_sensor, args_cli.lidar_bins)
+
+    if args_cli.lidar_horizontal_res is not None:
+        lidar_sensor.pattern_cfg.horizontal_res = float(args_cli.lidar_horizontal_res)
+    if args_cli.lidar_channels is not None:
+        lidar_sensor.pattern_cfg.channels = int(args_cli.lidar_channels)
+    if args_cli.lidar_update_period is not None:
+        lidar_sensor.update_period = float(args_cli.lidar_update_period)
+    elif lidar_sensor.update_period < nav_dt:
+        lidar_sensor.update_period = nav_dt
+
+    rays = _estimate_lidar_rays(lidar_sensor.pattern_cfg)
+    pat = lidar_sensor.pattern_cfg
+    align = "1:1 with lidar_bins" if rays == int(args_cli.lidar_bins) else "pooled to lidar_bins"
+    print(
+        "[INFO] Student sim: LiDAR enabled "
+        f"(mode={lidar_mode}, lidar_bins={args_cli.lidar_bins}, hfov={pat.horizontal_fov_range}, "
+        f"horizontal_res={pat.horizontal_res}, channels={pat.channels}, "
+        f"update_period={lidar_sensor.update_period}, ~rays/env={rays}, {align}, "
+        f"~total_rays={rays * args_cli.num_envs if rays > 0 else 'n/a'}).",
+        flush=True,
+    )
+
+
 def _configure_student_cameras(
     env_cfg,
     camera_hw: int,
@@ -274,13 +494,44 @@ def main():
 
     env_cfg = TaskDEnvB2Cfg()
     env_cfg.scene.num_envs = args_cli.num_envs
-    # Keep camera sensors but drop image/lidar observation managers (read camera buffers directly).
+    if args_cli.disable_no_progress:
+        env_cfg.terminations.no_target_progress_timeout = None
+        print("[INFO] Student sim: no_target_progress_timeout disabled.", flush=True)
+    else:
+        np_term = env_cfg.terminations.no_target_progress_timeout
+        np_term.params["stuck_time_s"] = float(args_cli.no_progress_s)
+        np_term.params["progress_eps"] = float(args_cli.no_progress_eps)
+        decimation = int(getattr(env_cfg, "decimation", 4))
+        sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
+        phys_dt = decimation * sim_dt
+        window_steps = max(1, int(float(args_cli.no_progress_s) / phys_dt))
+        print(
+            f"[INFO] Student sim: no_target_progress_timeout enabled "
+            f"(stuck_time_s={args_cli.no_progress_s}, progress_eps={args_cli.no_progress_eps}, "
+            f"~{window_steps} physics steps / {window_steps / max(1, args_cli.inner_steps):.0f} nav steps).",
+            flush=True,
+        )
+    fall_min_h = env_cfg.terminations.fall.params.get("minimum_height", "?")
+    print(
+        f"[INFO] Student sim: active terminations: fall(min_h={fall_min_h}), time_out, "
+        f"no_target_progress={not args_cli.disable_no_progress} "
+        f"(x_reached/no_motion/stage_target_deviation remain off in TaskDEnvCfg).",
+        flush=True,
+    )
+    # Keep camera sensors but drop image observation managers (read camera buffers directly).
     if env_cfg.observations is not None:
         env_cfg.observations.image = None
-        env_cfg.observations.extero = None
-    if getattr(env_cfg.scene, "lidar_sensor", None) is not None:
-        env_cfg.scene.lidar_sensor = None
-    print("[INFO] Student sim: LiDAR disabled (extero obs + lidar_sensor off).", flush=True)
+    if int(args_cli.lidar_bins) > 0:
+        decimation = int(getattr(env_cfg, "decimation", 4))
+        sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
+        nav_dt = float(args_cli.inner_steps) * decimation * sim_dt
+        _apply_student_lidar_cfg(env_cfg, args_cli, nav_dt)
+    else:
+        if env_cfg.observations is not None:
+            env_cfg.observations.extero = None
+        if getattr(env_cfg.scene, "lidar_sensor", None) is not None:
+            env_cfg.scene.lidar_sensor = None
+        print("[INFO] Student sim: LiDAR disabled (extero obs + lidar_sensor off).", flush=True)
     _configure_student_cameras(
         env_cfg,
         args_cli.camera_hw,
@@ -295,21 +546,24 @@ def main():
         )
     if args_cli.depth_only:
         print("[INFO] Student sim: depth_only mode (cameras data_types=['depth']).", flush=True)
-    elif args_cli.video:
-        print("[WARN] Video recording uses RGB; run without --depth_only for meaningful video.", flush=True)
+    if args_cli.ppo_no_train and not args_cli.video:
+        print("[INFO] ppo_no_train: no video output (add --video for RGB|head|ee stitched MP4).", flush=True)
 
-    # Render cameras once per nav step (not every physics substep).
+    # Training: render cameras once per nav step; combined debug video uses physics rate.
     decimation = int(getattr(env_cfg, "decimation", 4))
     sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
-    nav_dt = float(args_cli.inner_steps) * decimation * sim_dt
+    phys_dt = decimation * sim_dt
+    nav_dt = float(args_cli.inner_steps) * phys_dt
+    cam_update_period = phys_dt if (args_cli.ppo_no_train and args_cli.video) else nav_dt
     for cam_name in ("head_camera", "ee_camera"):
         cam = getattr(env_cfg.scene, cam_name, None)
         if cam is not None:
-            cam.update_period = nav_dt
+            cam.update_period = cam_update_period
     print(
         f"[INFO] Student sim: nav_dt={nav_dt:.3f}s ({1.0 / nav_dt:.1f}Hz), "
+        f"cam_update={cam_update_period:.3f}s, "
         f"camera_hw={args_cli.camera_hw}, depth_only={args_cli.depth_only}, "
-        f"tiled_cameras={args_cli.tiled_cameras}, "
+        f"lidar_bins={args_cli.lidar_bins}, tiled_cameras={args_cli.tiled_cameras}, "
         f"num_envs={args_cli.num_envs}, inner_steps={args_cli.inner_steps}",
         flush=True,
     )
@@ -319,16 +573,28 @@ def main():
     agent_cfg.num_steps_per_env = args_cli.steps_per_env
     agent_cfg.policy.img_hw = args_cli.camera_hw
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
+    agent_cfg.policy.proprio_dim = 12
+    agent_cfg.policy.lidar_bins = int(args_cli.lidar_bins)
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskd_student_b2piper_depth"
+    if int(args_cli.lidar_bins) > 0:
+        agent_cfg.experiment_name = f"{agent_cfg.experiment_name}_lidar{int(args_cli.lidar_bins)}"
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     log_dir = os.path.join(log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
 
-    render_mode = "rgb_array" if args_cli.video else None
+    record_combined_video = bool(args_cli.ppo_no_train and args_cli.video)
+    record_rgb_video = bool(args_cli.video and not args_cli.ppo_no_train)
+    inner_steps = int(args_cli.inner_steps)
+    max_phys_frames = int(args_cli.video_length)
+    no_train_video_nav_steps = min(
+        int(args_cli.no_train_steps),
+        max(1, (max_phys_frames + inner_steps - 1) // inner_steps),
+    )
+    render_mode = "rgb_array" if (record_rgb_video or record_combined_video) else None
     env = gym.make("ATEC-TaskD-B2Piper", cfg=env_cfg, render_mode=render_mode)
-    if args_cli.video:
+    if record_rgb_video:
         video_dir = os.path.join(log_dir, "videos", "student")
         env = gym.wrappers.RecordVideo(
             env,
@@ -337,7 +603,17 @@ def main():
             video_length=int(args_cli.video_length),
             disable_logger=True,
         )
-        print(f"[INFO] Recording video to: {video_dir}", flush=True)
+        print(
+            f"[INFO] Recording RGB rollout video (RecordVideo) to: {video_dir} "
+            f"({int(args_cli.video_length)} physics steps)",
+            flush=True,
+        )
+    if record_combined_video:
+        print(
+            "[INFO] ppo_no_train + --video: RGB|head_depth|ee_depth stitched MP4 at physics step rate.",
+            flush=True,
+        )
+    nav_log_interval = 0 if args_cli.ppo_no_train else args_cli.nav_log_interval
     nav_env = TaskDStudentEnv(
         env=env,
         ll_policy_path=args_cli.ll_policy,
@@ -348,7 +624,8 @@ def main():
         image_hw=args_cli.camera_hw,
         depth_max=args_cli.depth_max,
         depth_only=args_cli.depth_only,
-        nav_log_interval=args_cli.nav_log_interval,
+        lidar_bins=int(args_cli.lidar_bins),
+        nav_log_interval=nav_log_interval,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
 
@@ -379,10 +656,16 @@ def main():
         except AttributeError:
             policy_nn = None
         rollout_steps = int(args_cli.no_train_steps)
-        if args_cli.video:
-            rollout_steps = min(rollout_steps, int(args_cli.video_length))
+        combined_video_path = None
+        phys_fps = float(args_cli.depth_video_fps) if args_cli.depth_video_fps > 0 else 1.0 / max(phys_dt, 1.0e-6)
+        if record_combined_video:
+            rollout_steps = no_train_video_nav_steps
+            combined_video_path = os.path.join(log_dir, "videos", "rgb_head_ee.mp4")
+            nav_env.enable_combined_video(env_idx=0, max_frames=max_phys_frames)
             print(
-                f"[INFO] Video mode: limiting no-train rollout to {rollout_steps} steps.",
+                f"[INFO] Combined video: {combined_video_path} "
+                f"(<= {max_phys_frames} physics frames @ {phys_fps:.1f} Hz, "
+                f"{rollout_steps} nav steps x {inner_steps} inner)",
                 flush=True,
             )
         _run_no_train_rollout(
@@ -390,7 +673,12 @@ def main():
             steps=rollout_steps,
             policy=policy,
             policy_nn=policy_nn,
+            nav_env=nav_env,
+            video_env=0,
         )
+        if record_combined_video and combined_video_path is not None:
+            _write_depth_video(nav_env._combined_video_frames, combined_video_path, phys_fps)
+            nav_env.disable_combined_video()
         nav_env.close()
         return
 
