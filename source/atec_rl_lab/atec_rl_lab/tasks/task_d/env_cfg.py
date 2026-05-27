@@ -99,6 +99,15 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         },
         time_out=False,
     )
+    no_push_progress_timeout = DoneTerm(
+        func=atec_mdp.PushStageStuckTimeout,
+        params={
+            "stuck_time_s": 2.0,
+            "progress_eps": 0.05,
+            "align_tol": 0.15,
+        },
+        time_out=False,
+    )
 
 @configclass
 class TaskDEnvCfg(BaseEnvCfg):

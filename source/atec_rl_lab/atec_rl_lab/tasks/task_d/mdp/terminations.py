@@ -86,6 +86,7 @@ class NoTargetProgressTimeout(ManagerTermBase):
         dist_attr: str = "_nav_dist_to_target",
         stage_idx_attr: str = "_nav_stage_idx",
         active_attr: str = "_nav_stage_active",
+        push_active_attr: str = "_nav_push_stuck_active",
     ) -> torch.Tensor:
         if not self._initialized:
             self._window_size = max(1, int(float(stuck_time_s) / env.step_dt))
@@ -139,6 +140,12 @@ class NoTargetProgressTimeout(ManagerTermBase):
         window_ready = self._filled >= self._window_size
         net_progress = dist_oldest - dist
         no_progress = window_ready & (~torch.isnan(dist_oldest)) & (net_progress <= self._progress_eps)
+
+        push_active_t = getattr(root, push_active_attr, None)
+        if push_active_t is not None and isinstance(push_active_t, torch.Tensor):
+            push_active = push_active_t.to(device=env.device, dtype=torch.bool).view(-1)
+            no_progress = no_progress & (~push_active)
+
         return active & no_progress
 
     def reset(self, env_ids=None):
@@ -151,6 +158,139 @@ class NoTargetProgressTimeout(ManagerTermBase):
             self._head = 0
         else:
             self._dist_history[env_ids] = float("nan")
+            self._filled[env_ids] = 0
+            self._prev_stage_idx[env_ids] = -1
+
+
+class PushStageStuckTimeout(ManagerTermBase):
+    """Terminate on push stages when align, approach-to-box, and box-axis progress all stall."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._initialized = False
+        self._window_size = 1
+        self._progress_eps = 0.05
+        self._align_tol = 0.15
+        self._align_history = None
+        self._approach_history = None
+        self._box_progress_history = None
+        self._head = 0
+        self._filled = None
+        self._prev_stage_idx = None
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        stuck_time_s: float = 2.0,
+        progress_eps: float = 0.05,
+        align_tol: float = 0.15,
+        push_active_attr: str = "_nav_push_stuck_active",
+        align_err_attr: str = "_nav_push_align_err",
+        robot_box_dist_attr: str = "_nav_push_robot_box_dist",
+        box_progress_attr: str = "_nav_push_box_axis_progress",
+        stage_idx_attr: str = "_nav_stage_idx",
+        active_attr: str = "_nav_stage_active",
+    ) -> torch.Tensor:
+        if not self._initialized:
+            self._window_size = max(1, int(float(stuck_time_s) / env.step_dt))
+            self._progress_eps = float(progress_eps)
+            self._align_tol = float(align_tol)
+            n = env.num_envs
+            dev = env.device
+            shape = (n, self._window_size)
+            self._align_history = torch.full(shape, float("nan"), device=dev, dtype=torch.float32)
+            self._approach_history = torch.full(shape, float("nan"), device=dev, dtype=torch.float32)
+            self._box_progress_history = torch.full(shape, float("nan"), device=dev, dtype=torch.float32)
+            self._filled = torch.zeros(n, device=dev, dtype=torch.long)
+            self._prev_stage_idx = torch.full((n,), -1, device=dev, dtype=torch.long)
+            self._head = 0
+            self._initialized = True
+            self.reset()
+
+        root = env.unwrapped if hasattr(env, "unwrapped") else env
+        push_active_t = getattr(root, push_active_attr, None)
+        if push_active_t is None or not isinstance(push_active_t, torch.Tensor):
+            return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        push_active = push_active_t.to(device=env.device, dtype=torch.bool).view(-1)
+
+        align_t = getattr(root, align_err_attr, None)
+        approach_t = getattr(root, robot_box_dist_attr, None)
+        box_prog_t = getattr(root, box_progress_attr, None)
+        if (
+            align_t is None
+            or approach_t is None
+            or box_prog_t is None
+            or not all(isinstance(t, torch.Tensor) and int(t.shape[0]) == int(env.num_envs) for t in (align_t, approach_t, box_prog_t))
+        ):
+            return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+
+        align = align_t.to(device=env.device, dtype=torch.float32).view(-1)
+        approach = approach_t.to(device=env.device, dtype=torch.float32).view(-1)
+        box_prog = box_prog_t.to(device=env.device, dtype=torch.float32).view(-1)
+
+        stage_idx = getattr(root, stage_idx_attr, None)
+        if stage_idx is None:
+            stage_idx = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        else:
+            stage_idx = stage_idx.to(device=env.device, dtype=torch.long).view(-1)
+
+        active_t = getattr(root, active_attr, None)
+        if active_t is None:
+            active = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+        else:
+            active = active_t.to(device=env.device, dtype=torch.bool).view(-1)
+
+        stage_changed = stage_idx != self._prev_stage_idx
+        reset_mask = stage_changed | (~active) | (~push_active)
+        if bool(reset_mask.any()):
+            self._align_history[reset_mask] = float("nan")
+            self._approach_history[reset_mask] = float("nan")
+            self._box_progress_history[reset_mask] = float("nan")
+            self._filled[reset_mask] = 0
+
+        oldest = self._head
+        align_old = self._align_history[:, oldest]
+        approach_old = self._approach_history[:, oldest]
+        box_old = self._box_progress_history[:, oldest]
+
+        self._align_history[:, self._head] = align
+        self._approach_history[:, self._head] = approach
+        self._box_progress_history[:, self._head] = box_prog
+        self._head = (self._head + 1) % self._window_size
+        self._filled = torch.minimum(
+            self._filled + 1,
+            torch.full_like(self._filled, self._window_size),
+        )
+        self._prev_stage_idx = stage_idx.clone()
+
+        window_ready = self._filled >= self._window_size
+        align_progress = align_old - align
+        approach_progress = approach_old - approach
+        box_axis_progress = box_prog - box_old
+
+        align_ok = (align <= self._align_tol) | (
+            (~torch.isnan(align_old)) & (align_progress > self._progress_eps)
+        )
+        approach_ok = (~torch.isnan(approach_old)) & (approach_progress > self._progress_eps)
+        box_ok = (~torch.isnan(box_old)) & (box_axis_progress > self._progress_eps)
+
+        all_stuck = window_ready & (~align_ok) & (~approach_ok) & (~box_ok)
+        return active & push_active & all_stuck
+
+    def reset(self, env_ids=None):
+        if not self._initialized:
+            return
+        if env_ids is None:
+            self._align_history.fill_(float("nan"))
+            self._approach_history.fill_(float("nan"))
+            self._box_progress_history.fill_(float("nan"))
+            self._filled.zero_()
+            self._prev_stage_idx.fill_(-1)
+            self._head = 0
+        else:
+            self._align_history[env_ids] = float("nan")
+            self._approach_history[env_ids] = float("nan")
+            self._box_progress_history[env_ids] = float("nan")
             self._filled[env_ids] = 0
             self._prev_stage_idx[env_ids] = -1
 
