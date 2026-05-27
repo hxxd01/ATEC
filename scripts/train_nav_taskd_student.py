@@ -32,7 +32,24 @@ parser.add_argument(
 parser.add_argument("--ppo_no_train", action="store_true", help="Disable PPO updates; run rollout only.")
 parser.add_argument("--no_train_steps", type=int, default=300, help="High-level rollout steps for --ppo_no_train.")
 parser.add_argument("--video", action="store_true", default=False, help="Record a rollout video.")
-parser.add_argument("--video_length", type=int, default=300, help="Recorded video length in env steps.")
+parser.add_argument(
+    "--video_length",
+    type=int,
+    default=300,
+    help="Max physics frames for --ppo_no_train --video (caps rollout nav steps).",
+)
+parser.add_argument(
+    "--video_dir",
+    type=str,
+    default=None,
+    help="Output mp4 path or folder for --ppo_no_train --video (default: <log_dir>/videos/rgb_head_ee.mp4).",
+)
+parser.add_argument(
+    "--depth_video_fps",
+    type=float,
+    default=0.0,
+    help="FPS for --ppo_no_train --video combined mp4 (0 = physics step rate, ~50Hz).",
+)
 parser.add_argument(
     "--no_train_ckpt",
     type=str,
@@ -145,10 +162,51 @@ def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True)
         print(f"[INFO] Skipped keys (shape mismatch): {skipped_keys[:8]}", flush=True)
 
 
-def _run_no_train_rollout(vec_env: NavRslRlVecEnvWrapper, steps: int, policy=None, policy_nn=None) -> None:
+def _write_depth_video(frames: list, path: str, fps: float) -> None:
+    if not frames:
+        print(f"[WARN] Video not saved (0 frames): {path}", flush=True)
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        import imageio.v2 as imageio
+
+        imageio.mimwrite(path, frames, fps=float(fps))
+    except Exception as exc:
+        print(f"[WARN] imageio video failed ({exc}); trying cv2...", flush=True)
+        try:
+            import cv2
+
+            h, w = frames[0].shape[:2]
+            writer = cv2.VideoWriter(
+                path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(fps),
+                (w, h),
+            )
+            for fr in frames:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+            writer.release()
+        except Exception as exc2:
+            print(f"[WARN] video not saved: {exc2}", flush=True)
+            return
+    print(f"[INFO] Video saved: {path} ({len(frames)} frames @ {fps:.1f} fps)", flush=True)
+
+
+def _run_no_train_rollout(
+    vec_env: NavRslRlVecEnvWrapper,
+    steps: int,
+    policy=None,
+    policy_nn=None,
+    *,
+    nav_env=None,
+    video_env: int = 0,
+    early_stop_on_done: bool = True,
+) -> None:
     """Step the student env without PPO updates (optionally with policy inference)."""
+    env_idx = max(0, min(int(video_env), vec_env.num_envs - 1))
     obs, _ = vec_env.reset()
-    for i in range(int(steps)):
+    max_steps = int(steps)
+    for i in range(max_steps):
         if policy is not None:
             # Use no_grad (not inference_mode) so recurrent hidden state can be reset in-place.
             with torch.no_grad():
@@ -158,12 +216,27 @@ def _run_no_train_rollout(vec_env: NavRslRlVecEnvWrapper, steps: int, policy=Non
         obs, rew, dones, _ = vec_env.step(actions)
         if policy_nn is not None and hasattr(policy_nn, "reset"):
             policy_nn.reset(dones)
-        if i % 50 == 0 or i == steps - 1:
+        done_ratio = dones.float().mean().item()
+        if (
+            nav_env is not None
+            and getattr(nav_env, "_combined_video_enabled", False)
+            and getattr(nav_env, "_combined_video_max_frames", None) is not None
+            and nav_env.combined_video_frame_count >= nav_env._combined_video_max_frames
+        ):
             print(
-                f"[NO-TRAIN] step={i+1:4d}/{steps} mean_rew={rew.float().mean().item():+.4f} "
-                f"done_ratio={dones.float().mean().item():.2f}",
+                f"[NO-TRAIN] stop: recorded {nav_env.combined_video_frame_count} physics frames.",
                 flush=True,
             )
+            break
+        if i % 50 == 0 or i == max_steps - 1 or done_ratio >= 1.0:
+            print(
+                f"[NO-TRAIN] step={i+1:4d}/{max_steps} mean_rew={rew.float().mean().item():+.4f} "
+                f"done_ratio={done_ratio:.2f}",
+                flush=True,
+            )
+        if early_stop_on_done and bool(dones.all().item()):
+            print(f"[NO-TRAIN] early stop: all envs done at nav step {i+1}.", flush=True)
+            break
 
 
 def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool = False) -> None:
@@ -295,19 +368,21 @@ def main():
         )
     if args_cli.depth_only:
         print("[INFO] Student sim: depth_only mode (cameras data_types=['depth']).", flush=True)
-    elif args_cli.video:
-        print("[WARN] Video recording uses RGB; run without --depth_only for meaningful video.", flush=True)
+    if args_cli.ppo_no_train and not args_cli.video:
+        print("[INFO] ppo_no_train: no video (add --video for global|head|ee stitched MP4).", flush=True)
 
-    # Render cameras once per nav step (not every physics substep).
     decimation = int(getattr(env_cfg, "decimation", 4))
     sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
-    nav_dt = float(args_cli.inner_steps) * decimation * sim_dt
+    phys_dt = decimation * sim_dt
+    nav_dt = float(args_cli.inner_steps) * phys_dt
+    cam_update_period = phys_dt if (args_cli.ppo_no_train and args_cli.video) else nav_dt
     for cam_name in ("head_camera", "ee_camera"):
         cam = getattr(env_cfg.scene, cam_name, None)
         if cam is not None:
-            cam.update_period = nav_dt
+            cam.update_period = cam_update_period
     print(
         f"[INFO] Student sim: nav_dt={nav_dt:.3f}s ({1.0 / nav_dt:.1f}Hz), "
+        f"cam_update={cam_update_period:.3f}s, "
         f"camera_hw={args_cli.camera_hw}, depth_only={args_cli.depth_only}, "
         f"tiled_cameras={args_cli.tiled_cameras}, "
         f"num_envs={args_cli.num_envs}, inner_steps={args_cli.inner_steps}",
@@ -326,18 +401,20 @@ def main():
     log_dir = os.path.join(log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
 
-    render_mode = "rgb_array" if args_cli.video else None
+    record_combined_video = bool(args_cli.ppo_no_train and args_cli.video)
+    inner_steps = int(args_cli.inner_steps)
+    max_phys_frames = int(args_cli.video_length)
+    no_train_video_nav_steps = min(
+        int(args_cli.no_train_steps),
+        max(1, (max_phys_frames + inner_steps - 1) // inner_steps),
+    )
+    render_mode = "rgb_array" if record_combined_video else None
     env = gym.make("ATEC-TaskD-B2Piper", cfg=env_cfg, render_mode=render_mode)
-    if args_cli.video:
-        video_dir = os.path.join(log_dir, "videos", "student")
-        env = gym.wrappers.RecordVideo(
-            env,
-            video_folder=video_dir,
-            step_trigger=lambda step: step == 0,
-            video_length=int(args_cli.video_length),
-            disable_logger=True,
+    if record_combined_video:
+        print(
+            "[INFO] ppo_no_train + --video: global|head|ee stitched MP4 at physics step rate.",
+            flush=True,
         )
-        print(f"[INFO] Recording video to: {video_dir}", flush=True)
     nav_env = TaskDStudentEnv(
         env=env,
         ll_policy_path=args_cli.ll_policy,
@@ -379,10 +456,25 @@ def main():
         except AttributeError:
             policy_nn = None
         rollout_steps = int(args_cli.no_train_steps)
-        if args_cli.video:
-            rollout_steps = min(rollout_steps, int(args_cli.video_length))
+        combined_video_path = None
+        phys_fps = (
+            float(args_cli.depth_video_fps) if args_cli.depth_video_fps > 0 else 1.0 / max(phys_dt, 1.0e-6)
+        )
+        if record_combined_video:
+            rollout_steps = no_train_video_nav_steps
+            if args_cli.video_dir:
+                combined_video_path = os.path.abspath(args_cli.video_dir)
+                if combined_video_path.endswith(os.sep) or os.path.isdir(combined_video_path):
+                    os.makedirs(combined_video_path, exist_ok=True)
+                    combined_video_path = os.path.join(combined_video_path, "rgb_head_ee.mp4")
+            else:
+                combined_video_path = os.path.join(log_dir, "videos", "rgb_head_ee.mp4")
+            nav_env.enable_combined_video(env_idx=0, max_frames=max_phys_frames)
             print(
-                f"[INFO] Video mode: limiting no-train rollout to {rollout_steps} steps.",
+                f"[INFO] Combined video: {combined_video_path} "
+                f"(<= {max_phys_frames} physics frames @ {phys_fps:.1f} Hz, "
+                f"up to {rollout_steps} nav steps x {inner_steps} inner); "
+                f"continues after episode done (auto-reset).",
                 flush=True,
             )
         _run_no_train_rollout(
@@ -390,7 +482,13 @@ def main():
             steps=rollout_steps,
             policy=policy,
             policy_nn=policy_nn,
+            nav_env=nav_env,
+            video_env=0,
+            early_stop_on_done=not record_combined_video,
         )
+        if record_combined_video and combined_video_path is not None:
+            _write_depth_video(nav_env._combined_video_frames, combined_video_path, phys_fps)
+            nav_env.disable_combined_video()
         nav_env.close()
         return
 

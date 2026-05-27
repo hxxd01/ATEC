@@ -237,6 +237,8 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_no_motion = 0
         self._done_no_target_progress = 0
         self._done_no_push_progress = 0
+        # Per-stage episode-end counts (last index = all stages completed).
+        self._done_stage_counts: list[int] = [0] * (self._num_stages + 1)
 
         # Stage indices aligned with demo/solution.py nav_steps.
         self._idx_retreat = 0
@@ -660,6 +662,28 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_x_reached += int(x_reached_now.sum().item())
         self._done_fall += int((done_now & (~x_reached_now)).sum().item())
 
+    def _count_done_stages(self, done_now: torch.Tensor) -> None:
+        if not bool(done_now.any()):
+            return
+        stage_idx = torch.clamp(self._stage_idx_buf[done_now], min=0, max=self._num_stages)
+        for i in range(self._num_stages):
+            self._done_stage_counts[i] += int((stage_idx == i).sum().item())
+        self._done_stage_counts[self._num_stages] += int((stage_idx >= self._num_stages).sum().item())
+
+    def _stage_at_done_episode_log(self, done_now: torch.Tensor) -> dict[str, float]:
+        """Fraction of terminating envs per nav stage (for rsl_rl Episode_Termination_Stage/*)."""
+        total = int(done_now.sum().item())
+        if total <= 0:
+            return {}
+        stage_idx = torch.clamp(self._stage_idx_buf[done_now], min=0, max=self._num_stages)
+        out: dict[str, float] = {}
+        for i, name in enumerate(self._stage_names):
+            out[f"Episode_Termination_Stage/{name}"] = float((stage_idx == i).sum().item()) / total
+        finished = int((stage_idx >= self._num_stages).sum().item())
+        if finished > 0:
+            out["Episode_Termination_Stage/finished"] = finished / total
+        return out
+
     def get_observations(self):
         return self._obs_dict(self._current_obs), {}
 
@@ -675,6 +699,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_no_motion = 0
         self._done_no_target_progress = 0
         self._done_no_push_progress = 0
+        self._done_stage_counts = [0] * (self._num_stages + 1)
         rx, ry, _ = self._robot_pose()
         bx, by, _ = self._box_pose()
         self._ensure_state_buffers(rx.shape[0])
@@ -1266,6 +1291,10 @@ class TaskDTeacherEnv(gym.Wrapper):
         bonus = torch.where(reached, bonus, torch.zeros_like(bonus))
         return bonus
 
+    def _on_after_physics_step(self) -> None:
+        """Hook after each low-level env.step (override in subclasses)."""
+        return
+
     def step(self, nav_action: torch.Tensor):
         if not isinstance(nav_action, torch.Tensor):
             nav_action = torch.as_tensor(nav_action, dtype=torch.float32)
@@ -1330,6 +1359,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             env_action = self._build_env_action(ll_act)
             obs, base_rew, term, trunc, info = self.env.step(env_action)
             self._current_obs = obs
+            self._on_after_physics_step()
 
             step_term = term if isinstance(term, torch.Tensor) else torch.as_tensor(term, device=self._device)
             step_trunc = trunc if isinstance(trunc, torch.Tensor) else torch.as_tensor(trunc, device=self._device)
@@ -1341,13 +1371,17 @@ class TaskDTeacherEnv(gym.Wrapper):
             last_info = info
             if done_now.any():
                 step_log = info.get("log", {}) if isinstance(info, dict) else {}
+                merged_log = dict(episode_log)
                 if step_log:
-                    episode_log = step_log
+                    merged_log.update(step_log)
+                merged_log.update(self._stage_at_done_episode_log(done_now))
+                episode_log = merged_log
 
             rx, ry, _ = self._robot_pose()
             bx, by, _ = self._box_pose()
             if done_now.any():
                 self._count_done_terms(done_now)
+                self._count_done_stages(done_now)
                 if bool(done_now[0].item()):
                     term_flags = self._termination_term_flags()
                     reasons0: list[str] = []
@@ -1416,6 +1450,13 @@ class TaskDTeacherEnv(gym.Wrapper):
         stage_name = self._stage_names[idx0] if idx0 < self._num_stages else "done"
         if self._nav_log_interval > 0 and nav0 % self._nav_log_interval == 0:
             denom = max(1, self._done_total)
+            stage_ratio_parts = [
+                f"{self._stage_names[i]}={self._done_stage_counts[i] / denom:.2f}"
+                for i in range(self._num_stages)
+            ]
+            if self._done_stage_counts[self._num_stages] > 0:
+                stage_ratio_parts.append(f"finished={self._done_stage_counts[self._num_stages] / denom:.2f}")
+            stage_at_done = " ".join(stage_ratio_parts)
             print(
                 f"[{self._nav_log_tag}] nav={nav0:5d} curriculum={level0} "
                 f"stage={idx0 + 1}/{self._num_stages}({stage_name}) active={active0} "
@@ -1431,7 +1472,8 @@ class TaskDTeacherEnv(gym.Wrapper):
                 f"ratio={self._done_fall/denom:.2f}/{self._done_timeout/denom:.2f}/"
                 f"{self._done_x_reached/denom:.2f}/{self._done_stage_target/denom:.2f}/"
                 f"{self._done_no_motion/denom:.2f}/{self._done_no_target_progress/denom:.2f}/"
-                f"{self._done_no_push_progress/denom:.2f}",
+                f"{self._done_no_push_progress/denom:.2f} "
+                f"stage_at_done[{stage_at_done}]",
                 flush=True,
             )
 
