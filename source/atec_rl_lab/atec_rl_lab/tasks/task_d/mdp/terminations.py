@@ -299,16 +299,14 @@ class StageTargetDeviationTermination(ManagerTermBase):
     _STAGE_STARTS = (
         (-3.00, 0.00),   # retreat
         (-4.00, 0.00),   # sidestep_left
-        (-4.00, 2.10),   # advance
-        (-3.00, 2.10),   # push
-        (1.00, 0.10),    # final
+        (-4.00, 2.10),   # push
+        (0.00, 0.10),    # final
     )
     _STAGE_TARGETS = (
         (-4.00, 0.00),   # retreat
         (-4.00, 2.10),   # sidestep_left
-        (-3.00, 2.10),   # advance
-        (1.00, 0.10),    # push (2 m right + 4 m forward nominal)
-        (4.00, 0.10),    # final (+3 m along x)
+        (0.00, 0.10),    # push (2 m right + 4 m forward nominal)
+        (3.00, 0.10),    # final (+3 m along x)
     )
 
     def __init__(self, cfg, env):

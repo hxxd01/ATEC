@@ -99,15 +99,6 @@ class TaskDTeacherEnv(gym.Wrapper):
             dict(name="retreat", axis="x", sign=-0.7, dist=1.0, push=False, sparse_bonus=0.6),
             dict(name="sidestep_left", axis="y", sign=+1, dist=2.1, push=False, sparse_bonus=0.8),
             dict(
-                name="advance",
-                axis="x",
-                sign=+0.7,
-                dist=1.0,
-                push=False,
-                sparse_bonus=0.8,
-                match_box_x_tol=0.15,
-            ),
-            dict(
                 name="push",
                 axis="y",
                 sign=-1,
@@ -222,18 +213,17 @@ class TaskDTeacherEnv(gym.Wrapper):
         # Per-stage episode-end counts (last index = all stages completed).
         self._done_stage_counts: list[int] = [0] * (self._num_stages + 1)
 
-        # Stage indices: retreat → sidestep_left → advance → push → final.
+        # Stage indices: retreat → sidestep_left → push → final.
         self._idx_retreat = 0
         self._idx_sidestep_left = 1
-        self._idx_advance_match = 2
-        self._idx_push = 3
-        self._idx_final = 4
+        self._idx_push = 2
+        self._idx_final = 3
         self._push_box_drop_z = 0.0
 
         # Reward: progress toward stage target (bounded) + sparse bonus on reach.
         self._w_nav_dist = 3.0
         self._nav_dist_delta_clip = 0.05
-        # Distance tolerance for stage completion; advance also requires box x alignment.
+        # Distance tolerance for stage completion (non-push stages).
         self._stage_reach_tol = 0.35
         self._r_stage_complete = 1.0
         self._r_stage_complete_final = 2.0
@@ -982,7 +972,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         has_origin = (~torch.isnan(self._stage_origin_x_buf)) & (~torch.isnan(self._stage_origin_y_buf))
 
         # Only relative stages use previous-stage entry as segment start.
-        # Early approach stages (retreat/sidestep_left/advance) stay absolute.
+        # Early approach stages (retreat/sidestep_left) stay absolute.
         entry_start = valid & has_origin & self._stage_relative_target[stage_idx]
         sx = torch.where(entry_start, self._stage_origin_x_buf, sx)
         sy = torch.where(entry_start, self._stage_origin_y_buf, sy)
