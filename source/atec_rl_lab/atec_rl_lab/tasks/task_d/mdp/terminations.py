@@ -8,7 +8,11 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers.manager_base import ManagerTermBase
 
-from .env_origin import task_d_env_origin_xy
+from .env_origin import (
+    task_d_env_origin_xy,
+    task_d_nominal_to_world,
+    task_d_nominal_x_to_world,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -22,7 +26,8 @@ def robot_x_greater_than(
     """Terminate when robot root x (world frame) is greater than threshold + env origin."""
     robot = env.scene[asset_cfg.name]
     env_origin_x, _ = task_d_env_origin_xy(env)
-    return robot.data.root_pos_w[:, 0] > (float(x_threshold) + env_origin_x)
+    thresh = torch.full_like(env_origin_x, float(x_threshold))
+    return robot.data.root_pos_w[:, 0] > task_d_nominal_x_to_world(thresh, env_origin_x)
 
 
 class NoMotionTimeout(ManagerTermBase):
@@ -376,10 +381,12 @@ class StageTargetDeviationTermination(ManagerTermBase):
             y1 = seg_y1.to(device=env.device, dtype=torch.float32)
         else:
             env_origin_x, env_origin_y = task_d_env_origin_xy(env)
-            x0 = self._start_x[stage_idx] + env_origin_x
-            y0 = self._start_y[stage_idx] + env_origin_y
-            x1 = self._target_x[stage_idx] + env_origin_x
-            y1 = self._target_y[stage_idx] + env_origin_y
+            x0, y0 = task_d_nominal_to_world(
+                self._start_x[stage_idx], self._start_y[stage_idx], env_origin_x, env_origin_y
+            )
+            x1, y1 = task_d_nominal_to_world(
+                self._target_x[stage_idx], self._target_y[stage_idx], env_origin_x, env_origin_y
+            )
 
         vx = x1 - x0
         vy = y1 - y0

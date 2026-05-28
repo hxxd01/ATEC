@@ -82,7 +82,7 @@ python scripts/bc/train_taskd_bc.py \
 python scripts/train_nav_taskd_student.py \
   --task ATEC-TaskD-B2Piper \
   --ll_policy demo/policy.pt \
-  --num_envs 1 \
+  --num_envs 512 \
   --inner_steps 5 \
   --max_iter 10000 \
   --device cuda:0 \

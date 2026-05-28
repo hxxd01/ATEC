@@ -21,7 +21,7 @@ from atec_rl_lab.tasks.task_base import BetterTerrainGenerator, BetterTerrainImp
 
 # Playable pit footprint (same as legacy 12x8 tile). Cell size adds a dead gap between tiles.
 TASK_D_PLAYABLE_SIZE = (12.0, 8.0)
-TASK_D_TILE_GAP = (2.0, 2.0)
+TASK_D_TILE_GAP = (4.0, 4.0)
 TASK_D_CELL_SIZE = (
     TASK_D_PLAYABLE_SIZE[0] + TASK_D_TILE_GAP[0],
     TASK_D_PLAYABLE_SIZE[1] + TASK_D_TILE_GAP[1],

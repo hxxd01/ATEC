@@ -28,7 +28,9 @@ from .terrain import (
 
 # World spawn used by nav scripts / teacher; local offset is relative to each env's terrain origin.
 # For num_rows=1,num_cols=1 pit tile, terrain_origins[0,0] ~= (-4.2, 0) after generator centering (see debug_taskd_env_origins.py).
-_TASK_D_PIT_TERRAIN_ORIGIN_XY = (-4.2, 0.0)
+from .mdp.env_origin import TASK_D_PIT_TERRAIN_ORIGIN_XY as _TASK_D_PIT_TERRAIN_ORIGIN_XY
+
+TASK_D_PIT_TERRAIN_ORIGIN_XY = _TASK_D_PIT_TERRAIN_ORIGIN_XY
 _TASK_D_ROBOT_SPAWN_WORLD = (-3.0, 0.0, 0.8)
 _TASK_D_BOX_SPAWN_WORLD = (-3.0, 1.6, 0.5)
 

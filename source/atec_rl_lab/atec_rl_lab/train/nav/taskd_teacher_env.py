@@ -7,6 +7,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from atec_rl_lab.tasks.task_d.mdp.env_origin import TASK_D_PIT_TERRAIN_ORIGIN_XY
+
 _LIN_VEL_SLICE = slice(0, 3)
 _ANG_VEL_SLICE = slice(3, 6)
 _GRAVITY_SLICE = slice(9, 12)
@@ -428,6 +430,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             )
         self._env_origin_x = origins[:, 0].clone()
         self._env_origin_y = origins[:, 1].clone()
+        self._pit_ref_ox, self._pit_ref_oy = TASK_D_PIT_TERRAIN_ORIGIN_XY
 
     def _build_traj_segments(self) -> None:
         if len(self._traj_waypoints) < 2:
@@ -670,7 +673,9 @@ class TaskDTeacherEnv(gym.Wrapper):
 
         # Fallback when termination manager is unavailable.
         rx, _, _ = self._robot_pose()
-        x_reached_now = done_now & (rx.squeeze(-1) > (3.5 + self._env_origin_x))
+        x_reached_now = done_now & (
+            rx.squeeze(-1) > (3.5 + self._env_origin_x - self._pit_ref_ox)
+        )
         self._done_x_reached += int(x_reached_now.sum().item())
         self._done_fall += int((done_now & (~x_reached_now)).sum().item())
 
@@ -998,10 +1003,12 @@ class TaskDTeacherEnv(gym.Wrapper):
 
         ox = self._env_origin_x
         oy = self._env_origin_y
-        sx = self._stage_start_x[stage_idx] + ox
-        sy = self._stage_start_y[stage_idx] + oy
-        ex = self._stage_target_x[stage_idx] + ox
-        ey = self._stage_target_y[stage_idx] + oy
+        pit_ox = self._pit_ref_ox
+        pit_oy = self._pit_ref_oy
+        sx = self._stage_start_x[stage_idx] + ox - pit_ox
+        sy = self._stage_start_y[stage_idx] + oy - pit_oy
+        ex = self._stage_target_x[stage_idx] + ox - pit_ox
+        ey = self._stage_target_y[stage_idx] + oy - pit_oy
         has_origin = (~torch.isnan(self._stage_origin_x_buf)) & (~torch.isnan(self._stage_origin_y_buf))
 
         # Only relative stages use previous-stage entry as segment start.
@@ -1014,7 +1021,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         approach_stage = valid & (~torch.isnan(approach_y))
         if bool(approach_stage.any()):
             ex = torch.where(approach_stage, bx.squeeze(-1), ex)
-            ey = torch.where(approach_stage, approach_y + oy, ey)
+            ey = torch.where(approach_stage, approach_y + oy - pit_oy, ey)
 
         match_box_y = valid & self._stage_match_box_y_target[stage_idx]
         if bool(match_box_y.any()):
@@ -1055,7 +1062,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         valid = self._stage_idx_buf < self._active_stage_count_buf
         rx1 = rx.squeeze(-1)
         ry1 = ry.squeeze(-1)
-        oy = self._env_origin_y
+        pit_oy = self._pit_ref_oy
         _, _, robot_yaw = self._robot_pose()
 
         main_push = self._main_push_stage_mask(stage_idx, valid)
@@ -1083,7 +1090,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         approach_y = self._stage_approach_y[stage_idx]
         use_approach_y = valid & (~torch.isnan(approach_y))
         if bool(use_approach_y.any()):
-            y_ok = (ry1 - (approach_y + oy)).abs() <= self._stage_reach_tol
+            y_ok = (ry1 - (approach_y + self._env_origin_y - pit_oy)).abs() <= self._stage_reach_tol
             reached = torch.where(use_approach_y, reached & y_ok, reached)
         face_tol = self._stage_face_box_tol[stage_idx]
         use_face = valid & (~torch.isnan(face_tol))
@@ -1341,7 +1348,15 @@ class TaskDTeacherEnv(gym.Wrapper):
         dbg_dseg0 = float("nan")
         dbg_done_reason0 = "none"
 
+        # Per-env mask: once Isaac resets an env mid-inner-loop, do not mix the next
+        # episode's reward/stats into this nav-step return (rsl_rl sees one transition).
+        episode_done = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
+
         for _ in range(self.inner_steps):
+            active = ~episode_done
+            if not bool(active.any()):
+                break
+
             rx, ry, _ = self._robot_pose()
             bx, by, _ = self._box_pose()
             self._sync_nav_stage_idx(rx, ry, bx, by)
@@ -1382,23 +1397,25 @@ class TaskDTeacherEnv(gym.Wrapper):
             step_term_1d = step_term.squeeze(-1).bool() if step_term.ndim > 1 else step_term.bool()
             step_trunc_1d = step_trunc.squeeze(-1).bool() if step_trunc.ndim > 1 else step_trunc.bool()
             done_now = step_term_1d | step_trunc_1d
+            new_done = done_now & active
+            episode_done |= done_now
             terminated |= step_term_1d
             truncated |= step_trunc_1d
             last_info = info
-            if done_now.any():
+            if new_done.any():
                 step_log = info.get("log", {}) if isinstance(info, dict) else {}
                 merged_log = dict(episode_log)
                 if step_log:
                     merged_log.update(step_log)
-                merged_log.update(self._stage_at_done_episode_log(done_now))
+                merged_log.update(self._stage_at_done_episode_log(new_done))
                 episode_log = merged_log
 
             rx, ry, _ = self._robot_pose()
             bx, by, _ = self._box_pose()
-            if done_now.any():
-                self._count_done_terms(done_now)
-                self._count_done_stages(done_now)
-                if bool(done_now[0].item()):
+            if new_done.any():
+                self._count_done_terms(new_done)
+                self._count_done_stages(new_done)
+                if bool(new_done[0].item()):
                     term_flags = self._termination_term_flags()
                     reasons0: list[str] = []
                     for name in (
@@ -1418,13 +1435,15 @@ class TaskDTeacherEnv(gym.Wrapper):
                     if not reasons0 and bool(step_term_1d[0].item()):
                         reasons0.append("term_unknown")
                     dbg_done_reason0 = "|".join(reasons0) if reasons0 else "none"
-            self._done_total += int(done_now.sum().item())
+            self._done_total += int(new_done.sum().item())
 
             reached, dist_to_target = self._compute_stage_reached(rx, ry, bx, by)
+            reached = reached & active
             shaped, dense, time_pen = self._compute_reward(dist_to_target, done_now, reached, rx, ry, bx, by)
-            total_reward += shaped
-            total_dense += dense
-            total_time_pen += time_pen
+            alive_f = active.to(dtype=shaped.dtype)
+            total_reward += shaped * alive_f
+            total_dense += dense * alive_f
+            total_time_pen += time_pen * alive_f
 
             if bool(reached.any()):
                 stage_idx_now = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
@@ -1457,12 +1476,13 @@ class TaskDTeacherEnv(gym.Wrapper):
             self._prev_robot_x, self._prev_robot_y = rx.clone(), ry.clone()
             self._prev_box_x, self._prev_box_y = bx.clone(), by.clone()
 
-            self._reset_env_state(done_now, rx, ry, bx, by)
+            self._reset_env_state(new_done, rx, ry, bx, by)
 
+        self._nav_step_count += 1
         idx0 = int(self._stage_idx_buf[0].item())
         active0 = int(self._active_stage_count_buf[0].item())
         level0 = int(self._curriculum_level_buf[0].item())
-        nav0 = int(self._nav_step_count_buf[0].item())
+        nav0 = self._nav_step_count
         stage_name = self._stage_names[idx0] if idx0 < self._num_stages else "done"
         if self._nav_log_interval > 0 and nav0 % self._nav_log_interval == 0:
             denom = max(1, self._done_total)

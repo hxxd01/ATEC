@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Sequence
 import isaaclab.sim as sim_utils
 from isaaclab.managers.manager_base import ManagerTermBase
 
-from .env_origin import task_d_env_origin_xy
+from .env_origin import task_d_env_origin_xy, task_d_nominal_x_to_world
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -87,6 +87,12 @@ class RewardCrossX(ManagerTermBase):
             ox = float(env_origin_x[env_id].item())
             for th_idx, th in enumerate(thresholds):
                 prim_path = f"{parent_prim_path}/env_{env_id}_threshold_{th_idx}"
+                th_world = float(
+                    task_d_nominal_x_to_world(
+                        torch.tensor(float(th), device=env_origin_x.device),
+                        env_origin_x[env_id : env_id + 1],
+                    ).item()
+                )
 
                 cfg = sim_utils.CuboidCfg(
                     size=(line_thickness_x, line_length_y, line_height_z),
@@ -100,7 +106,7 @@ class RewardCrossX(ManagerTermBase):
                     prim_path=prim_path,
                     cfg=cfg,
                     translation=(
-                        float(th) + ox,
+                        th_world,
                         0.0,
                         float(3.0 + line_height_z * 0.5),
                     ),
@@ -255,7 +261,10 @@ class RewardCrossX(ManagerTermBase):
         thresholds_t = torch.tensor(thresholds, device=root_pos_x.device, dtype=root_pos_x.dtype)
         reward_values_t = torch.tensor(reward_values, device=root_pos_x.device, dtype=root_pos_x.dtype)
 
-        crossed = root_pos_x.unsqueeze(1) > (thresholds_t.unsqueeze(0) + env_origin_x.unsqueeze(1))
+        thresholds_world = task_d_nominal_x_to_world(
+            thresholds_t.unsqueeze(0).expand(env.num_envs, -1), env_origin_x.unsqueeze(1)
+        )
+        crossed = root_pos_x.unsqueeze(1) > thresholds_world
         trigger = crossed & (~self._reward_given)
         self._reward_given |= crossed
 
@@ -337,7 +346,13 @@ class RewardBoxXInRange(ManagerTermBase):
 
         in_any_range = torch.zeros_like(box_x, dtype=torch.bool)
         for mn, mx in zip(x_min_list, x_max_list):
-            in_any_range |= (box_x >= (mn + env_origin_x)) & (box_x <= (mx + env_origin_x))
+            mn_w = task_d_nominal_x_to_world(
+                torch.tensor(mn, device=box_x.device, dtype=box_x.dtype), env_origin_x
+            )
+            mx_w = task_d_nominal_x_to_world(
+                torch.tensor(mx, device=box_x.device, dtype=box_x.dtype), env_origin_x
+            )
+            in_any_range |= (box_x >= mn_w) & (box_x <= mx_w)
 
         if one_time:
             trigger = in_any_range & (~self._reward_given)
