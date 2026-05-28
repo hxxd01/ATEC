@@ -90,7 +90,7 @@ python scripts/train_nav_taskd_student.py \
   --camera_hw 24 \
   --tiled_cameras \
   --depth_only
-  --resume /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper/2026-05-25_05-21-46/model_600.pt
+  --resume /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-29_00-48-08/model_200.pt
 
 python scripts/collect_train_bc.py \
   --task ATEC-TaskD-B2Piper \
@@ -108,7 +108,7 @@ python scripts/collect_train_bc.py \
 # TaskD student 测试+录视频（--video_length=物理帧数；inner_steps=5 时 500 帧≈100 nav step）
 python scripts/train_nav_taskd_student.py \
   --ll_policy demo/policy.pt \
-  --num_envs 32 \
+  --num_envs 1 \
   --inner_steps 5 \
   --device cuda:0 \
   --headless \
@@ -119,7 +119,7 @@ python scripts/train_nav_taskd_student.py \
   --depth_only \
   --video \
   --video_length 100 \
-  --no_train_ckpt /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-28_04-50-53/model_1600.pt
+  --no_train_ckpt /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-29_00-48-08/model_100.pt
 
 python scripts/train_nav_taska_student.py \
   --ll_policy demo/taska.pt \

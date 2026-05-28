@@ -174,7 +174,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         if self._stage_idx_buf is None or self._active_stage_count_buf is None:
             return ["nav state: (not initialized yet)"]
         rx, ry, _ = self._robot_pose()
-        bx, by, _ = self._box_pose()
+        bx, by, _, _ = self._box_pose()
         stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
         valid = self._stage_idx_buf < self._active_stage_count_buf
         tx, ty = self._compute_stage_target(stage_idx, valid, rx, ry, bx, by)
@@ -272,8 +272,8 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         if max_frames is not None and len(self._combined_video_frames) >= max_frames:
             return
         rx, ry, _ = self._robot_pose()
-        bx, by, _ = self._box_pose()
-        self._sync_nav_stage_idx(rx, ry, bx, by)
+        bx, by, bz, _ = self._box_pose()
+        self._sync_nav_stage_idx(rx, ry, bx, by, bz)
         self._combined_video_frames.append(self.stitch_rgb_head_ee_frame(with_overlay=True))
         if len(self._combined_video_frames) == 1:
             lines = self._video_debug_lines(self._combined_video_env_idx)
@@ -318,7 +318,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         r_vel = robot.data.root_lin_vel_w.to(device=self._device, dtype=torch.float32)[:, :2]
         b_vel = box.data.root_lin_vel_w.to(device=self._device, dtype=torch.float32)[:, :2]
         rx, ry, robot_yaw = self._robot_pose()
-        bx, by, box_yaw = self._box_pose()
+        bx, by, _, box_yaw = self._box_pose()
         bx_body, by_body = self._relative_box_body(rx, ry, robot_yaw, bx, by)
         rel_yaw = torch.atan2(torch.sin(box_yaw - robot_yaw), torch.cos(box_yaw - robot_yaw))
         rel_world = torch.cat([bx - rx, by - ry], dim=-1)

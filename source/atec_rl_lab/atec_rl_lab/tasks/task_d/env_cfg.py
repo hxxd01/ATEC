@@ -164,7 +164,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         params={
             "stuck_time_s": 2.0,
             "progress_eps": 0.05,
-            "align_tol": 0.15,
+            "push_right_cap": 2.0,
         },
         time_out=False,
     )
