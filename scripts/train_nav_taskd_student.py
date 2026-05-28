@@ -11,6 +11,17 @@ parser = argparse.ArgumentParser(description="Train Task D student policy (BC wa
 parser.add_argument("--ll_policy", type=str, required=True, help="Low-level locomotion policy (.pt)")
 parser.add_argument("--bc_ckpt", type=str, default=None, help="BC checkpoint path (best.pt/last.pt)")
 parser.add_argument("--num_envs", type=int, default=32)
+parser.add_argument(
+    "--env_spacing",
+    type=float,
+    default=None,
+    help="InteractiveScene env_spacing (GridCloner). With terrain generator, env_origins still come from terrain tiles.",
+)
+parser.add_argument(
+    "--debug_env_origins",
+    action="store_true",
+    help="Print scene.env_origins[:16] after env creation (check 1x1 terrain vs multi-tile).",
+)
 parser.add_argument("--inner_steps", type=int, default=5, help="Low-level sim steps per nav step (5 -> 10Hz nav).")
 parser.add_argument("--max_iter", type=int, default=8000)
 parser.add_argument("--resume", type=str, default=None)
@@ -73,7 +84,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab.utils.io import dump_yaml
 
 import atec_rl_lab.tasks  # noqa: F401
-from atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvB2Cfg
+from atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvB2Cfg, refresh_task_d_terrain_cfg
 from atec_rl_lab.train.nav.taskd_student_env import TaskDStudentEnv
 from atec_rl_lab.train.nav.nav_cfg import TaskDStudentPPORunnerCfg
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
@@ -312,6 +323,35 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool
         print(f"[INFO] Example skipped keys: {skipped[:5]}", flush=True)
 
 
+def _print_env_origins_debug(base_env, *, env_spacing: float, show: int = 16) -> None:
+    """Print env_origins sample to verify terrain grid vs 1x1 pit."""
+    scene = base_env.unwrapped.scene
+    origins = scene.env_origins
+    n = min(int(show), int(origins.shape[0]))
+    xy = origins[:n, :2].detach().cpu().numpy()
+    tg = getattr(getattr(scene, "terrain", None), "terrain_generator", None)
+    tg_cfg = getattr(tg, "cfg", None) if tg is not None else None
+    rows = getattr(tg_cfg, "num_rows", None)
+    cols = getattr(tg_cfg, "num_cols", None)
+    print(
+        f"[TaskDDebug] num_envs={origins.shape[0]}  scene.env_spacing(cfg)={env_spacing}  "
+        f"terrain num_rows={rows} num_cols={cols}",
+        flush=True,
+    )
+    if getattr(scene, "terrain", None) is not None and scene.terrain.terrain_origins is not None:
+        t_orig = scene.terrain.terrain_origins.detach().cpu().numpy()
+        print(f"[TaskDDebug] terrain_origins grid shape={t_orig.shape}", flush=True)
+    print(f"[TaskDDebug] env_origins[:{n}, :2]:\n{xy}", flush=True)
+    uniq = len({tuple(row) for row in xy.round(3)})
+    print(f"[TaskDDebug] unique xy (3dp): {uniq}/{n}", flush=True)
+    if uniq <= 1:
+        print(
+            "[TaskDDebug] WARNING: env_origins identical -> terrain likely 1x1; "
+            "env_spacing does not spread pits.",
+            flush=True,
+        )
+
+
 def _configure_student_cameras(
     env_cfg,
     camera_hw: int,
@@ -347,6 +387,10 @@ def main():
 
     env_cfg = TaskDEnvB2Cfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.env_spacing is not None:
+        env_cfg.scene.env_spacing = float(args_cli.env_spacing)
+    refresh_task_d_terrain_cfg(env_cfg)
+    scene_env_spacing = float(env_cfg.scene.env_spacing)
     # Keep camera sensors but drop image/lidar observation managers (read camera buffers directly).
     if env_cfg.observations is not None:
         env_cfg.observations.image = None
@@ -385,7 +429,7 @@ def main():
         f"cam_update={cam_update_period:.3f}s, "
         f"camera_hw={args_cli.camera_hw}, depth_only={args_cli.depth_only}, "
         f"tiled_cameras={args_cli.tiled_cameras}, "
-        f"num_envs={args_cli.num_envs}, inner_steps={args_cli.inner_steps}",
+        f"num_envs={args_cli.num_envs}, env_spacing={scene_env_spacing}, inner_steps={args_cli.inner_steps}",
         flush=True,
     )
 
@@ -428,6 +472,8 @@ def main():
         nav_log_interval=args_cli.nav_log_interval,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
+    if args_cli.debug_env_origins:
+        _print_env_origins_debug(env, env_spacing=scene_env_spacing, show=16)
 
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
     if args_cli.resume:

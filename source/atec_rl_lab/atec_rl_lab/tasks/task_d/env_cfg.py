@@ -16,12 +16,19 @@ from isaaclab.assets import RigidObjectCfg
 import isaaclab.sim as sim_utils
 
 from atec_rl_lab.tasks.task_base import BaseEnvCfg
+from atec_rl_lab.tasks.task_base.envs_base_cfg import BaseSceneCfg
 from atec_rl_lab.tasks.task_base.envs_base_cfg import TerminationsCfg as BaseTerminationsCfg
-from .terrain import TASK_D_TERRAIN_CFG, PitAndPlatformTerrainCfg
+from .terrain import (
+    TASK_D_CELL_SIZE,
+    TASK_D_TERRAIN_CFG,
+    PitAndPlatformTerrainCfg,
+    configure_task_d_terrain_for_num_envs,
+    task_d_terrain_grid_shape,
+)
 
 # World spawn used by nav scripts / teacher; local offset is relative to each env's terrain origin.
-# For num_rows=1,num_cols=1 pit tile, terrain_origins[0,0] ~= (1.8, 4, 0) in world frame.
-_TASK_D_PIT_TERRAIN_ORIGIN_XY = (1.8, 4.0)
+# For num_rows=1,num_cols=1 pit tile, terrain_origins[0,0] ~= (-4.2, 0) after generator centering (see debug_taskd_env_origins.py).
+_TASK_D_PIT_TERRAIN_ORIGIN_XY = (-4.2, 0.0)
 _TASK_D_ROBOT_SPAWN_WORLD = (-3.0, 0.0, 0.8)
 _TASK_D_BOX_SPAWN_WORLD = (-3.0, 1.6, 0.5)
 
@@ -160,23 +167,39 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         time_out=False,
     )
 
+def refresh_task_d_terrain_cfg(env_cfg: "TaskDEnvCfg") -> None:
+    """Rebuild terrain grid after ``scene.num_envs`` is set. Call before ``gym.make``."""
+    env_cfg.scene.terrain = env_cfg._build_terrain_cfg()
+
+
 @configclass
 class TaskDEnvCfg(BaseEnvCfg):
+    """Task D defaults: 512 envs, 10 m clone spacing; terrain grid sized in ``_build_terrain_cfg``."""
+
+    scene: BaseSceneCfg = BaseSceneCfg(num_envs=512, env_spacing=10.0)
     pit_width_range: tuple[float, float] = (1.3, 1.4)
     platform_height_range: tuple[float, float] = (1.0, 1.2)
 
     def _build_terrain_cfg(self):
+        num_envs = int(self.scene.num_envs)
         terrain_cfg = copy.deepcopy(TASK_D_TERRAIN_CFG)
+        configure_task_d_terrain_for_num_envs(terrain_cfg, num_envs)
         pit_cfg = terrain_cfg.terrain_generator.sub_terrains.get("pit_and_platform")
         if isinstance(pit_cfg, PitAndPlatformTerrainCfg):
             pit_cfg.pit_width_range = self.pit_width_range
             pit_cfg.platform_height_range = self.platform_height_range
+        nrow, ncol = task_d_terrain_grid_shape(num_envs)
+        print(
+            f"[TaskDEnv] terrain grid {nrow}x{ncol} for num_envs={num_envs} "
+            f"(playable 12x8, cell={TASK_D_CELL_SIZE} incl. gap)",
+            flush=True,
+        )
         return terrain_cfg
 
     def __post_init__(self):
         super().__post_init__()
+        refresh_task_d_terrain_cfg(self)
 
-        self.scene.terrain = self._build_terrain_cfg()
         self.scene.box = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Box",
             spawn=sim_utils.CuboidCfg(

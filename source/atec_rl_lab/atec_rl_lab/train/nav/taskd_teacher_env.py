@@ -291,6 +291,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._traj_prefix_len = None
         self._traj_total_len = 0.0
         self._build_traj_segments()
+        self._bind_env_origins()
         self._prev_robot_s = None
         self._prev_rel_progress = None
         self._prev_dist_to_target: torch.Tensor | None = None
@@ -416,6 +417,17 @@ class TaskDTeacherEnv(gym.Wrapper):
         bx_body = cy * dx + sy * dy
         by_body = -sy * dx + cy * dy
         return bx_body, by_body
+
+    def _bind_env_origins(self) -> None:
+        """Cache terrain env_origins for per-tile world-frame stage targets and thresholds."""
+        base = self.env.unwrapped
+        origins = base.scene.env_origins.to(device=self._device, dtype=torch.float32)
+        if int(origins.shape[0]) != int(self.num_envs):
+            raise ValueError(
+                f"scene.env_origins has {int(origins.shape[0])} entries but num_envs={int(self.num_envs)}"
+            )
+        self._env_origin_x = origins[:, 0].clone()
+        self._env_origin_y = origins[:, 1].clone()
 
     def _build_traj_segments(self) -> None:
         if len(self._traj_waypoints) < 2:
@@ -658,7 +670,7 @@ class TaskDTeacherEnv(gym.Wrapper):
 
         # Fallback when termination manager is unavailable.
         rx, _, _ = self._robot_pose()
-        x_reached_now = done_now & (rx.squeeze(-1) > 3.5)
+        x_reached_now = done_now & (rx.squeeze(-1) > (3.5 + self._env_origin_x))
         self._done_x_reached += int(x_reached_now.sum().item())
         self._done_fall += int((done_now & (~x_reached_now)).sum().item())
 
@@ -705,6 +717,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._ensure_state_buffers(rx.shape[0])
         self._prev_robot_x, self._prev_robot_y = rx.clone(), ry.clone()
         self._prev_box_x, self._prev_box_y = bx.clone(), by.clone()
+        self._bind_env_origins()
         full_reset = torch.ones(rx.shape[0], device=self._device, dtype=torch.bool)
         self._reset_env_state(full_reset, rx, ry, bx, by)
         self._sync_nav_stage_idx(rx, ry, bx, by)
@@ -983,10 +996,12 @@ class TaskDTeacherEnv(gym.Wrapper):
 
         self._ensure_relative_stage_origin(stage_idx, valid, rx, ry)
 
-        sx = self._stage_start_x[stage_idx]
-        sy = self._stage_start_y[stage_idx]
-        ex = self._stage_target_x[stage_idx]
-        ey = self._stage_target_y[stage_idx]
+        ox = self._env_origin_x
+        oy = self._env_origin_y
+        sx = self._stage_start_x[stage_idx] + ox
+        sy = self._stage_start_y[stage_idx] + oy
+        ex = self._stage_target_x[stage_idx] + ox
+        ey = self._stage_target_y[stage_idx] + oy
         has_origin = (~torch.isnan(self._stage_origin_x_buf)) & (~torch.isnan(self._stage_origin_y_buf))
 
         # Only relative stages use previous-stage entry as segment start.
@@ -999,7 +1014,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         approach_stage = valid & (~torch.isnan(approach_y))
         if bool(approach_stage.any()):
             ex = torch.where(approach_stage, bx.squeeze(-1), ex)
-            ey = torch.where(approach_stage, approach_y, ey)
+            ey = torch.where(approach_stage, approach_y + oy, ey)
 
         match_box_y = valid & self._stage_match_box_y_target[stage_idx]
         if bool(match_box_y.any()):
@@ -1040,6 +1055,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         valid = self._stage_idx_buf < self._active_stage_count_buf
         rx1 = rx.squeeze(-1)
         ry1 = ry.squeeze(-1)
+        oy = self._env_origin_y
         _, _, robot_yaw = self._robot_pose()
 
         main_push = self._main_push_stage_mask(stage_idx, valid)
@@ -1067,7 +1083,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         approach_y = self._stage_approach_y[stage_idx]
         use_approach_y = valid & (~torch.isnan(approach_y))
         if bool(use_approach_y.any()):
-            y_ok = (ry1 - approach_y).abs() <= self._stage_reach_tol
+            y_ok = (ry1 - (approach_y + oy)).abs() <= self._stage_reach_tol
             reached = torch.where(use_approach_y, reached & y_ok, reached)
         face_tol = self._stage_face_box_tol[stage_idx]
         use_face = valid & (~torch.isnan(face_tol))

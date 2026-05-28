@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Sequence
 import isaaclab.sim as sim_utils
 from isaaclab.managers.manager_base import ManagerTermBase
 
+from .env_origin import task_d_env_origin_xy
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -79,8 +81,10 @@ class RewardCrossX(ManagerTermBase):
 
         self._visual_prim_paths = []
 
+        env_origin_x, _ = task_d_env_origin_xy(self._env)
         for env_id in range(self._env.num_envs):
             env_paths = []
+            ox = float(env_origin_x[env_id].item())
             for th_idx, th in enumerate(thresholds):
                 prim_path = f"{parent_prim_path}/env_{env_id}_threshold_{th_idx}"
 
@@ -96,7 +100,7 @@ class RewardCrossX(ManagerTermBase):
                     prim_path=prim_path,
                     cfg=cfg,
                     translation=(
-                        float(th),
+                        float(th) + ox,
                         0.0,
                         float(3.0 + line_height_z * 0.5),
                     ),
@@ -247,10 +251,11 @@ class RewardCrossX(ManagerTermBase):
         robot = env.scene[asset_cfg.name]
 
         root_pos_x = robot.data.root_pos_w[:, 0]
+        env_origin_x, _ = task_d_env_origin_xy(env)
         thresholds_t = torch.tensor(thresholds, device=root_pos_x.device, dtype=root_pos_x.dtype)
         reward_values_t = torch.tensor(reward_values, device=root_pos_x.device, dtype=root_pos_x.dtype)
 
-        crossed = root_pos_x.unsqueeze(1) > thresholds_t.unsqueeze(0)
+        crossed = root_pos_x.unsqueeze(1) > (thresholds_t.unsqueeze(0) + env_origin_x.unsqueeze(1))
         trigger = crossed & (~self._reward_given)
         self._reward_given |= crossed
 
@@ -326,12 +331,13 @@ class RewardBoxXInRange(ManagerTermBase):
     ) -> torch.Tensor:
         box = env.scene[asset_cfg.name]
         box_x = box.data.root_pos_w[:, 0]
+        env_origin_x, _ = task_d_env_origin_xy(env)
 
         x_min_list, x_max_list = self._normalize_ranges(x_min=x_min, x_max=x_max)
 
         in_any_range = torch.zeros_like(box_x, dtype=torch.bool)
         for mn, mx in zip(x_min_list, x_max_list):
-            in_any_range |= (box_x >= mn) & (box_x <= mx)
+            in_any_range |= (box_x >= (mn + env_origin_x)) & (box_x <= (mx + env_origin_x))
 
         if one_time:
             trigger = in_any_range & (~self._reward_given)

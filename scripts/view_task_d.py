@@ -22,11 +22,13 @@ simulation_app = app_launcher.app
 from isaaclab.envs import ManagerBasedRLEnv
 
 from atec_rl_lab.tasks.task_d import TaskDEnvB2Cfg
+from atec_rl_lab.tasks.task_d.env_cfg import refresh_task_d_terrain_cfg
 
 
 def main():
     env_cfg = TaskDEnvB2Cfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    refresh_task_d_terrain_cfg(env_cfg)
 
     env = ManagerBasedRLEnv(env_cfg)
 

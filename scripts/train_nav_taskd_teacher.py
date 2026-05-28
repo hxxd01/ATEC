@@ -90,7 +90,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab.utils.io import dump_yaml
 
 import atec_rl_lab.tasks  # noqa: F401
-from atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvB2Cfg
+from atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvB2Cfg, refresh_task_d_terrain_cfg
 from atec_rl_lab.train.nav.taskd_teacher_env import TaskDTeacherEnv
 from atec_rl_lab.train.nav.nav_cfg import TaskDTeacherPPORunnerCfg
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
@@ -119,6 +119,7 @@ def main():
 
     env_cfg = TaskDEnvB2Cfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    refresh_task_d_terrain_cfg(env_cfg)
     # Keep camera sensors off by default (speed + stability first).
     # "enable_cameras" comes from AppLauncher.add_app_launcher_args().
     if getattr(args_cli, "enable_cameras", False):
