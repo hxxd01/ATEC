@@ -171,7 +171,7 @@ class NoTargetProgressTimeout(ManagerTermBase):
 
 
 class PushStageStuckTimeout(ManagerTermBase):
-    """Terminate on push stage when box neither moves right nor forward over a time window."""
+    """Terminate on push when box stalls in both axes and robot is not approaching the box."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -181,6 +181,7 @@ class PushStageStuckTimeout(ManagerTermBase):
         self._right_cap = 2.0
         self._right_history = None
         self._forward_history = None
+        self._approach_history = None
         self._head = 0
         self._filled = None
         self._prev_stage_idx = None
@@ -194,6 +195,7 @@ class PushStageStuckTimeout(ManagerTermBase):
         push_active_attr: str = "_nav_push_stuck_active",
         right_progress_attr: str = "_nav_push_box_right_progress",
         forward_progress_attr: str = "_nav_push_box_forward_progress",
+        robot_box_dist_attr: str = "_nav_push_robot_box_dist",
         stage_idx_attr: str = "_nav_stage_idx",
         active_attr: str = "_nav_stage_active",
     ) -> torch.Tensor:
@@ -206,6 +208,7 @@ class PushStageStuckTimeout(ManagerTermBase):
             shape = (n, self._window_size)
             self._right_history = torch.full(shape, float("nan"), device=dev, dtype=torch.float32)
             self._forward_history = torch.full(shape, float("nan"), device=dev, dtype=torch.float32)
+            self._approach_history = torch.full(shape, float("nan"), device=dev, dtype=torch.float32)
             self._filled = torch.zeros(n, device=dev, dtype=torch.long)
             self._prev_stage_idx = torch.full((n,), -1, device=dev, dtype=torch.long)
             self._head = 0
@@ -220,18 +223,21 @@ class PushStageStuckTimeout(ManagerTermBase):
 
         right_t = getattr(root, right_progress_attr, None)
         forward_t = getattr(root, forward_progress_attr, None)
+        approach_t = getattr(root, robot_box_dist_attr, None)
         if (
             right_t is None
             or forward_t is None
+            or approach_t is None
             or not all(
                 isinstance(t, torch.Tensor) and int(t.shape[0]) == int(env.num_envs)
-                for t in (right_t, forward_t)
+                for t in (right_t, forward_t, approach_t)
             )
         ):
             return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
 
         right_prog = right_t.to(device=env.device, dtype=torch.float32).view(-1)
         forward_prog = forward_t.to(device=env.device, dtype=torch.float32).view(-1)
+        approach = approach_t.to(device=env.device, dtype=torch.float32).view(-1)
 
         stage_idx = getattr(root, stage_idx_attr, None)
         if stage_idx is None:
@@ -250,14 +256,17 @@ class PushStageStuckTimeout(ManagerTermBase):
         if bool(reset_mask.any()):
             self._right_history[reset_mask] = float("nan")
             self._forward_history[reset_mask] = float("nan")
+            self._approach_history[reset_mask] = float("nan")
             self._filled[reset_mask] = 0
 
         oldest = self._head
         right_old = self._right_history[:, oldest]
         forward_old = self._forward_history[:, oldest]
+        approach_old = self._approach_history[:, oldest]
 
         self._right_history[:, self._head] = right_prog
         self._forward_history[:, self._head] = forward_prog
+        self._approach_history[:, self._head] = approach
         self._head = (self._head + 1) % self._window_size
         self._filled = torch.minimum(
             self._filled + 1,
@@ -268,12 +277,18 @@ class PushStageStuckTimeout(ManagerTermBase):
         window_ready = self._filled >= self._window_size
         right_delta = right_prog - right_old
         forward_delta = forward_prog - forward_old
+        approach_delta = approach_old - approach
 
         right_capped = right_prog >= (self._right_cap - self._progress_eps)
-        right_ok = right_capped | ((~torch.isnan(right_old)) & (right_delta > self._progress_eps))
-        forward_ok = (~torch.isnan(forward_old)) & (forward_delta > self._progress_eps)
+        right_progressing = (~torch.isnan(right_old)) & (right_delta > self._progress_eps)
+        forward_progressing = (~torch.isnan(forward_old)) & (forward_delta > self._progress_eps)
+        approach_progressing = (~torch.isnan(approach_old)) & (approach_delta > self._progress_eps)
 
-        all_stuck = window_ready & (~right_ok) & (~forward_ok)
+        # All three must stall; skip right-axis check after right cap is reached.
+        right_stuck = torch.where(right_capped, torch.zeros_like(right_prog, dtype=torch.bool), ~right_progressing)
+        forward_stuck = ~forward_progressing
+        approach_stuck = ~approach_progressing
+        all_stuck = window_ready & right_stuck & forward_stuck & approach_stuck
         return active & push_active & all_stuck
 
     def reset(self, env_ids=None):
@@ -282,12 +297,14 @@ class PushStageStuckTimeout(ManagerTermBase):
         if env_ids is None:
             self._right_history.fill_(float("nan"))
             self._forward_history.fill_(float("nan"))
+            self._approach_history.fill_(float("nan"))
             self._filled.zero_()
             self._prev_stage_idx.fill_(-1)
             self._head = 0
         else:
             self._right_history[env_ids] = float("nan")
             self._forward_history[env_ids] = float("nan")
+            self._approach_history[env_ids] = float("nan")
             self._filled[env_ids] = 0
             self._prev_stage_idx[env_ids] = -1
 

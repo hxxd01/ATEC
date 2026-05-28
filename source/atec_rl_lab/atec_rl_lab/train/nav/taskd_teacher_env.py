@@ -838,15 +838,18 @@ class TaskDTeacherEnv(gym.Wrapper):
         self,
         stage_idx: torch.Tensor,
         valid: torch.Tensor,
+        rx: torch.Tensor,
+        ry: torch.Tensor,
         bx: torch.Tensor,
         by: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         self._ensure_box_push_origin(stage_idx, valid, bx, by)
         main_push = self._main_push_stage_mask(stage_idx, valid)
         right_progress = self._compute_push_right_progress(stage_idx, valid, by)
         forward_progress = self._compute_push_forward_progress(stage_idx, valid, bx)
+        robot_box_dist = torch.hypot(rx.squeeze(-1) - bx.squeeze(-1), ry.squeeze(-1) - by.squeeze(-1))
         self._prev_sync_stage_idx = stage_idx.clone()
-        return main_push, right_progress, forward_progress
+        return main_push, right_progress, forward_progress, robot_box_dist
 
     def _publish_nav_traj_segments(
         self,
@@ -887,8 +890,8 @@ class TaskDTeacherEnv(gym.Wrapper):
         sx, sy, ex, ey = self._compute_stage_segment_endpoints(stage_idx, valid, rx, ry, bx, by)
         self._publish_nav_traj_segments(sx, sy, ex, ey)
 
-        push_stuck_active, push_right_progress, push_forward_progress = self._publish_push_stuck_signals(
-            stage_idx, valid, bx, by
+        push_stuck_active, push_right_progress, push_forward_progress, push_robot_box_dist = (
+            self._publish_push_stuck_signals(stage_idx, valid, rx, ry, bx, by)
         )
         _, dist_to_target = self._compute_stage_reached(rx, ry, bx, by, bz)
 
@@ -897,6 +900,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             ("_nav_dist_to_target", dist_to_target),
             ("_nav_push_box_right_progress", push_right_progress),
             ("_nav_push_box_forward_progress", push_forward_progress),
+            ("_nav_push_robot_box_dist", push_robot_box_dist),
         )
         for attr, val in float_attrs:
             if (
