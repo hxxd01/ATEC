@@ -467,6 +467,8 @@ def main():
         vx_min=args_cli.vx_min,
         vx_max=args_cli.vx_max,
         image_hw=args_cli.camera_hw,
+        depth_render_h=int(args_cli.camera_hw),
+        depth_render_w=int(args_cli.camera_hw),
         depth_max=args_cli.depth_max,
         depth_only=args_cli.depth_only,
         nav_log_interval=args_cli.nav_log_interval,

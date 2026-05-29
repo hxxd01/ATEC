@@ -1,0 +1,23 @@
+# Auto-synced with train_nav_taskd_student.py -> demo/depth_preprocess.py (train=deploy).
+# platform_depth_* = upload/play resolution; depth_render_* = sim train resolution before img_hw.
+policy:
+  img_hw: 24
+  img_channels: 1
+  depth_render_h: 24
+  depth_render_w: 24
+  platform_depth_h: 480
+  platform_depth_w: 640
+  depth_max: 5.0
+  camera_render_scale: 1.0
+  proprio_dim: 9
+  enc_dim: 128
+  fuse_dim: 256
+  rnn_type: gru
+  rnn_hidden_dim: 256
+  rnn_num_layers: 1
+  actor_obs_normalization: true
+  critic_obs_normalization: true
+  actor_hidden_dims: [256]
+  critic_hidden_dims: [256, 128]
+  init_noise_std: 0.6
+  noise_std_type: scalar

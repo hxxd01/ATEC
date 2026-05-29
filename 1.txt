@@ -90,7 +90,7 @@ python scripts/train_nav_taskd_student.py \
   --camera_hw 24 \
   --tiled_cameras \
   --depth_only \
-  --resume /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-29_00-48-08/model_200.pt
+  --resume /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-29_03-13-21/model_1300.pt
 
 python scripts/collect_train_bc.py \
   --task ATEC-TaskD-B2Piper \

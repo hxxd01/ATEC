@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+_demo_dir = Path(__file__).resolve().parents[5] / "demo"
+if str(_demo_dir) not in sys.path:
+    sys.path.insert(0, str(_demo_dir))
+from depth_preprocess import prep_depth as _prep_depth_shared  # noqa: E402
 
 from .taskd_teacher_env import (
     TaskDTeacherEnv,
@@ -25,6 +33,8 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         vx_min: float = -2.0,
         vx_max: float = 2.0,
         image_hw: int = 64,
+        depth_render_h: int | None = None,
+        depth_render_w: int | None = None,
         depth_max: float = 5.0,
         depth_only: bool = False,
         nav_log_interval: int = 10,
@@ -41,6 +51,12 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         )
         self._nav_log_tag = "TaskDStudent"
         self._image_hw = int(image_hw)
+        if depth_render_h is None or depth_render_w is None:
+            self._depth_render_h = int(image_hw)
+            self._depth_render_w = int(image_hw)
+        else:
+            self._depth_render_h = int(depth_render_h)
+            self._depth_render_w = int(depth_render_w)
         self._depth_max = float(depth_max)
         self._depth_only = bool(depth_only)
         self._img_channels = 1 if self._depth_only else 4
@@ -75,26 +91,13 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         return x
 
     def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
-        src_is_int = not x.dtype.is_floating_point
-        if x.dtype != torch.float32:
-            x = x.float()
-        if x.ndim == 4 and x.shape[1] == 1:
-            x = x[:, 0]
-        elif x.ndim == 4 and x.shape[-1] == 1:
-            x = x[..., 0]
-        x = torch.nan_to_num(x, nan=self._depth_max, posinf=self._depth_max, neginf=0.0)
-        if src_is_int:
-            x = torch.clamp(x / 255.0, 0.0, 1.0)
-        elif x.max() > 1.5:
-            x = torch.clamp(x, 0.05, self._depth_max)
-            x = torch.log1p(x) / np.log1p(self._depth_max)
-        else:
-            x = torch.clamp(x, 0.0, 1.0)
-        if x.ndim == 3:
-            x = x.unsqueeze(1)
-        if x.shape[-1] != self._image_hw or x.shape[-2] != self._image_hw:
-            x = F.interpolate(x, size=(self._image_hw, self._image_hw), mode="bilinear", align_corners=False)
-        return x
+        return _prep_depth_shared(
+            x,
+            image_hw=self._image_hw,
+            depth_render_h=self._depth_render_h,
+            depth_render_w=self._depth_render_w,
+            depth_max=self._depth_max,
+        )
 
     def _policy_depth_gray(self, cam_tensor: torch.Tensor, env_idx: int) -> np.ndarray:
         """Single-camera policy-input depth as uint8 HxW."""
