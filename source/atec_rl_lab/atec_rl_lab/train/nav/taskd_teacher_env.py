@@ -1052,6 +1052,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             valid
             & self._stage_relative_target[stage_idx]
             & (~self._stage_match_box_y_target[stage_idx])
+            & (~self._stage_follow_box_target[stage_idx])
             & has_origin
         )
         if bool(rel_stage.any()):
