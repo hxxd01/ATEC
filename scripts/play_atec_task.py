@@ -45,6 +45,12 @@ parser.add_argument(
     help="Enable debug prints: reward, elapsed sim time, measured base linear velocities.",
 )
 parser.add_argument(
+    "--print-box-pose",
+    action="store_true",
+    default=False,
+    help="Task D: print robot/box xyz (world + env-local) every sim step; also on video HUD.",
+)
+parser.add_argument(
     "--fast",
     action="store_true",
     default=None,
@@ -153,6 +159,132 @@ def _disable_lidar_keep_cameras(env_cfg) -> None:
     print("[play] Task D: lidar off, observation cameras kept.", flush=True)
 
 
+# Task D box cuboid size in env_cfg.scene.box spawn (0.8, 1.0, 0.6) m.
+_TASKD_BOX_HALF_EXT = (0.4, 0.5, 0.3)
+_TASKD_BOX_DROP_CENTER_Z = 0.0  # teacher push-done: link-frame z < 0
+_play_box_lowest_z0: float | None = None
+
+
+def _box_corners_world(link_pos: torch.Tensor, link_quat: torch.Tensor) -> torch.Tensor:
+    """Eight cuboid corners in world frame from PhysX link pose + env_cfg size."""
+    from isaaclab.utils.math import quat_apply
+
+    device = link_pos.device
+    hx, hy, hz = _TASKD_BOX_HALF_EXT
+    corners_b = []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                corners_b.append([sx * hx, sy * hy, sz * hz])
+    corners_b = torch.tensor(corners_b, device=device, dtype=torch.float32)
+    quat = link_quat.unsqueeze(0).expand(8, -1)
+    return quat_apply(quat, corners_b) + link_pos.unsqueeze(0)
+
+
+def _taskd_scene_pose_snapshot(env) -> dict | None:
+    """PhysX poses for env 0: link/COM/AABB (not a synthetic geometry-center guess)."""
+    try:
+        unwrapped = env.unwrapped
+        robot = unwrapped.scene["robot"]
+        try:
+            box = unwrapped.scene["box"]
+        except (AttributeError, KeyError):
+            box = unwrapped.scene.rigid_objects["box"]
+        device = robot.data.root_link_pos_w.device
+
+        robot_link = robot.data.root_link_pos_w[0]
+        box_link = box.data.root_link_pos_w[0]
+        box_com = (
+            box.data.root_com_pos_w[0]
+            if hasattr(box.data, "root_com_pos_w")
+            else box_link
+        )
+        box_quat = box.data.root_link_quat_w[0]
+        corners_w = _box_corners_world(box_link, box_quat)
+        aabb_min = corners_w.min(dim=0).values
+        aabb_max = corners_w.max(dim=0).values
+        # Center of the bottom face (4 corners at min-z side of the oriented box).
+        z_eps = 1.0e-4
+        bottom_mask = corners_w[:, 2] <= corners_w[:, 2].min() + z_eps
+        bottom_ctr = corners_w[bottom_mask].mean(dim=0)
+
+        box_v = torch.zeros(3, device=device)
+        if hasattr(box.data, "root_com_lin_vel_w"):
+            box_v = box.data.root_com_lin_vel_w[0]
+
+        origin = torch.zeros(3, device=device)
+        if hasattr(unwrapped.scene, "env_origins"):
+            origin = unwrapped.scene.env_origins[0]
+
+        def _to_list(t: torch.Tensor) -> list[float]:
+            return t.detach().cpu().tolist()
+
+        robot_w = _to_list(robot_link)
+        dist_xy = float(
+            torch.linalg.vector_norm(robot_link[:2] - box_link[:2]).detach().cpu()
+        )
+        speed = float(torch.linalg.vector_norm(box_v).detach().cpu())
+        link_z = float(box_link[2].item())
+        return {
+            "robot_w": robot_w,
+            "box_link": _to_list(box_link),
+            "box_com": _to_list(box_com),
+            "box_aabb_min": _to_list(aabb_min),
+            "box_aabb_max": _to_list(aabb_max),
+            "box_bottom_ctr": _to_list(bottom_ctr),
+            "box_lowest_z": float(aabb_min[2].item()),
+            "box_v": _to_list(box_v),
+            "dist_xy": dist_xy,
+            "box_speed": speed,
+            "teacher_drop_link_z_lt0": link_z < _TASKD_BOX_DROP_CENTER_Z,
+        }
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return None
+
+
+def _format_xyz(label: str, xyz: list[float]) -> str:
+    return f"{label}=({xyz[0]:+.3f},{xyz[1]:+.3f},{xyz[2]:+.3f})"
+
+
+def _print_taskd_box_pose(env, timestep: int, *, on_done: bool = False) -> None:
+    global _play_box_lowest_z0
+    snap = _taskd_scene_pose_snapshot(env)
+    if snap is None:
+        print(f"[play] step={timestep} box pose unavailable (scene has no robot/box)", flush=True)
+        return
+    lowest_z = snap["box_lowest_z"]
+    if _play_box_lowest_z0 is None:
+        _play_box_lowest_z0 = lowest_z
+    dz_low = lowest_z - _play_box_lowest_z0
+    settled = snap["box_speed"] < 0.02
+    tag = "done" if on_done else f"step={timestep}"
+    bv = snap["box_v"]
+    print(
+        f"[play] {tag} "
+        f"{_format_xyz('box_link', snap['box_link'])} "
+        f"{_format_xyz('box_com', snap['box_com'])} "
+        f"{_format_xyz('box_bottom', snap['box_bottom_ctr'])} "
+        f"box_lowest_z={lowest_z:+.3f} dz_low={dz_low:+.3f} "
+        f"aabb_min={snap['box_aabb_min'][0]:+.3f},{snap['box_aabb_min'][1]:+.3f},{snap['box_aabb_min'][2]:+.3f} "
+        f"aabb_max={snap['box_aabb_max'][0]:+.3f},{snap['box_aabb_max'][1]:+.3f},{snap['box_aabb_max'][2]:+.3f} "
+        f"box_v=({bv[0]:+.3f},{bv[1]:+.3f},{bv[2]:+.3f}) spd={snap['box_speed']:.4f} "
+        f"settled={int(settled)} teacher_link_z_lt0={int(snap['teacher_drop_link_z_lt0'])} "
+        f"dist_xy={snap['dist_xy']:.3f} {_format_xyz('robot_link', snap['robot_w'])}",
+        flush=True,
+    )
+
+
+def _taskd_pose_overlay_lines(env) -> list[str]:
+    snap = _taskd_scene_pose_snapshot(env)
+    if snap is None:
+        return []
+    return [
+        _format_xyz("box_link", snap["box_link"]),
+        f"lowest_z={snap['box_lowest_z']:+.2f} bottom_z={snap['box_bottom_ctr'][2]:+.2f}",
+        f"spd={snap['box_speed']:.3f}",
+    ]
+
+
 def _build_video_overlay_lines(
     obs,
     env,
@@ -160,6 +292,8 @@ def _build_video_overlay_lines(
     timestep: int,
     total_episode_reward: float,
     total_elapsed_time: float,
+    *,
+    show_box_pose: bool = False,
 ) -> list[str]:
     """Build HUD lines matching --debug terminal output."""
     lines = [
@@ -185,16 +319,30 @@ def _build_video_overlay_lines(
     except (AttributeError, KeyError):
         pass
 
+    if show_box_pose:
+        lines.extend(_taskd_pose_overlay_lines(env))
+
     if hasattr(solution, "get_video_overlay_lines"):
         lines.extend(solution.get_video_overlay_lines())
 
     return lines
 
 
-def _debug_print_motion(obs, env, total_episode_reward: float, total_elapsed_time: float, solution=None) -> None:
+def _debug_print_motion(
+    obs,
+    env,
+    total_episode_reward: float,
+    total_elapsed_time: float,
+    solution=None,
+    *,
+    timestep: int = 0,
+    print_box_pose: bool = False,
+) -> None:
     """Print reward/time and measured velocities (after env.step)."""
     print(f"total_episode_reward:{total_episode_reward: .2f}")
     print(f"total_elapsed_time:{total_elapsed_time: .2f}")
+    if print_box_pose:
+        _print_taskd_box_pose(env, timestep)
     proprio = obs.get("proprio")
     if proprio is None:
         return
@@ -479,6 +627,16 @@ def play() -> tuple[float, float]:
         solution.bind_env(env)
         print("[play] Task D: bind_env() — nav uses sim robot/box pose.", flush=True)
 
+    show_box_pose = bool(_is_task_d and args_cli.print_box_pose)
+    if show_box_pose:
+        global _play_box_lowest_z0
+        _play_box_lowest_z0 = None
+        print(
+            "[play] Task D: box pose from PhysX — link/COM + AABB corners (0.8x1.0x0.6); "
+            "box_lowest_z = world min corner; teacher uses link z<0.",
+            flush=True,
+        )
+
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
 
@@ -511,6 +669,7 @@ def play() -> tuple[float, float]:
                         timestep,
                         total_episode_reward,
                         total_elapsed_time,
+                        show_box_pose=show_box_pose,
                     )
                 )
 
@@ -532,15 +691,26 @@ def play() -> tuple[float, float]:
             elif dt is not None:
                 total_elapsed_time += dt  # wall clock time as fallback
 
+            timestep += 1
+
             if args_cli.debug:
-                _debug_print_motion(obs, env, total_episode_reward, total_elapsed_time, solution=solution)
+                _debug_print_motion(
+                    obs,
+                    env,
+                    total_episode_reward,
+                    total_elapsed_time,
+                    solution=solution,
+                    timestep=timestep,
+                    print_box_pose=show_box_pose,
+                )
+            elif show_box_pose:
+                _print_taskd_box_pose(env, timestep)
 
             done = (terminated.item() or truncated.item())
             if done:
                 _print_done_reason(terminated, truncated, info, env=env)
                 break
 
-            timestep += 1
             # If recording one video, exit after video_length steps
             if args_cli.video and timestep >= args_cli.video_length:
                 break

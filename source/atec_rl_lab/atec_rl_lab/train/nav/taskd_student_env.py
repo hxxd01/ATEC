@@ -38,6 +38,10 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         depth_max: float = 5.0,
         depth_only: bool = False,
         nav_log_interval: int = 10,
+        push_box_drop_com_z: float = 0.295,
+        adjust_box_behind_x: float = 0.4,
+        adjust_box_z_settle_eps: float = 1.0e-3,
+        w_adjust_yaw_face_x: float = 2.0,
     ):
         super().__init__(
             env=env,
@@ -48,6 +52,10 @@ class TaskDStudentEnv(TaskDTeacherEnv):
             vx_min=vx_min,
             vx_max=vx_max,
             nav_log_interval=nav_log_interval,
+            push_box_drop_com_z=push_box_drop_com_z,
+            adjust_box_behind_x=adjust_box_behind_x,
+            adjust_box_z_settle_eps=adjust_box_z_settle_eps,
+            w_adjust_yaw_face_x=w_adjust_yaw_face_x,
         )
         self._nav_log_tag = "TaskDStudent"
         self._image_hw = int(image_hw)
@@ -176,8 +184,8 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         ei = max(0, min(int(env_idx), self.num_envs - 1))
         if self._stage_idx_buf is None or self._active_stage_count_buf is None:
             return ["nav state: (not initialized yet)"]
-        rx, ry, _ = self._robot_pose()
-        bx, by, _, _ = self._box_pose()
+        rx, ry, rz = self._robot_pose()
+        bx, by, bz, _ = self._box_pose()
         stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
         valid = self._stage_idx_buf < self._active_stage_count_buf
         tx, ty = self._compute_stage_target(stage_idx, valid, rx, ry, bx, by)
@@ -186,9 +194,9 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         prog = float(self._stage_progress_buf[ei].item()) if self._stage_progress_buf is not None else float("nan")
         return [
             f"stage {si + 1}/{self._num_stages} ({sn})  prog={prog:.2f}",
-            f"robot  x={rx[ei, 0].item():+.2f}  y={ry[ei, 0].item():+.2f}",
+            f"robot  x={rx[ei, 0].item():+.2f}  y={ry[ei, 0].item():+.2f}  z={rz[ei, 0].item():+.2f}",
             f"target x={tx[ei].item():+.2f}  y={ty[ei].item():+.2f}",
-            f"box    x={bx[ei, 0].item():+.2f}  y={by[ei, 0].item():+.2f}",
+            f"box    x={bx[ei, 0].item():+.2f}  y={by[ei, 0].item():+.2f}  z={bz[ei, 0].item():+.3f} (com)",
         ]
 
     @staticmethod

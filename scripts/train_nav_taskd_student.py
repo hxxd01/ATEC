@@ -68,6 +68,30 @@ parser.add_argument(
     help="Checkpoint used only for --ppo_no_train rollout inference.",
 )
 parser.add_argument("--nav_log_interval", type=int, default=50, help="Print [TaskDTeacher] nav log every N nav steps (0=off).")
+parser.add_argument(
+    "--push-box-drop-com-z",
+    type=float,
+    default=0.295,
+    help="End push stage when box center-of-mass world z drops below this value.",
+)
+parser.add_argument(
+    "--adjust-box-behind-x",
+    type=float,
+    default=0.4,
+    help="Adjust stage target: robot x = box_x - this offset (m).",
+)
+parser.add_argument(
+    "--adjust-box-z-settle-eps",
+    type=float,
+    default=1.0e-3,
+    help="Adjust stage done: |box_com_z - prev_frame| must be <= this.",
+)
+parser.add_argument(
+    "--w-adjust-yaw-face-x",
+    type=float,
+    default=2.0,
+    help="Adjust stage dense reward weight for yaw alignment to world +x.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 # Student policy always reads head/ee camera buffers.
@@ -472,6 +496,10 @@ def main():
         depth_max=args_cli.depth_max,
         depth_only=args_cli.depth_only,
         nav_log_interval=args_cli.nav_log_interval,
+        push_box_drop_com_z=args_cli.push_box_drop_com_z,
+        adjust_box_behind_x=args_cli.adjust_box_behind_x,
+        adjust_box_z_settle_eps=args_cli.adjust_box_z_settle_eps,
+        w_adjust_yaw_face_x=args_cli.w_adjust_yaw_face_x,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
     if args_cli.debug_env_origins:
