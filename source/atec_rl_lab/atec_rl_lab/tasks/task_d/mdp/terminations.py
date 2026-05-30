@@ -174,6 +174,115 @@ class NoTargetProgressTimeout(ManagerTermBase):
             self._prev_stage_idx[env_ids] = -1
 
 
+class FinalStageMaxXStuckTimeout(ManagerTermBase):
+    """Terminate in final stage when max x progress from origin stalls for stuck_time_s."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._initialized = False
+        self._window_size = 1
+        self._progress_eps = 0.05
+        self._final_stage_idx = 3
+        self._max_history = None
+        self._running_max = None
+        self._head = 0
+        self._filled = None
+        self._prev_stage_idx = None
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        stuck_time_s: float = 2.0,
+        progress_eps: float = 0.05,
+        final_stage_idx: int = 3,
+        x_progress_attr: str = "_nav_final_x_progress",
+        stage_idx_attr: str = "_nav_stage_idx",
+        active_attr: str = "_nav_stage_active",
+    ) -> torch.Tensor:
+        if not self._initialized:
+            self._window_size = max(1, int(float(stuck_time_s) / env.step_dt))
+            self._progress_eps = float(progress_eps)
+            self._final_stage_idx = int(final_stage_idx)
+            n = env.num_envs
+            dev = env.device
+            self._max_history = torch.full((n, self._window_size), float("nan"), device=dev, dtype=torch.float32)
+            self._running_max = torch.zeros(n, device=dev, dtype=torch.float32)
+            self._filled = torch.zeros(n, device=dev, dtype=torch.long)
+            self._prev_stage_idx = torch.full((n,), -1, device=dev, dtype=torch.long)
+            self._head = 0
+            self._initialized = True
+            self.reset()
+
+        root = env.unwrapped if hasattr(env, "unwrapped") else env
+        x_t = getattr(root, x_progress_attr, None)
+        if x_t is None or not isinstance(x_t, torch.Tensor) or int(x_t.shape[0]) != int(env.num_envs):
+            return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+
+        x_prog = x_t.to(device=env.device, dtype=torch.float32).view(-1)
+
+        stage_idx = getattr(root, stage_idx_attr, None)
+        if stage_idx is None:
+            stage_idx = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        else:
+            stage_idx = stage_idx.to(device=env.device, dtype=torch.long).view(-1)
+
+        active_t = getattr(root, active_attr, None)
+        if active_t is None:
+            active = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+        else:
+            active = active_t.to(device=env.device, dtype=torch.bool).view(-1)
+
+        final_active = active & (stage_idx == self._final_stage_idx)
+
+        stage_changed = stage_idx != self._prev_stage_idx
+        reset_mask = stage_changed | (~final_active)
+        if bool(reset_mask.any()):
+            self._max_history[reset_mask] = float("nan")
+            self._filled[reset_mask] = 0
+            self._running_max[reset_mask] = 0.0
+
+        entered_final = stage_changed & (stage_idx == self._final_stage_idx)
+        if bool(entered_final.any()):
+            self._running_max[entered_final] = x_prog[entered_final]
+
+        if bool(final_active.any()):
+            self._running_max[final_active] = torch.maximum(self._running_max[final_active], x_prog[final_active])
+
+        oldest = self._head
+        max_old = self._max_history[:, oldest]
+        self._max_history[:, self._head] = self._running_max
+        self._head = (self._head + 1) % self._window_size
+        self._filled = torch.where(
+            final_active,
+            torch.minimum(
+                self._filled + 1,
+                torch.full_like(self._filled, self._window_size),
+            ),
+            self._filled,
+        )
+        self._prev_stage_idx = stage_idx.clone()
+
+        window_ready = self._filled >= self._window_size
+        net_progress = self._running_max - max_old
+        stuck = window_ready & (~torch.isnan(max_old)) & (net_progress <= self._progress_eps)
+        return final_active & stuck
+
+    def reset(self, env_ids=None):
+        if not self._initialized:
+            return
+        if env_ids is None:
+            self._max_history.fill_(float("nan"))
+            self._running_max.zero_()
+            self._filled.zero_()
+            self._prev_stage_idx.fill_(-1)
+            self._head = 0
+        else:
+            self._max_history[env_ids] = float("nan")
+            self._running_max[env_ids] = 0.0
+            self._filled[env_ids] = 0
+            self._prev_stage_idx[env_ids] = -1
+
+
 class PushStageStuckTimeout(ManagerTermBase):
     """Terminate on push when box stalls on both axes (and not approaching when far/no contact)."""
 

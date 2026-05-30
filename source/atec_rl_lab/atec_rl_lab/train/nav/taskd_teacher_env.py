@@ -211,6 +211,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_no_motion = 0
         self._done_no_target_progress = 0
         self._done_no_push_progress = 0
+        self._done_final_max_x_stuck = 0
         self._push_complete_count = 0
         # Per-stage episode-end counts (last index = all stages completed).
         self._done_stage_counts: list[int] = [0] * (self._num_stages + 1)
@@ -609,6 +610,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             "no_motion_timeout",
             "no_target_progress_timeout",
             "no_push_progress_timeout",
+            "final_max_x_stuck_timeout",
         ):
             try:
                 out[name] = tm.get_term(name).view(-1)[: self.num_envs].to(
@@ -637,6 +639,8 @@ class TaskDTeacherEnv(gym.Wrapper):
                 self._done_no_target_progress += int((done_now & term_flags["no_target_progress_timeout"]).sum().item())
             if "no_push_progress_timeout" in term_flags:
                 self._done_no_push_progress += int((done_now & term_flags["no_push_progress_timeout"]).sum().item())
+            if "final_max_x_stuck_timeout" in term_flags:
+                self._done_final_max_x_stuck += int((done_now & term_flags["final_max_x_stuck_timeout"]).sum().item())
             return
 
         # Fallback when termination manager is unavailable.
@@ -709,6 +713,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_no_motion = 0
         self._done_no_target_progress = 0
         self._done_no_push_progress = 0
+        self._done_final_max_x_stuck = 0
         self._push_complete_count = 0
         self._done_stage_counts = [0] * (self._num_stages + 1)
         rx, ry, _ = self._robot_pose()
@@ -903,11 +908,13 @@ class TaskDTeacherEnv(gym.Wrapper):
             self._publish_push_stuck_signals(stage_idx, valid, rx, ry, bx, by)
         )
         push_in_contact = self._contact_on()
+        final_x_prog = self._compute_final_robot_x_progress(stage_idx, valid, rx)
         _, dist_to_target = self._compute_stage_reached(rx, ry, bx, by, bz)
 
         device = base.device
         float_attrs = (
             ("_nav_dist_to_target", dist_to_target),
+            ("_nav_final_x_progress", final_x_prog),
             ("_nav_push_box_right_progress", push_right_progress),
             ("_nav_push_box_forward_progress", push_forward_progress),
             ("_nav_push_robot_box_dist", push_robot_box_dist),
@@ -1465,6 +1472,7 @@ class TaskDTeacherEnv(gym.Wrapper):
                         "no_motion_timeout",
                         "no_target_progress_timeout",
                         "no_push_progress_timeout",
+                        "final_max_x_stuck_timeout",
                     ):
                         if name in term_flags and bool(term_flags[name][0].item()):
                             reasons0.append(name)
