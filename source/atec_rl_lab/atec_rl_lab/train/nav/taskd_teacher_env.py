@@ -113,7 +113,7 @@ class TaskDTeacherEnv(gym.Wrapper):
                 push_combined=True,
                 push_right_dist=2.0,
                 push_forward_dist=4.0,
-                sparse_bonus=1.6,
+                sparse_bonus=6.0,
                 relative_robot_target=True,
             ),
             dict(
@@ -248,6 +248,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_no_motion = 0
         self._done_no_target_progress = 0
         self._done_no_push_progress = 0
+        self._push_complete_count = 0
         # Per-stage episode-end counts (last index = all stages completed).
         self._done_stage_counts: list[int] = [0] * (self._num_stages + 1)
 
@@ -270,11 +271,12 @@ class TaskDTeacherEnv(gym.Wrapper):
         # Distance tolerance for stage completion (non-push stages).
         self._stage_reach_tol = 0.35
         self._r_stage_complete = 1.0
+        self._r_stage_complete_push = 6.0  # sparse bonus when push finishes → enter adjust
         self._r_stage_complete_final = 2.0
         # Small per-step penalty to encourage reaching targets quickly.
         self._r_step_penalty = -0.01
         # Push stages: box axis progress (solution-style) + approach when no contact.
-        self._w_push_box_axis = 4.0
+        self._w_push_box_axis = 2.0
         self._push_box_axis_delta_clip = 0.05
         self._w_approach_box = 3.0
         self._approach_box_delta_clip = 0.05
@@ -744,6 +746,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._done_no_motion = 0
         self._done_no_target_progress = 0
         self._done_no_push_progress = 0
+        self._push_complete_count = 0
         self._done_stage_counts = [0] * (self._num_stages + 1)
         rx, ry, _ = self._robot_pose()
         bx, by, _, _ = self._box_pose()
@@ -939,6 +942,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         push_stuck_active, push_right_progress, push_forward_progress, push_robot_box_dist = (
             self._publish_push_stuck_signals(stage_idx, valid, rx, ry, bx, by)
         )
+        push_in_contact = self._contact_on()
         _, dist_to_target = self._compute_stage_reached(rx, ry, bx, by, bz)
 
         device = base.device
@@ -963,6 +967,14 @@ class TaskDTeacherEnv(gym.Wrapper):
         ):
             base._nav_push_stuck_active = torch.zeros(self.num_envs, device=device, dtype=torch.bool)
         base._nav_push_stuck_active.copy_(push_stuck_active.to(device=device, dtype=torch.bool))
+
+        if (
+            not hasattr(base, "_nav_push_in_contact")
+            or not isinstance(base._nav_push_in_contact, torch.Tensor)
+            or int(base._nav_push_in_contact.shape[0]) != int(self.num_envs)
+        ):
+            base._nav_push_in_contact = torch.zeros(self.num_envs, device=device, dtype=torch.bool)
+        base._nav_push_in_contact.copy_(push_in_contact.to(device=device, dtype=torch.bool))
 
         if (
             not hasattr(base, "_nav_stage_active")
@@ -1390,11 +1402,16 @@ class TaskDTeacherEnv(gym.Wrapper):
 
     def _stage_sparse_bonus(self, reached: torch.Tensor) -> torch.Tensor:
         stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
-        final_reach = reached & (stage_idx == self._idx_final)
+        bonus = torch.full((self.num_envs,), self._r_stage_complete, device=self._device, dtype=torch.float32)
         bonus = torch.where(
-            final_reach,
-            torch.full((self.num_envs,), self._r_stage_complete_final, device=self._device, dtype=torch.float32),
-            torch.full((self.num_envs,), self._r_stage_complete, device=self._device, dtype=torch.float32),
+            stage_idx == self._idx_push,
+            torch.full_like(bonus, self._r_stage_complete_push),
+            bonus,
+        )
+        bonus = torch.where(
+            stage_idx == self._idx_final,
+            torch.full_like(bonus, self._r_stage_complete_final),
+            bonus,
         )
         bonus = torch.where(reached, bonus, torch.zeros_like(bonus))
         return bonus
@@ -1443,8 +1460,8 @@ class TaskDTeacherEnv(gym.Wrapper):
                 break
 
             rx, ry, _ = self._robot_pose()
-            bx, by, bz, _ = self._box_pose()
-            self._sync_nav_stage_idx(rx, ry, bx, by, bz)
+            bx, by, bz_pre, _ = self._box_pose()
+            self._sync_nav_stage_idx(rx, ry, bx, by, bz_pre)
             # Snapshot values exactly at the moment used by base-env termination checks.
             stage_idx_dbg_pre = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
             valid_dbg_pre = self._stage_idx_buf < self._active_stage_count_buf
@@ -1496,7 +1513,14 @@ class TaskDTeacherEnv(gym.Wrapper):
                 episode_log = merged_log
 
             rx, ry, _ = self._robot_pose()
-            bx, by, bz, _ = self._box_pose()
+            bx, by, bz_post, _ = self._box_pose()
+            bz_pre1 = bz_pre.squeeze(-1)
+            bz_post1 = bz_post.squeeze(-1)
+            bz_for_reach = torch.minimum(bz_pre1, bz_post1)
+            prev_bz = self._prev_box_com_z
+            valid_prev_bz = ~torch.isnan(prev_bz)
+            bz_for_reach = torch.where(valid_prev_bz, torch.minimum(bz_for_reach, prev_bz), bz_for_reach)
+            bz = bz_for_reach.unsqueeze(-1)
             if new_done.any():
                 self._count_done_terms(new_done)
                 self._count_done_stages(new_done)
@@ -1548,6 +1572,9 @@ class TaskDTeacherEnv(gym.Wrapper):
                     self._box_push_origin_y_buf,
                 )
                 stage_bonus = self._stage_sparse_bonus(reached)
+                finish_push_bonus = finish_push & (stage_bonus > 0.0)
+                if bool(finish_push_bonus.any()):
+                    self._push_complete_count += int(finish_push_bonus.sum().item())
                 inner_rew = inner_rew + stage_bonus
                 total_reward = total_reward + stage_bonus
                 total_sparse += stage_bonus
@@ -1595,6 +1622,7 @@ class TaskDTeacherEnv(gym.Wrapper):
                 f"prog={float(self._stage_progress_buf[0].item()):.2f} rew={total_reward.mean().item():+.4f} "
                 f"nav[dense/sparse/time]={total_dense.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_time_pen.mean().item():+.3f} "
+                f"push_complete={self._push_complete_count} "
                 f"pos=({dbg_rx0:+.2f},{dbg_ry0:+.2f}) tgt=({dbg_tx0:+.2f},{dbg_ty0:+.2f}) "
                 f"seg=({dbg_sx0:+.2f},{dbg_sy0:+.2f})->({dbg_ex0:+.2f},{dbg_ey0:+.2f}) dseg={dbg_dseg0:.2f} "
                 f"why0={dbg_done_reason0} "

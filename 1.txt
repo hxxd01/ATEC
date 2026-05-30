@@ -28,7 +28,7 @@ python scripts/play_atec_task.py --task ATEC-TaskA-B2Piper --headless --debug  -
 
 #看tensorboard
 source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && tensorboard --logdir=/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth --host 127.0.0.1 --port 6010
-
+source /home/zhongyuan/anaconda3/etc/profile.d/conda.sh && conda activate xxd && tensorboard --logdir=/home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper_depth --host 127.0.0.1 --port 6010
 
 --device cuda:1
 python scripts/train_nav_taskd_student.py \
@@ -56,7 +56,7 @@ python scripts/rsl_rl/train.py \
   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0 \
   --headless \
   --resume \
-  --load_run 2026-05-18_14-45-46 \
+  --load_run 2026-05-18_14-45-46  \\
   --checkpoint model_7700.pt
 
 python scripts/collect_taskd_trajectories.py \
@@ -90,11 +90,11 @@ python scripts/train_nav_taskd_student.py \
   --camera_hw 24 \
   --tiled_cameras \
   --depth_only \
-  --push-box-drop-com-z 0.28 \
+  --push-box-drop-com-z 0.295 \
   --adjust-box-behind-x 0.6 \
   --adjust-box-z-settle-eps 0.001 \
-  --w-adjust-yaw-face-x 3.0 \
-  --resume /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-30_01-21-55/model_300.pt
+  --w-adjust-yaw-face-x 4.0 \
+  --resume /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-30_14-39-50/model_700.pt
 
 python scripts/collect_train_bc.py \
   --task ATEC-TaskD-B2Piper \

@@ -100,13 +100,13 @@ class TaskDStudentActorCritic(nn.Module):
         )
 
         self.memory_a = Memory(
-            fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim
+            fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_dim=rnn_hidden_dim
         )
         self.memory_c = Memory(
             fuse_dim + (64 if self._critic_priv_dim > 0 else 0),
             type=rnn_type,
             num_layers=rnn_num_layers,
-            hidden_size=rnn_hidden_dim,
+            hidden_dim=rnn_hidden_dim,
         )
 
         # Keep actor head shape BC-compatible: 256 -> 256 -> action_dim
@@ -192,10 +192,10 @@ class TaskDStudentActorCritic(nn.Module):
             std = torch.exp(self.log_std).expand_as(mean)
         self.distribution = Normal(mean, std)
 
-    def act(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
+    def act(self, obs: dict, masks=None, hidden_state=None) -> torch.Tensor:
         encoded = self._encode_actor(self._get_flat_obs(obs, self.obs_groups["policy"]))
         encoded = self.actor_obs_normalizer(encoded)
-        out_mem = self.memory_a(encoded, masks, hidden_states).squeeze(0)
+        out_mem = self.memory_a(encoded, masks, hidden_state).squeeze(0)
         self.update_distribution(out_mem)
         return self.distribution.sample()
 
@@ -205,10 +205,10 @@ class TaskDStudentActorCritic(nn.Module):
         out_mem = self.memory_a(encoded).squeeze(0)
         return self.actor(out_mem)
 
-    def evaluate(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
+    def evaluate(self, obs: dict, masks=None, hidden_state=None) -> torch.Tensor:
         encoded = self._encode_critic(self._get_flat_obs(obs, self.obs_groups["critic"]))
         encoded = self.critic_obs_normalizer(encoded)
-        out_mem = self.memory_c(encoded, masks, hidden_states).squeeze(0)
+        out_mem = self.memory_c(encoded, masks, hidden_state).squeeze(0)
         return self.critic(out_mem)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -227,9 +227,9 @@ class TaskDStudentActorCritic(nn.Module):
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
 
     def get_hidden_states(self):
-        return self.memory_a.hidden_states, self.memory_c.hidden_states
+        return self.memory_a.hidden_state, self.memory_c.hidden_state
 
     def detach_hidden_states(self, dones=None):
-        self.memory_a.detach_hidden_states(dones)
-        self.memory_c.detach_hidden_states(dones)
+        self.memory_a.detach_hidden_state(dones)
+        self.memory_c.detach_hidden_state(dones)
 

@@ -165,6 +165,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
             "stuck_time_s": 2.0,
             "progress_eps": 0.05,
             "push_right_cap": 2.0,
+            "approach_dist_min": 1.2,
         },
         time_out=False,
     )

@@ -171,7 +171,7 @@ class NoTargetProgressTimeout(ManagerTermBase):
 
 
 class PushStageStuckTimeout(ManagerTermBase):
-    """Terminate on push when box stalls in both axes and robot is not approaching the box."""
+    """Terminate on push when box stalls on both axes (and not approaching when far/no contact)."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
@@ -196,6 +196,8 @@ class PushStageStuckTimeout(ManagerTermBase):
         right_progress_attr: str = "_nav_push_box_right_progress",
         forward_progress_attr: str = "_nav_push_box_forward_progress",
         robot_box_dist_attr: str = "_nav_push_robot_box_dist",
+        contact_attr: str = "_nav_push_in_contact",
+        approach_dist_min: float = 1.2,
         stage_idx_attr: str = "_nav_stage_idx",
         active_attr: str = "_nav_stage_active",
     ) -> torch.Tensor:
@@ -284,11 +286,21 @@ class PushStageStuckTimeout(ManagerTermBase):
         forward_progressing = (~torch.isnan(forward_old)) & (forward_delta > self._progress_eps)
         approach_progressing = (~torch.isnan(approach_old)) & (approach_delta > self._progress_eps)
 
-        # All three must stall; skip right-axis check after right cap is reached.
+        contact_t = getattr(root, contact_attr, None)
+        if contact_t is None or not isinstance(contact_t, torch.Tensor):
+            in_contact = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        else:
+            in_contact = contact_t.to(device=env.device, dtype=torch.bool).view(-1)
+        # While pushing in contact (or already close), distance naturally stays flat — do not
+        # require monotonic approach; only check box axis progress.
+        approach_required = (~in_contact) & (approach > float(approach_dist_min))
+
+        # All box-axis checks must stall; skip right-axis after right cap is reached.
         right_stuck = torch.where(right_capped, torch.zeros_like(right_prog, dtype=torch.bool), ~right_progressing)
         forward_stuck = ~forward_progressing
-        approach_stuck = ~approach_progressing
-        all_stuck = window_ready & right_stuck & forward_stuck & approach_stuck
+        approach_stuck = approach_required & (~approach_progressing)
+        box_axes_stuck = right_stuck & forward_stuck
+        all_stuck = window_ready & box_axes_stuck & (~approach_required | approach_stuck)
         return active & push_active & all_stuck
 
     def reset(self, env_ids=None):
