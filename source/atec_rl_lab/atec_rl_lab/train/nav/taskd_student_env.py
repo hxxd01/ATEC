@@ -39,9 +39,6 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         depth_only: bool = False,
         nav_log_interval: int = 10,
         push_box_drop_com_z: float = 0.295,
-        adjust_box_behind_x: float = 0.4,
-        adjust_box_z_settle_eps: float = 1.0e-3,
-        w_adjust_yaw_face_x: float = 2.0,
     ):
         super().__init__(
             env=env,
@@ -53,9 +50,6 @@ class TaskDStudentEnv(TaskDTeacherEnv):
             vx_max=vx_max,
             nav_log_interval=nav_log_interval,
             push_box_drop_com_z=push_box_drop_com_z,
-            adjust_box_behind_x=adjust_box_behind_x,
-            adjust_box_z_settle_eps=adjust_box_z_settle_eps,
-            w_adjust_yaw_face_x=w_adjust_yaw_face_x,
         )
         self._nav_log_tag = "TaskDStudent"
         self._image_hw = int(image_hw)

@@ -156,6 +156,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         params={
             "stuck_time_s": 2.0,
             "progress_eps": 0.05,
+            "skip_stage_idx": 3,
         },
         time_out=False,
     )

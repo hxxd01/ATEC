@@ -95,6 +95,7 @@ class NoTargetProgressTimeout(ManagerTermBase):
         stage_idx_attr: str = "_nav_stage_idx",
         active_attr: str = "_nav_stage_active",
         push_active_attr: str = "_nav_push_stuck_active",
+        skip_stage_idx: int | None = None,
     ) -> torch.Tensor:
         if not self._initialized:
             self._window_size = max(1, int(float(stuck_time_s) / env.step_dt))
@@ -153,6 +154,9 @@ class NoTargetProgressTimeout(ManagerTermBase):
         if push_active_t is not None and isinstance(push_active_t, torch.Tensor):
             push_active = push_active_t.to(device=env.device, dtype=torch.bool).view(-1)
             no_progress = no_progress & (~push_active)
+
+        if skip_stage_idx is not None:
+            no_progress = no_progress & (stage_idx != int(skip_stage_idx))
 
         return active & no_progress
 

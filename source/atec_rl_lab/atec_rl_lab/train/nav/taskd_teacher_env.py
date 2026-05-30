@@ -75,11 +75,6 @@ class TaskDTeacherEnv(gym.Wrapper):
         curriculum_mid_nav_steps: int = 3500,
         nav_log_interval: int = 50,
         push_box_drop_com_z: float = 0.295,
-        adjust_box_behind_x: float = 0.4,
-        adjust_reach_tol: float = 0.2,
-        adjust_box_z_settle_eps: float = 1.0e-3,
-        w_adjust_yaw_face_x: float = 2.0,
-        adjust_yaw_delta_clip: float = 0.05,
     ):
         super().__init__(env)
         self._device = device
@@ -115,18 +110,6 @@ class TaskDTeacherEnv(gym.Wrapper):
                 push_forward_dist=4.0,
                 sparse_bonus=6.0,
                 relative_robot_target=True,
-            ),
-            dict(
-                name="adjust",
-                axis="x",
-                sign=0.0,
-                dist=0.0,
-                push=False,
-                sparse_bonus=0.8,
-                relative_robot_target=True,
-                follow_box_target=True,
-                yaw_face_plus_x=True,
-                box_behind_x=0.4,
             ),
             dict(
                 name="final",
@@ -196,26 +179,6 @@ class TaskDTeacherEnv(gym.Wrapper):
             device=self._device,
             dtype=torch.float32,
         )
-        self._stage_follow_box_target = torch.tensor(
-            [bool(spec.get("follow_box_target", False)) for spec in self.stage_specs],
-            device=self._device,
-            dtype=torch.bool,
-        )
-        self._stage_yaw_face_plus_x = torch.tensor(
-            [bool(spec.get("yaw_face_plus_x", False)) for spec in self.stage_specs],
-            device=self._device,
-            dtype=torch.bool,
-        )
-        self._stage_box_behind_x = torch.tensor(
-            [
-                float(spec.get("box_behind_x"))
-                if spec.get("box_behind_x") is not None
-                else float("nan")
-                for spec in self.stage_specs
-            ],
-            device=self._device,
-            dtype=torch.float32,
-        )
         self._stage_sign = torch.tensor([float(spec["sign"]) for spec in self.stage_specs], device=self._device, dtype=torch.float32)
         self._stage_dist = torch.tensor([float(spec["dist"]) for spec in self.stage_specs], device=self._device, dtype=torch.float32)
         self._stage_push_right_dist = torch.tensor(
@@ -252,18 +215,12 @@ class TaskDTeacherEnv(gym.Wrapper):
         # Per-stage episode-end counts (last index = all stages completed).
         self._done_stage_counts: list[int] = [0] * (self._num_stages + 1)
 
-        # Stage indices: retreat → sidestep_left → push → adjust → final.
+        # Stage indices: retreat → sidestep_left → push → final.
         self._idx_retreat = 0
         self._idx_sidestep_left = 1
         self._idx_push = 2
-        self._idx_adjust = 3
-        self._idx_final = 4
+        self._idx_final = 3
         self._push_box_drop_z = float(push_box_drop_com_z)
-        self._adjust_box_behind_x = float(adjust_box_behind_x)
-        self._adjust_reach_tol = float(adjust_reach_tol)
-        self._adjust_box_z_settle_eps = float(adjust_box_z_settle_eps)
-        self._w_adjust_yaw_face_x = float(w_adjust_yaw_face_x)
-        self._adjust_yaw_delta_clip = float(adjust_yaw_delta_clip)
 
         # Reward: progress toward stage target (bounded) + sparse bonus on reach.
         self._w_nav_dist = 3.0
@@ -271,22 +228,26 @@ class TaskDTeacherEnv(gym.Wrapper):
         # Distance tolerance for stage completion (non-push stages).
         self._stage_reach_tol = 0.35
         self._r_stage_complete = 1.0
-        self._r_stage_complete_push = 6.0  # sparse bonus when push finishes → enter adjust
+        self._r_stage_complete_push = 6.0  # sparse bonus when push finishes → enter final
         self._r_stage_complete_final = 2.0
         # Small per-step penalty to encourage reaching targets quickly.
         self._r_step_penalty = -0.01
         # Push stages: box axis progress (solution-style) + approach when no contact.
         self._w_push_box_axis = 2.0
         self._push_box_axis_delta_clip = 0.05
-        self._w_approach_box = 3.0
+        self._w_approach_box = 1.0
         self._approach_box_delta_clip = 0.05
         self._contact_force_thresh = 2.0
         # approach_box: reward turning to face the box (progress-based on yaw error).
         self._w_face_box = 2.0
         self._face_box_delta_clip = 0.05
         # final: reward robot x increasing after box has landed.
-        self._w_final_robot_x = 4.0
+        self._w_final_robot_x = 6.0
         self._final_robot_x_delta_clip = 0.05
+        # final: one-shot milestones when robot x crosses box x / box x + 1.
+        self._final_cross_box_x_bonus = 5.0
+        self._final_cross_box_x_plus1_bonus = 5.0
+        self._final_cross_box_x_plus1_offset = 1.0
 
         self._traj_waypoints = _build_nominal_waypoints(self.stage_specs)
         stage_targets = self._traj_waypoints[1 : self._num_stages + 1]
@@ -310,13 +271,14 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._prev_box_axis_progress: torch.Tensor | None = None
         self._prev_push_right_progress: torch.Tensor | None = None
         self._prev_push_forward_progress: torch.Tensor | None = None
-        self._prev_final_robot_x_progress: torch.Tensor | None = None
+        self._max_final_robot_x_progress: torch.Tensor | None = None
+        self._final_cross_box_x_given: torch.Tensor | None = None
+        self._final_cross_box_x_plus1_given: torch.Tensor | None = None
         self._prev_robot_box_dist: torch.Tensor | None = None
         self._box_push_origin_x_buf: torch.Tensor | None = None
         self._box_push_origin_y_buf: torch.Tensor | None = None
         self._prev_sync_stage_idx: torch.Tensor | None = None
         self._prev_face_box_yaw_err: torch.Tensor | None = None
-        self._prev_adjust_yaw_err: torch.Tensor | None = None
         self._prev_box_com_z: torch.Tensor | None = None
 
         self._prev_robot_x = None
@@ -343,8 +305,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             f"[TaskDTeacher] nav_dt={nav_dt:.3f}s ({1.0/nav_dt:.2f}Hz), "
             f"vx=[{self._vx_min:.1f},{self._vx_max:.1f}] curriculum=[{self._curriculum_warmup_nav_steps},"
             f"{self._curriculum_mid_nav_steps}] stages={self._num_stages} "
-            f"push_drop_com_z<{self._push_box_drop_z:.3f} adjust_behind_x={self._adjust_box_behind_x:.2f} "
-            f"adjust_reach_tol={self._adjust_reach_tol:.2f} "
+            f"push_drop_com_z<{self._push_box_drop_z:.3f} "
             f"nav_log_interval={self._nav_log_interval}",
             flush=True,
         )
@@ -525,13 +486,14 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._prev_box_axis_progress = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._prev_push_right_progress = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._prev_push_forward_progress = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
-        self._prev_final_robot_x_progress = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._max_final_robot_x_progress = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
+        self._final_cross_box_x_given = torch.zeros(batch, device=self._device, dtype=torch.bool)
+        self._final_cross_box_x_plus1_given = torch.zeros(batch, device=self._device, dtype=torch.bool)
         self._prev_robot_box_dist = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._box_push_origin_x_buf = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._box_push_origin_y_buf = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._prev_sync_stage_idx = torch.full((batch,), -1, device=self._device, dtype=torch.long)
         self._prev_face_box_yaw_err = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
-        self._prev_adjust_yaw_err = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
         self._prev_box_com_z = torch.full((batch,), float("nan"), device=self._device, dtype=torch.float32)
 
     def _reset_env_state(self, reset_mask: torch.Tensor, rx, ry, bx, by) -> None:
@@ -556,13 +518,14 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._prev_box_axis_progress[reset_mask] = float("nan")
         self._prev_push_right_progress[reset_mask] = float("nan")
         self._prev_push_forward_progress[reset_mask] = float("nan")
-        self._prev_final_robot_x_progress[reset_mask] = float("nan")
+        self._max_final_robot_x_progress[reset_mask] = float("nan")
+        self._final_cross_box_x_given[reset_mask] = False
+        self._final_cross_box_x_plus1_given[reset_mask] = False
         self._prev_robot_box_dist[reset_mask] = float("nan")
         self._box_push_origin_x_buf[reset_mask] = float("nan")
         self._box_push_origin_y_buf[reset_mask] = float("nan")
         self._prev_sync_stage_idx[reset_mask] = -1
         self._prev_face_box_yaw_err[reset_mask] = float("nan")
-        self._prev_adjust_yaw_err[reset_mask] = float("nan")
         self._prev_box_com_z[reset_mask] = float("nan")
         if self._ep_stage_reward_buf is not None:
             self._ep_stage_reward_buf[reset_mask] = 0.0
@@ -810,9 +773,6 @@ class TaskDTeacherEnv(gym.Wrapper):
     def _main_push_stage_mask(self, stage_idx: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         return valid & (stage_idx == self._idx_push)
 
-    def _adjust_stage_mask(self, stage_idx: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        return valid & (stage_idx == self._idx_adjust)
-
     def _final_stage_mask(self, stage_idx: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         return valid & (stage_idx == self._idx_final)
 
@@ -1054,20 +1014,10 @@ class TaskDTeacherEnv(gym.Wrapper):
             ex = torch.where(match_box_y, anchor_x, ex)
             ey = torch.where(match_box_y, by1, ey)
 
-        follow_box = valid & self._stage_follow_box_target[stage_idx]
-        if bool(follow_box.any()):
-            behind_x = self._stage_box_behind_x[stage_idx]
-            behind_x = torch.where(torch.isnan(behind_x), self._adjust_box_behind_x, behind_x)
-            sx = torch.where(follow_box, rx1, sx)
-            sy = torch.where(follow_box, ry1, sy)
-            ex = torch.where(follow_box, bx.squeeze(-1) - behind_x, ex)
-            ey = torch.where(follow_box, by1, ey)
-
         rel_stage = (
             valid
             & self._stage_relative_target[stage_idx]
             & (~self._stage_match_box_y_target[stage_idx])
-            & (~self._stage_follow_box_target[stage_idx])
             & has_origin
         )
         if bool(rel_stage.any()):
@@ -1098,41 +1048,31 @@ class TaskDTeacherEnv(gym.Wrapper):
         _, _, robot_yaw = self._robot_pose()
 
         main_push = self._main_push_stage_mask(stage_idx, valid)
-        adjust = self._adjust_stage_mask(stage_idx, valid)
+        final_mask = self._final_stage_mask(stage_idx, valid)
         self._ensure_box_push_origin(stage_idx, valid, bx, by)
         right_progress = self._compute_push_right_progress(stage_idx, valid, by)
         forward_progress = self._compute_push_forward_progress(stage_idx, valid, bx)
         stage_dist = self._stage_dist[stage_idx]
+        final_x_prog = self._compute_final_robot_x_progress(stage_idx, valid, rx)
 
         target_x, target_y = self._compute_stage_target(stage_idx, valid, rx, ry, bx, by)
         dist_to_target = torch.hypot(rx1 - target_x, ry1 - target_y)
-        reach_tol = torch.where(
-            adjust,
-            torch.full_like(dist_to_target, self._adjust_reach_tol),
-            torch.full_like(dist_to_target, self._stage_reach_tol),
-        )
-        reached_nav = valid & (dist_to_target <= reach_tol)
-        reached_push = main_push & (bz.squeeze(-1) < self._push_box_drop_z)
-        bz1 = bz.squeeze(-1)
-        prev_bz = self._prev_box_com_z
-        box_z_settled = (~torch.isnan(prev_bz)) & (
-            (bz1 - prev_bz).abs() <= self._adjust_box_z_settle_eps
-        )
-        reached_adjust = adjust & reached_nav & box_z_settled
-        reached = torch.where(
-            main_push,
-            reached_push,
-            torch.where(adjust, reached_adjust, reached_nav),
-        )
+        final_remaining_x = torch.clamp(stage_dist - final_x_prog, min=0.0)
+        dist_to_target = torch.where(final_mask, final_remaining_x, dist_to_target)
 
-        # Keep important alignment constraints at stage completion (non-push stages).
+        reached_push = main_push & (bz.squeeze(-1) < self._push_box_drop_z)
+        reached_nav = valid & (~final_mask) & (dist_to_target <= self._stage_reach_tol)
+        reached_final = final_mask & (final_x_prog >= stage_dist)
+        reached = torch.where(main_push, reached_push, torch.where(final_mask, reached_final, reached_nav))
+
+        # Keep important alignment constraints at stage completion (non-push, non-final stages).
         x_tol = self._stage_match_box_x_tol[stage_idx]
-        use_x_tol = valid & (~main_push) & (~adjust) & (~torch.isnan(x_tol))
+        use_x_tol = valid & (~main_push) & (~final_mask) & (~torch.isnan(x_tol))
         if bool(use_x_tol.any()):
             x_ok = (rx.squeeze(-1) - bx.squeeze(-1)).abs() <= x_tol
             reached = torch.where(use_x_tol, reached & x_ok, reached)
         y_tol = self._stage_match_box_y_tol[stage_idx]
-        use_y_tol = valid & (~main_push) & (~adjust) & (~torch.isnan(y_tol))
+        use_y_tol = valid & (~main_push) & (~final_mask) & (~torch.isnan(y_tol))
         if bool(use_y_tol.any()):
             y_ok = (ry.squeeze(-1) - by.squeeze(-1)).abs() <= y_tol
             reached = torch.where(use_y_tol, reached & y_ok, reached)
@@ -1159,8 +1099,6 @@ class TaskDTeacherEnv(gym.Wrapper):
             torch.zeros_like(right_progress),
         )
         push_prog = 0.5 * right_norm + 0.5 * torch.clamp(forward_progress / torch.clamp(stage_dist, min=1.0e-6), 0.0, 1.0)
-        final_mask = self._final_stage_mask(stage_idx, valid)
-        final_x_prog = self._compute_final_robot_x_progress(stage_idx, valid, rx)
         final_prog = torch.where(
             stage_dist > 1.0e-6,
             torch.clamp(final_x_prog / stage_dist, 0.0, 1.0),
@@ -1172,37 +1110,6 @@ class TaskDTeacherEnv(gym.Wrapper):
             torch.where(final_mask, final_prog * stage_dist, dist_to_target),
         )
         return reached, dist_to_target
-
-    def _compute_adjust_yaw_face_x_reward(
-        self,
-        stage_idx: torch.Tensor,
-        valid: torch.Tensor,
-        robot_yaw: torch.Tensor,
-        done_now: torch.Tensor,
-        reached: torch.Tensor,
-    ) -> torch.Tensor:
-        adjust = self._adjust_stage_mask(stage_idx, valid)
-        yaw_face = valid & self._stage_yaw_face_plus_x[stage_idx]
-        active = adjust & yaw_face
-        yaw_err = torch.atan2(
-            torch.sin(robot_yaw.squeeze(-1)),
-            torch.cos(robot_yaw.squeeze(-1)),
-        ).abs()
-        prev_init = torch.isnan(self._prev_adjust_yaw_err)
-        self._prev_adjust_yaw_err = torch.where(prev_init, yaw_err, self._prev_adjust_yaw_err)
-        delta_yaw = torch.clamp(
-            self._prev_adjust_yaw_err - yaw_err,
-            -self._adjust_yaw_delta_clip,
-            self._adjust_yaw_delta_clip,
-        )
-        dense = self._w_adjust_yaw_face_x * delta_yaw
-        reset_prev = done_now | reached
-        self._prev_adjust_yaw_err = torch.where(
-            reset_prev,
-            torch.full_like(self._prev_adjust_yaw_err, float("nan")),
-            yaw_err,
-        )
-        return torch.where(active, dense, torch.zeros_like(dense))
 
     def _compute_face_box_reward(
         self,
@@ -1331,23 +1238,48 @@ class TaskDTeacherEnv(gym.Wrapper):
     ) -> torch.Tensor:
         final = self._final_stage_mask(stage_idx, valid)
         x_progress = self._compute_final_robot_x_progress(stage_idx, valid, rx)
-        prev_init = torch.isnan(self._prev_final_robot_x_progress)
-        self._prev_final_robot_x_progress = torch.where(
-            prev_init, x_progress, self._prev_final_robot_x_progress
-        )
+        max_init = torch.isnan(self._max_final_robot_x_progress)
+        prev_max = torch.where(max_init, torch.zeros_like(x_progress), self._max_final_robot_x_progress)
         delta_x = torch.clamp(
-            x_progress - self._prev_final_robot_x_progress,
-            -self._final_robot_x_delta_clip,
+            x_progress - prev_max,
+            0.0,
             self._final_robot_x_delta_clip,
         )
         dense = self._w_final_robot_x * delta_x
-        reset_prev = done_now | reached
-        self._prev_final_robot_x_progress = torch.where(
-            reset_prev,
-            torch.full_like(self._prev_final_robot_x_progress, float("nan")),
-            x_progress,
+        new_max = torch.maximum(prev_max, x_progress)
+        reset_max = done_now | reached
+        self._max_final_robot_x_progress = torch.where(
+            reset_max,
+            torch.full_like(self._max_final_robot_x_progress, float("nan")),
+            new_max,
         )
         return torch.where(final, dense, torch.zeros_like(dense))
+
+    def _compute_final_cross_box_milestone_bonus(
+        self,
+        stage_idx: torch.Tensor,
+        valid: torch.Tensor,
+        rx: torch.Tensor,
+        bx: torch.Tensor,
+        done_now: torch.Tensor,
+    ) -> torch.Tensor:
+        final = self._final_stage_mask(stage_idx, valid)
+        rx1 = rx.squeeze(-1)
+        bx1 = bx.squeeze(-1)
+        cross_box = final & (rx1 > bx1)
+        cross_plus1 = final & (rx1 > bx1 + self._final_cross_box_x_plus1_offset)
+        newly_cross_box = cross_box & (~self._final_cross_box_x_given)
+        newly_cross_plus1 = cross_plus1 & (~self._final_cross_box_x_plus1_given)
+        bonus = torch.zeros_like(rx1)
+        bonus = bonus + newly_cross_box.to(dtype=bonus.dtype) * self._final_cross_box_x_bonus
+        bonus = bonus + newly_cross_plus1.to(dtype=bonus.dtype) * self._final_cross_box_x_plus1_bonus
+        self._final_cross_box_x_given = self._final_cross_box_x_given | newly_cross_box
+        self._final_cross_box_x_plus1_given = self._final_cross_box_x_plus1_given | newly_cross_plus1
+        self._final_cross_box_x_given = torch.where(done_now, torch.zeros_like(self._final_cross_box_x_given), self._final_cross_box_x_given)
+        self._final_cross_box_x_plus1_given = torch.where(
+            done_now, torch.zeros_like(self._final_cross_box_x_plus1_given), self._final_cross_box_x_plus1_given
+        )
+        return bonus
 
     def _compute_reward(
         self,
@@ -1382,9 +1314,6 @@ class TaskDTeacherEnv(gym.Wrapper):
         )
         dense = dense + self._compute_push_dual_axis_progress_reward(
             stage_idx, valid, bx, by, bz, done_now, reached
-        )
-        dense = dense + self._compute_adjust_yaw_face_x_reward(
-            stage_idx, valid, robot_yaw, done_now, reached
         )
         dense = dense + self._compute_face_box_reward(stage_idx, valid, rx, ry, bx, by, robot_yaw, done_now, reached)
         dense = dense + self._compute_final_robot_x_progress_reward(
@@ -1551,11 +1480,17 @@ class TaskDTeacherEnv(gym.Wrapper):
             shaped, dense, time_pen = self._compute_reward(
                 dist_to_target, done_now, reached, rx, ry, bx, by, bz
             )
+            stage_idx_now = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+            valid_now = self._stage_idx_buf < self._active_stage_count_buf
+            cross_milestone = self._compute_final_cross_box_milestone_bonus(
+                stage_idx_now, valid_now, rx, bx, done_now
+            )
             alive_f = active.to(dtype=shaped.dtype)
-            inner_rew = shaped * alive_f
+            inner_rew = shaped * alive_f + cross_milestone * alive_f
             total_reward += inner_rew
             total_dense += dense * alive_f
             total_time_pen += time_pen * alive_f
+            total_sparse += cross_milestone * alive_f
 
             if bool(reached.any()):
                 stage_idx_now = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
@@ -1593,11 +1528,7 @@ class TaskDTeacherEnv(gym.Wrapper):
 
             self._prev_robot_x, self._prev_robot_y = rx.clone(), ry.clone()
             self._prev_box_x, self._prev_box_y = bx.clone(), by.clone()
-            self._prev_box_com_z = torch.where(
-                reached,
-                torch.full_like(self._prev_box_com_z, float("nan")),
-                bz.squeeze(-1),
-            )
+            self._prev_box_com_z = bz.squeeze(-1)
 
             self._reset_env_state(new_done, rx, ry, bx, by)
 
