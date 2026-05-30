@@ -76,6 +76,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         nav_log_interval: int = 50,
         push_box_drop_com_z: float = 0.295,
         adjust_box_behind_x: float = 0.4,
+        adjust_reach_tol: float = 0.2,
         adjust_box_z_settle_eps: float = 1.0e-3,
         w_adjust_yaw_face_x: float = 2.0,
         adjust_yaw_delta_clip: float = 0.05,
@@ -258,6 +259,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._idx_final = 4
         self._push_box_drop_z = float(push_box_drop_com_z)
         self._adjust_box_behind_x = float(adjust_box_behind_x)
+        self._adjust_reach_tol = float(adjust_reach_tol)
         self._adjust_box_z_settle_eps = float(adjust_box_z_settle_eps)
         self._w_adjust_yaw_face_x = float(w_adjust_yaw_face_x)
         self._adjust_yaw_delta_clip = float(adjust_yaw_delta_clip)
@@ -340,6 +342,7 @@ class TaskDTeacherEnv(gym.Wrapper):
             f"vx=[{self._vx_min:.1f},{self._vx_max:.1f}] curriculum=[{self._curriculum_warmup_nav_steps},"
             f"{self._curriculum_mid_nav_steps}] stages={self._num_stages} "
             f"push_drop_com_z<{self._push_box_drop_z:.3f} adjust_behind_x={self._adjust_box_behind_x:.2f} "
+            f"adjust_reach_tol={self._adjust_reach_tol:.2f} "
             f"nav_log_interval={self._nav_log_interval}",
             flush=True,
         )
@@ -1091,7 +1094,12 @@ class TaskDTeacherEnv(gym.Wrapper):
 
         target_x, target_y = self._compute_stage_target(stage_idx, valid, rx, ry, bx, by)
         dist_to_target = torch.hypot(rx1 - target_x, ry1 - target_y)
-        reached_nav = valid & (dist_to_target <= self._stage_reach_tol)
+        reach_tol = torch.where(
+            adjust,
+            torch.full_like(dist_to_target, self._adjust_reach_tol),
+            torch.full_like(dist_to_target, self._stage_reach_tol),
+        )
+        reached_nav = valid & (dist_to_target <= reach_tol)
         reached_push = main_push & (bz.squeeze(-1) < self._push_box_drop_z)
         bz1 = bz.squeeze(-1)
         prev_bz = self._prev_box_com_z
