@@ -2,9 +2,9 @@
 
 Pipeline (must match taskd_student_env._prep_depth):
   1. -> Bx1xHxW, nan_to_num
-  2. optional bilinear to depth_render_h x depth_render_w (platform 480x640 -> train sim 24x24)
+  2. optional bilinear to depth_render_h x depth_render_w (platform 480x640 -> default 24x32, keeps aspect)
   3. uint8 / log1p normalize (meters if max > 1.5)
-  4. bilinear to image_hw x image_hw
+  4. bilinear to image_hw x image_hw (square policy input)
 """
 
 from __future__ import annotations

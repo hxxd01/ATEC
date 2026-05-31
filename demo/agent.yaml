@@ -1,10 +1,9 @@
-# Auto-synced with train_nav_taskd_student.py -> demo/depth_preprocess.py (train=deploy).
-# platform_depth_* = upload/play resolution; depth_render_* = sim train resolution before img_hw.
+# Policy prep (upload bundle): platform 480x640 per demo/server.py -> depth_render -> img_hw
 policy:
   img_hw: 24
   img_channels: 1
   depth_render_h: 24
-  depth_render_w: 24
+  depth_render_w: 32
   platform_depth_h: 480
   platform_depth_w: 640
   depth_max: 5.0

@@ -237,6 +237,8 @@ class AlgSolution:
         self.img_channels = int(policy_cfg.get("img_channels", 1))
         self.depth_only = self.img_channels == 1
         self.depth_max = float(policy_cfg.get("depth_max", os.environ.get("NAV_DEPTH_MAX", "5.0")))
+        self.platform_depth_h = int(policy_cfg.get("platform_depth_h", 480))
+        self.platform_depth_w = int(policy_cfg.get("platform_depth_w", 640))
 
         self.vx_min = float(os.environ.get("NAV_VX_MIN", "-2.0"))
         self.vx_max = float(os.environ.get("NAV_VX_MAX", "2.0"))
@@ -276,9 +278,9 @@ class AlgSolution:
         self.nav_policy.load_state_dict(state, strict=True)
         self.nav_policy.eval()
         print(
-            f"[AlgSolution] depth: platform 480x640 -> bilinear {self.depth_render_h}x{self.depth_render_w} "
-            f"-> log1p -> {self.image_hw}x{self.image_hw} (train=deploy), "
-            f"ckpt={os.path.basename(student_ckpt_path)}",
+            f"[AlgSolution] depth: {self.platform_depth_h}x{self.platform_depth_w} "
+            f"-> bilinear {self.depth_render_h}x{self.depth_render_w} -> log1p -> "
+            f"{self.image_hw}x{self.image_hw} policy, ckpt={os.path.basename(student_ckpt_path)}",
             flush=True,
         )
 

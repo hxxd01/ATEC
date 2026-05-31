@@ -43,7 +43,28 @@ def task_d_spawn_local(world_pos: tuple[float, float, float]) -> tuple[float, fl
 
 TASK_D_ROBOT_SPAWN_LOCAL = task_d_spawn_local(_TASK_D_ROBOT_SPAWN_WORLD)
 TASK_D_BOX_SPAWN_LOCAL = task_d_spawn_local(_TASK_D_BOX_SPAWN_WORLD)
+# Nav depth preprocess clamp; camera far clip for play/server (demo/server.py depth is float32 meters).
+TASK_D_NAV_DEPTH_MAX = 5.0
+TASK_D_PLATFORM_CAMERA_FAR = 50.0
 _SPAWN_DIAG_PRINTED: set[str] = set()
+
+
+def apply_task_d_camera_depth_clip(scene_cfg, depth_far: float | None = None) -> None:
+    """Set head/ee camera far clip (default TASK_D_PLATFORM_CAMERA_FAR for play/server)."""
+    far = float(TASK_D_PLATFORM_CAMERA_FAR if depth_far is None else depth_far)
+    for cam_name in ("head_camera", "ee_camera"):
+        cam = getattr(scene_cfg, cam_name, None)
+        if cam is None or getattr(cam, "spawn", None) is None:
+            continue
+        spawn = cam.spawn
+        near = float(spawn.clipping_range[0]) if spawn.clipping_range else 0.05
+        new_spawn = sim_utils.PinholeCameraCfg(
+            focal_length=spawn.focal_length,
+            focus_distance=spawn.focus_distance,
+            horizontal_aperture=spawn.horizontal_aperture,
+            clipping_range=(near, far),
+        )
+        setattr(scene_cfg, cam_name, cam.replace(spawn=new_spawn))
 
 
 def reset_root_state_at_env_origin(

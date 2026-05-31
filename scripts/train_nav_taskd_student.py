@@ -28,8 +28,65 @@ parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--steps_per_env", type=int, default=24)
 parser.add_argument("--vx_min", type=float, default=-2.0)
 parser.add_argument("--vx_max", type=float, default=2.0)
-parser.add_argument("--camera_hw", type=int, default=64)
-parser.add_argument("--depth_max", type=float, default=5.0)
+parser.add_argument(
+    "--camera_hw",
+    type=int,
+    default=24,
+    help="Policy depth input side (square img_hw). Native sim size: --sim_camera_h/w (default square camera_hw).",
+)
+parser.add_argument(
+    "--sim_camera_h",
+    type=int,
+    default=None,
+    help="Native sim head/ee camera height (e.g. 24). Ignored with --platform_depth_train.",
+)
+parser.add_argument(
+    "--sim_camera_w",
+    type=int,
+    default=None,
+    help="Native sim head/ee camera width (e.g. 32). Ignored with --platform_depth_train.",
+)
+parser.add_argument(
+    "--platform_depth_train",
+    action="store_true",
+    help="Match demo/server.py: sim cameras 480x640 float depth, then prep_depth -> policy img_hw.",
+)
+parser.add_argument(
+    "--platform_depth_h",
+    type=int,
+    default=480,
+    help="Sim camera H when --platform_depth_train (demo/server.py SERVER_DEPTH_H).",
+)
+parser.add_argument(
+    "--platform_depth_w",
+    type=int,
+    default=640,
+    help="Sim camera W when --platform_depth_train (demo/server.py SERVER_DEPTH_W).",
+)
+parser.add_argument(
+    "--depth_render_h",
+    type=int,
+    default=None,
+    help="prep_depth H before policy square (default: sim cam H, or 24 with --platform_depth_train).",
+)
+parser.add_argument(
+    "--depth_render_w",
+    type=int,
+    default=None,
+    help="prep_depth W (default: sim cam W, or 32 with --platform_depth_train).",
+)
+parser.add_argument(
+    "--depth_max",
+    type=float,
+    default=5.0,
+    help="prep_depth log1p clamp (meters). Not in server.py; default 5.0 matches existing BC/train.",
+)
+parser.add_argument(
+    "--camera_far_clip",
+    type=float,
+    default=None,
+    help="Camera far clip (m). Default 50 (platform/play). Use 5 only to hide distant pits in multi-env.",
+)
 parser.add_argument(
     "--depth_only",
     action="store_true",
@@ -90,7 +147,12 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab.utils.io import dump_yaml
 
 import atec_rl_lab.tasks  # noqa: F401
-from atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvB2Cfg, refresh_task_d_terrain_cfg
+from atec_rl_lab.tasks.task_d.env_cfg import (
+    TASK_D_PLATFORM_CAMERA_FAR,
+    TaskDEnvB2Cfg,
+    apply_task_d_camera_depth_clip,
+    refresh_task_d_terrain_cfg,
+)
 from atec_rl_lab.train.nav.taskd_student_env import TaskDStudentEnv
 from atec_rl_lab.train.nav.nav_cfg import TaskDStudentPPORunnerCfg
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
@@ -358,15 +420,53 @@ def _print_env_origins_debug(base_env, *, env_spacing: float, show: int = 16) ->
         )
 
 
+def _resolve_camera_far_clip(cli_value: float | None) -> float:
+    return float(TASK_D_PLATFORM_CAMERA_FAR if cli_value is None else cli_value)
+
+
+def _resolve_depth_pipeline(args_cli) -> tuple[int, int, int, int, int, str]:
+    """Return (sim_cam_h, sim_cam_w, policy_hw, depth_render_h, depth_render_w, mode_label)."""
+    policy_hw = int(args_cli.camera_hw)
+    if args_cli.platform_depth_train:
+        if args_cli.sim_camera_h is not None or args_cli.sim_camera_w is not None:
+            print(
+                "[WARN] --sim_camera_h/w ignored when --platform_depth_train is set "
+                "(using --platform_depth_h/w for sim cameras).",
+                flush=True,
+            )
+        cam_h = int(args_cli.platform_depth_h)
+        cam_w = int(args_cli.platform_depth_w)
+        drh = int(args_cli.depth_render_h) if args_cli.depth_render_h is not None else 24
+        drw = int(args_cli.depth_render_w) if args_cli.depth_render_w is not None else 32
+        return cam_h, cam_w, policy_hw, drh, drw, "platform"
+
+    hw = policy_hw
+    cam_h = int(args_cli.sim_camera_h) if args_cli.sim_camera_h is not None else hw
+    cam_w = int(args_cli.sim_camera_w) if args_cli.sim_camera_w is not None else hw
+    if args_cli.depth_render_h is not None:
+        drh = int(args_cli.depth_render_h)
+    else:
+        drh = cam_h
+    if args_cli.depth_render_w is not None:
+        drw = int(args_cli.depth_render_w)
+    else:
+        drw = cam_w
+    return cam_h, cam_w, policy_hw, drh, drw, "native"
+
+
 def _configure_student_cameras(
     env_cfg,
-    camera_hw: int,
+    *,
+    camera_height: int,
+    camera_width: int,
     depth_only: bool,
     tiled: bool,
+    camera_far_clip: float,
 ) -> None:
-    """Resize cameras; optionally depth-only and/or tiled rendering."""
+    """Set head/ee camera resolution; optionally depth-only and/or tiled rendering."""
     from isaaclab.sensors import CameraCfg, TiledCameraCfg
 
+    apply_task_d_camera_depth_clip(env_cfg.scene, float(camera_far_clip))
     cam_cfg_cls = TiledCameraCfg if tiled else CameraCfg
     data_types = ["depth"] if depth_only else ["rgb", "depth"]
     for cam_name in ("head_camera", "ee_camera"):
@@ -380,12 +480,51 @@ def _configure_student_cameras(
                 prim_path=cam.prim_path,
                 spawn=cam.spawn,
                 offset=cam.offset,
-                height=int(camera_hw),
-                width=int(camera_hw),
+                height=int(camera_height),
+                width=int(camera_width),
                 data_types=data_types,
                 update_period=cam.update_period,
             ),
         )
+
+
+def _dump_deploy_agent_yaml(
+    log_dir: str,
+    *,
+    policy_hw: int,
+    depth_render_h: int,
+    depth_render_w: int,
+    depth_only: bool,
+    depth_max: float,
+    platform: bool,
+    platform_h: int,
+    platform_w: int,
+) -> None:
+    """Write demo-compatible policy block (solution.py reads demo/agent.yaml)."""
+    deploy = {
+        "policy": {
+            "img_hw": int(policy_hw),
+            "img_channels": 1 if depth_only else 4,
+            "depth_render_h": int(depth_render_h),
+            "depth_render_w": int(depth_render_w),
+            "platform_depth_h": int(platform_h),
+            "platform_depth_w": int(platform_w),
+            "depth_max": float(depth_max),
+            "proprio_dim": 9,
+            "enc_dim": 128,
+            "fuse_dim": 256,
+            "rnn_type": "gru",
+            "rnn_hidden_dim": 256,
+            "rnn_num_layers": 1,
+            "actor_obs_normalization": True,
+            "critic_obs_normalization": True,
+            "actor_hidden_dims": [256],
+            "critic_hidden_dims": [256, 128],
+            "init_noise_std": 0.6,
+            "noise_std_type": "scalar",
+        }
+    }
+    dump_yaml(os.path.join(log_dir, "params", "deploy_agent.yaml"), deploy)
 
 
 def main():
@@ -397,6 +536,8 @@ def main():
         env_cfg.scene.env_spacing = float(args_cli.env_spacing)
     refresh_task_d_terrain_cfg(env_cfg)
     scene_env_spacing = float(env_cfg.scene.env_spacing)
+    cam_h, cam_w, policy_hw, depth_render_h, depth_render_w, depth_mode = _resolve_depth_pipeline(args_cli)
+    camera_far_clip = _resolve_camera_far_clip(args_cli.camera_far_clip)
     # Keep camera sensors but drop image/lidar observation managers (read camera buffers directly).
     if env_cfg.observations is not None:
         env_cfg.observations.image = None
@@ -406,9 +547,11 @@ def main():
     print("[INFO] Student sim: LiDAR disabled (extero obs + lidar_sensor off).", flush=True)
     _configure_student_cameras(
         env_cfg,
-        args_cli.camera_hw,
-        args_cli.depth_only,
-        args_cli.tiled_cameras,
+        camera_height=cam_h,
+        camera_width=cam_w,
+        depth_only=args_cli.depth_only,
+        tiled=args_cli.tiled_cameras,
+        camera_far_clip=camera_far_clip,
     )
     if args_cli.tiled_cameras:
         print(
@@ -425,15 +568,34 @@ def main():
     sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
     phys_dt = decimation * sim_dt
     nav_dt = float(args_cli.inner_steps) * phys_dt
-    cam_update_period = phys_dt if (args_cli.ppo_no_train and args_cli.video) else nav_dt
+    cam_update_period = nav_dt
+    if args_cli.ppo_no_train and args_cli.video:
+        print(
+            "[INFO] ppo_no_train + --video: cam_update=nav_dt (match training obs timing).",
+            flush=True,
+        )
     for cam_name in ("head_camera", "ee_camera"):
         cam = getattr(env_cfg.scene, cam_name, None)
         if cam is not None:
             cam.update_period = cam_update_period
+    if depth_mode == "platform":
+        print(
+            f"[INFO] Depth pipeline (platform, match demo/server.py): sim {cam_h}x{cam_w} float32 "
+            f"-> bilinear {depth_render_h}x{depth_render_w} -> log1p -> policy {policy_hw}x{policy_hw}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[INFO] Depth pipeline (native): sim {cam_h}x{cam_w} -> log1p -> "
+            f"depth_render {depth_render_h}x{depth_render_w} -> policy {policy_hw}x{policy_hw}",
+            flush=True,
+        )
     print(
         f"[INFO] Student sim: nav_dt={nav_dt:.3f}s ({1.0 / nav_dt:.1f}Hz), "
-        f"cam_update={cam_update_period:.3f}s, "
-        f"camera_hw={args_cli.camera_hw}, depth_only={args_cli.depth_only}, "
+        f"cam_update={cam_update_period:.3f}s, depth_mode={depth_mode}, "
+        f"sim_camera={cam_h}x{cam_w}, depth_render={depth_render_h}x{depth_render_w}, "
+        f"policy_img_hw={policy_hw}, depth_only={args_cli.depth_only}, "
+        f"depth_max={args_cli.depth_max}, camera_far_clip={camera_far_clip}, "
         f"tiled_cameras={args_cli.tiled_cameras}, "
         f"num_envs={args_cli.num_envs}, env_spacing={scene_env_spacing}, inner_steps={args_cli.inner_steps}",
         flush=True,
@@ -442,7 +604,7 @@ def main():
     agent_cfg = TaskDStudentPPORunnerCfg()
     agent_cfg.max_iterations = args_cli.max_iter
     agent_cfg.num_steps_per_env = args_cli.steps_per_env
-    agent_cfg.policy.img_hw = args_cli.camera_hw
+    agent_cfg.policy.img_hw = policy_hw
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskd_student_b2piper_depth"
@@ -472,9 +634,9 @@ def main():
         inner_steps=args_cli.inner_steps,
         vx_min=args_cli.vx_min,
         vx_max=args_cli.vx_max,
-        image_hw=args_cli.camera_hw,
-        depth_render_h=int(args_cli.camera_hw),
-        depth_render_w=int(args_cli.camera_hw),
+        image_hw=policy_hw,
+        depth_render_h=depth_render_h,
+        depth_render_w=depth_render_w,
         depth_max=args_cli.depth_max,
         depth_only=args_cli.depth_only,
         nav_log_interval=args_cli.nav_log_interval,
@@ -485,6 +647,12 @@ def main():
         _print_env_origins_debug(env, env_spacing=scene_env_spacing, show=16)
 
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
+    if args_cli.resume and depth_mode == "platform":
+        print(
+            "[WARN] --resume with --platform_depth_train: checkpoint may be from native 24x24 sim; "
+            "expect domain shift unless fine-tuning.",
+            flush=True,
+        )
     if args_cli.resume:
         print(f"[INFO] Resuming PPO from: {args_cli.resume}", flush=True)
         _load_ppo_checkpoint(runner, args_cli.resume, load_optimizer=True)
@@ -501,9 +669,26 @@ def main():
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    _dump_deploy_agent_yaml(
+        log_dir,
+        policy_hw=policy_hw,
+        depth_render_h=depth_render_h,
+        depth_render_w=depth_render_w,
+        depth_only=args_cli.depth_only,
+        depth_max=args_cli.depth_max,
+        platform=depth_mode == "platform",
+        platform_h=int(args_cli.platform_depth_h),
+        platform_w=int(args_cli.platform_depth_w),
+    )
 
     print(f"[INFO] Logging to: {log_dir}", flush=True)
     if args_cli.ppo_no_train:
+        if not args_cli.no_train_ckpt and not args_cli.resume:
+            print(
+                "[WARN] --ppo_no_train without --no_train_ckpt (or --resume): "
+                "nav policy weights are random. Pass --no_train_ckpt path/to/model_XXX.pt",
+                flush=True,
+            )
         print("[INFO] PPO no-train mode enabled. Running rollout only...", flush=True)
         policy = runner.get_inference_policy(device=vec_env.device)
         try:
