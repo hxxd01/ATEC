@@ -2,9 +2,9 @@
 
 Pipeline (must match taskd_student_env._prep_depth):
   1. -> Bx1xHxW, nan_to_num
-  2. optional bilinear to depth_render_h x depth_render_w (platform 480x640 -> default 24x32, keeps aspect)
+  2. bilinear to image_h x image_w if needed (platform 480x640 -> 24x32, keeps aspect)
   3. uint8 / log1p normalize (meters if max > 1.5)
-  4. bilinear to image_hw x image_hw (square policy input)
+  4. output [B, 1, image_h, image_w] — no square squash
 """
 
 from __future__ import annotations
@@ -28,21 +28,22 @@ def _to_bchw(x: torch.Tensor) -> torch.Tensor:
 def prep_depth(
     depth: torch.Tensor,
     *,
-    image_hw: int,
-    depth_render_h: int | None = None,
-    depth_render_w: int | None = None,
+    image_h: int,
+    image_w: int,
     depth_max: float = 5.0,
+    image_hw: int | None = None,
 ) -> torch.Tensor:
-    """Preprocess depth to policy input [B, 1, image_hw, image_hw]."""
+    """Preprocess depth to policy input [B, 1, image_h, image_w]."""
+    if image_hw is not None:
+        image_h = image_w = int(image_hw)
+    ih, iw = int(image_h), int(image_w)
     src_is_int = not depth.dtype.is_floating_point
     x = _to_bchw(depth)
 
     x = torch.nan_to_num(x, nan=depth_max, posinf=depth_max, neginf=0.0)
 
-    if depth_render_h is not None and depth_render_w is not None:
-        rh, rw = int(depth_render_h), int(depth_render_w)
-        if x.shape[-2] != rh or x.shape[-1] != rw:
-            x = F.interpolate(x, size=(rh, rw), mode="bilinear", align_corners=False)
+    if x.shape[-2] != ih or x.shape[-1] != iw:
+        x = F.interpolate(x, size=(ih, iw), mode="bilinear", align_corners=False)
 
     if src_is_int:
         x = torch.clamp(x / 255.0, 0.0, 1.0)
@@ -54,9 +55,6 @@ def prep_depth(
     else:
         x = torch.clamp(x, 0.0, 1.0)
 
-    ih = int(image_hw)
-    if x.shape[-2] != ih or x.shape[-1] != ih:
-        x = F.interpolate(x, size=(ih, ih), mode="bilinear", align_corners=False)
     return x
 
 
@@ -66,13 +64,11 @@ def preprocess_depth(
     *,
     output_hw: int = 24,
     max_depth: float = 5.0,
-    depth_render_h: int | None = None,
-    depth_render_w: int | None = None,
+    image_h: int | None = None,
+    image_w: int | None = None,
 ) -> torch.Tensor:
-    return prep_depth(
-        depth,
-        image_hw=output_hw,
-        depth_render_h=depth_render_h,
-        depth_render_w=depth_render_w,
-        depth_max=max_depth,
-    )
+    if image_h is not None and image_w is not None:
+        ih, iw = int(image_h), int(image_w)
+    else:
+        ih = iw = int(output_hw)
+    return prep_depth(depth, image_h=ih, image_w=iw, depth_max=max_depth)

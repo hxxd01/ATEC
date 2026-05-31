@@ -1,9 +1,8 @@
-# Policy prep (upload bundle): platform 480x640 per demo/server.py -> depth_render -> img_hw
+# Policy prep (upload bundle): platform 480x640 per demo/server.py -> prep_depth -> 24x32 policy
 policy:
-  img_hw: 24
+  img_h: 24
+  img_w: 32
   img_channels: 1
-  depth_render_h: 24
-  depth_render_w: 32
   platform_depth_h: 480
   platform_depth_w: 640
   depth_max: 5.0

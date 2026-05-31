@@ -78,19 +78,24 @@ python scripts/bc/train_taskd_bc.py \
   --stride 4 \
   --batch_size 32 \
   --epochs 100
-
+  --sim_camera_h 24 \
+  --sim_camera_w 32 \
 python scripts/train_nav_taskd_student.py \
   --task ATEC-TaskD-B2Piper \
   --ll_policy demo/policy.pt \
-  --num_envs 512 \
+  --num_envs 80 \
   --inner_steps 5 \
   --max_iter 10000 \
   --device cuda:0 \
   --headless \
-  --sim_camera_h 24 \
-  --sim_camera_w 32 \
   --tiled_cameras \
-  --depth_only \
+  --platform_depth_train \
+  --depth_only \ 
+
+480×640 (platform) / 24×32 (native sim)
+    ↓ bilinear → 24×32（若尺寸已匹配则跳过）
+    ↓ log1p (depth_max=5.0)
+24×32 → ConvEncoder → GRU → action
   --resume /home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-05-30_14-39-50/model_700.pt
 
 python scripts/collect_train_bc.py \
@@ -124,7 +129,7 @@ python scripts/train_nav_taskd_student.py \
 # Platform / server 对齐: demo/server.py 480x640 depth
 python scripts/train_nav_taskd_student.py \
   --ll_policy demo/policy.pt \
-  --num_envs 1 \
+  --num_envs 128 \
   --inner_steps 5 \
   --device cuda:0 \
   --headless \

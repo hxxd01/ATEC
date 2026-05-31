@@ -29,10 +29,22 @@ parser.add_argument("--steps_per_env", type=int, default=24)
 parser.add_argument("--vx_min", type=float, default=-2.0)
 parser.add_argument("--vx_max", type=float, default=2.0)
 parser.add_argument(
-    "--camera_hw",
+    "--policy_img_h",
     type=int,
     default=24,
-    help="Policy depth input side (square img_hw). Native sim size: --sim_camera_h/w (default square camera_hw).",
+    help="Policy depth input height (default 24, matches platform 480:640 aspect with policy_img_w=32).",
+)
+parser.add_argument(
+    "--policy_img_w",
+    type=int,
+    default=32,
+    help="Policy depth input width (default 32).",
+)
+parser.add_argument(
+    "--camera_hw",
+    type=int,
+    default=None,
+    help="Legacy square policy input (sets policy_img_h/w). Overrides --policy_img_h/w when set.",
 )
 parser.add_argument(
     "--sim_camera_h",
@@ -49,7 +61,7 @@ parser.add_argument(
 parser.add_argument(
     "--platform_depth_train",
     action="store_true",
-    help="Match demo/server.py: sim cameras 480x640 float depth, then prep_depth -> policy img_hw.",
+    help="Match demo/server.py: sim cameras 480x640 float depth, then prep_depth -> policy_img_h/w.",
 )
 parser.add_argument(
     "--platform_depth_h",
@@ -67,13 +79,13 @@ parser.add_argument(
     "--depth_render_h",
     type=int,
     default=None,
-    help="prep_depth H before policy square (default: sim cam H, or 24 with --platform_depth_train).",
+    help="Deprecated alias for --policy_img_h (kept for old scripts).",
 )
 parser.add_argument(
     "--depth_render_w",
     type=int,
     default=None,
-    help="prep_depth W (default: sim cam W, or 32 with --platform_depth_train).",
+    help="Deprecated alias for --policy_img_w (kept for old scripts).",
 )
 parser.add_argument(
     "--depth_max",
@@ -424,9 +436,19 @@ def _resolve_camera_far_clip(cli_value: float | None) -> float:
     return float(TASK_D_PLATFORM_CAMERA_FAR if cli_value is None else cli_value)
 
 
-def _resolve_depth_pipeline(args_cli) -> tuple[int, int, int, int, int, str]:
-    """Return (sim_cam_h, sim_cam_w, policy_hw, depth_render_h, depth_render_w, mode_label)."""
-    policy_hw = int(args_cli.camera_hw)
+def _resolve_policy_img_size(args_cli) -> tuple[int, int]:
+    """Return (policy_h, policy_w) for rect policy input."""
+    if args_cli.camera_hw is not None:
+        side = int(args_cli.camera_hw)
+        return side, side
+    ph = int(args_cli.depth_render_h) if args_cli.depth_render_h is not None else int(args_cli.policy_img_h)
+    pw = int(args_cli.depth_render_w) if args_cli.depth_render_w is not None else int(args_cli.policy_img_w)
+    return ph, pw
+
+
+def _resolve_depth_pipeline(args_cli) -> tuple[int, int, int, int, str]:
+    """Return (sim_cam_h, sim_cam_w, policy_h, policy_w, mode_label)."""
+    policy_h, policy_w = _resolve_policy_img_size(args_cli)
     if args_cli.platform_depth_train:
         if args_cli.sim_camera_h is not None or args_cli.sim_camera_w is not None:
             print(
@@ -436,22 +458,11 @@ def _resolve_depth_pipeline(args_cli) -> tuple[int, int, int, int, int, str]:
             )
         cam_h = int(args_cli.platform_depth_h)
         cam_w = int(args_cli.platform_depth_w)
-        drh = int(args_cli.depth_render_h) if args_cli.depth_render_h is not None else 24
-        drw = int(args_cli.depth_render_w) if args_cli.depth_render_w is not None else 32
-        return cam_h, cam_w, policy_hw, drh, drw, "platform"
+        return cam_h, cam_w, policy_h, policy_w, "platform"
 
-    hw = policy_hw
-    cam_h = int(args_cli.sim_camera_h) if args_cli.sim_camera_h is not None else hw
-    cam_w = int(args_cli.sim_camera_w) if args_cli.sim_camera_w is not None else hw
-    if args_cli.depth_render_h is not None:
-        drh = int(args_cli.depth_render_h)
-    else:
-        drh = cam_h
-    if args_cli.depth_render_w is not None:
-        drw = int(args_cli.depth_render_w)
-    else:
-        drw = cam_w
-    return cam_h, cam_w, policy_hw, drh, drw, "native"
+    cam_h = int(args_cli.sim_camera_h) if args_cli.sim_camera_h is not None else policy_h
+    cam_w = int(args_cli.sim_camera_w) if args_cli.sim_camera_w is not None else policy_w
+    return cam_h, cam_w, policy_h, policy_w, "native"
 
 
 def _configure_student_cameras(
@@ -491,9 +502,8 @@ def _configure_student_cameras(
 def _dump_deploy_agent_yaml(
     log_dir: str,
     *,
-    policy_hw: int,
-    depth_render_h: int,
-    depth_render_w: int,
+    policy_h: int,
+    policy_w: int,
     depth_only: bool,
     depth_max: float,
     platform: bool,
@@ -503,10 +513,9 @@ def _dump_deploy_agent_yaml(
     """Write demo-compatible policy block (solution.py reads demo/agent.yaml)."""
     deploy = {
         "policy": {
-            "img_hw": int(policy_hw),
+            "img_h": int(policy_h),
+            "img_w": int(policy_w),
             "img_channels": 1 if depth_only else 4,
-            "depth_render_h": int(depth_render_h),
-            "depth_render_w": int(depth_render_w),
             "platform_depth_h": int(platform_h),
             "platform_depth_w": int(platform_w),
             "depth_max": float(depth_max),
@@ -536,7 +545,7 @@ def main():
         env_cfg.scene.env_spacing = float(args_cli.env_spacing)
     refresh_task_d_terrain_cfg(env_cfg)
     scene_env_spacing = float(env_cfg.scene.env_spacing)
-    cam_h, cam_w, policy_hw, depth_render_h, depth_render_w, depth_mode = _resolve_depth_pipeline(args_cli)
+    cam_h, cam_w, policy_h, policy_w, depth_mode = _resolve_depth_pipeline(args_cli)
     camera_far_clip = _resolve_camera_far_clip(args_cli.camera_far_clip)
     # Keep camera sensors but drop image/lidar observation managers (read camera buffers directly).
     if env_cfg.observations is not None:
@@ -581,20 +590,20 @@ def main():
     if depth_mode == "platform":
         print(
             f"[INFO] Depth pipeline (platform, match demo/server.py): sim {cam_h}x{cam_w} float32 "
-            f"-> bilinear {depth_render_h}x{depth_render_w} -> log1p -> policy {policy_hw}x{policy_hw}",
+            f"-> bilinear {policy_h}x{policy_w} -> log1p -> policy {policy_h}x{policy_w}",
             flush=True,
         )
     else:
         print(
-            f"[INFO] Depth pipeline (native): sim {cam_h}x{cam_w} -> log1p -> "
-            f"depth_render {depth_render_h}x{depth_render_w} -> policy {policy_hw}x{policy_hw}",
+            f"[INFO] Depth pipeline (native): sim {cam_h}x{cam_w} -> bilinear {policy_h}x{policy_w} "
+            f"-> log1p -> policy {policy_h}x{policy_w}",
             flush=True,
         )
     print(
         f"[INFO] Student sim: nav_dt={nav_dt:.3f}s ({1.0 / nav_dt:.1f}Hz), "
         f"cam_update={cam_update_period:.3f}s, depth_mode={depth_mode}, "
-        f"sim_camera={cam_h}x{cam_w}, depth_render={depth_render_h}x{depth_render_w}, "
-        f"policy_img_hw={policy_hw}, depth_only={args_cli.depth_only}, "
+        f"sim_camera={cam_h}x{cam_w}, policy_img={policy_h}x{policy_w}, "
+        f"depth_only={args_cli.depth_only}, "
         f"depth_max={args_cli.depth_max}, camera_far_clip={camera_far_clip}, "
         f"tiled_cameras={args_cli.tiled_cameras}, "
         f"num_envs={args_cli.num_envs}, env_spacing={scene_env_spacing}, inner_steps={args_cli.inner_steps}",
@@ -604,7 +613,8 @@ def main():
     agent_cfg = TaskDStudentPPORunnerCfg()
     agent_cfg.max_iterations = args_cli.max_iter
     agent_cfg.num_steps_per_env = args_cli.steps_per_env
-    agent_cfg.policy.img_hw = policy_hw
+    agent_cfg.policy.img_h = policy_h
+    agent_cfg.policy.img_w = policy_w
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskd_student_b2piper_depth"
@@ -634,9 +644,8 @@ def main():
         inner_steps=args_cli.inner_steps,
         vx_min=args_cli.vx_min,
         vx_max=args_cli.vx_max,
-        image_hw=policy_hw,
-        depth_render_h=depth_render_h,
-        depth_render_w=depth_render_w,
+        image_h=policy_h,
+        image_w=policy_w,
         depth_max=args_cli.depth_max,
         depth_only=args_cli.depth_only,
         nav_log_interval=args_cli.nav_log_interval,
@@ -647,13 +656,12 @@ def main():
         _print_env_origins_debug(env, env_spacing=scene_env_spacing, show=16)
 
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
-    if args_cli.resume and depth_mode == "platform":
+    if args_cli.resume:
         print(
-            "[WARN] --resume with --platform_depth_train: checkpoint may be from native 24x24 sim; "
-            "expect domain shift unless fine-tuning.",
+            "[WARN] --resume: old 24x24-square checkpoints are incompatible with 24x32 policy input; "
+            "encoder weights will be partially skipped.",
             flush=True,
         )
-    if args_cli.resume:
         print(f"[INFO] Resuming PPO from: {args_cli.resume}", flush=True)
         _load_ppo_checkpoint(runner, args_cli.resume, load_optimizer=True)
     if args_cli.no_train_ckpt:
@@ -671,9 +679,8 @@ def main():
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     _dump_deploy_agent_yaml(
         log_dir,
-        policy_hw=policy_hw,
-        depth_render_h=depth_render_h,
-        depth_render_w=depth_render_w,
+        policy_h=policy_h,
+        policy_w=policy_w,
         depth_only=args_cli.depth_only,
         depth_max=args_cli.depth_max,
         platform=depth_mode == "platform",

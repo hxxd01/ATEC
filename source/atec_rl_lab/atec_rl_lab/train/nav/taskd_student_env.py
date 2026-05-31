@@ -32,9 +32,9 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         inner_steps: int = 25,
         vx_min: float = -2.0,
         vx_max: float = 2.0,
-        image_hw: int = 64,
-        depth_render_h: int | None = None,
-        depth_render_w: int | None = None,
+        image_h: int = 24,
+        image_w: int = 32,
+        image_hw: int | None = None,
         depth_max: float = 5.0,
         depth_only: bool = False,
         nav_log_interval: int = 10,
@@ -52,17 +52,16 @@ class TaskDStudentEnv(TaskDTeacherEnv):
             push_box_drop_com_z=push_box_drop_com_z,
         )
         self._nav_log_tag = "TaskDStudent"
-        self._image_hw = int(image_hw)
-        if depth_render_h is None or depth_render_w is None:
-            self._depth_render_h = int(image_hw)
-            self._depth_render_w = int(image_hw)
+        if image_hw is not None:
+            self._image_h = int(image_hw)
+            self._image_w = int(image_hw)
         else:
-            self._depth_render_h = int(depth_render_h)
-            self._depth_render_w = int(depth_render_w)
+            self._image_h = int(image_h)
+            self._image_w = int(image_w)
         self._depth_max = float(depth_max)
         self._depth_only = bool(depth_only)
         self._img_channels = 1 if self._depth_only else 4
-        self._student_img_flat = 2 * self._img_channels * self._image_hw * self._image_hw
+        self._student_img_flat = 2 * self._img_channels * self._image_h * self._image_w
         self._actor_dim = self._student_img_flat + 9
         # privileged extras:
         # robot pose(3) + box pose(3) + rel body(3) + r_vel(2) + b_vel(2) + rel_world(2) + contact(1)
@@ -77,7 +76,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         )
         print(
             f"[TaskDStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
-            f"img={self._img_channels}ch x2 cams depth_only={self._depth_only} "
+            f"img={self._img_channels}ch@{self._image_h}x{self._image_w} x2 cams depth_only={self._depth_only} "
             f"(includes {self._critic_extra_dim} privileged dims)",
             flush=True,
         )
@@ -88,16 +87,17 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         if x.max() > 1.5:
             x = x / 255.0
         x = x.permute(0, 3, 1, 2).contiguous()
-        if x.shape[-1] != self._image_hw or x.shape[-2] != self._image_hw:
-            x = F.interpolate(x, size=(self._image_hw, self._image_hw), mode="bilinear", align_corners=False)
+        if x.shape[-1] != self._image_w or x.shape[-2] != self._image_h:
+            x = F.interpolate(
+                x, size=(self._image_h, self._image_w), mode="bilinear", align_corners=False
+            )
         return x
 
     def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
         return _prep_depth_shared(
             x,
-            image_hw=self._image_hw,
-            depth_render_h=self._depth_render_h,
-            depth_render_w=self._depth_render_w,
+            image_h=self._image_h,
+            image_w=self._image_w,
             depth_max=self._depth_max,
         )
 
@@ -170,7 +170,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
     def _get_sim_render_rgb(self) -> np.ndarray:
         frame = self.env.render()
         if frame is None:
-            return np.zeros((self._image_hw, self._image_hw, 3), dtype=np.uint8)
+            return np.zeros((self._image_h, self._image_w, 3), dtype=np.uint8)
         return self._to_uint8_rgb(frame)
 
     def _video_debug_lines(self, env_idx: int) -> list[str]:
@@ -259,7 +259,7 @@ class TaskDStudentEnv(TaskDTeacherEnv):
         head_rgb, ee_rgb = self.get_depth_video_frames(ei)
         target_h = max(rgb.shape[0], head_rgb.shape[0], ee_rgb.shape[0])
         if target_h < 120:
-            target_h = max(240, self._image_hw * 8)
+            target_h = max(240, self._image_h * 8)
         panels = [
             self._resize_rgb_panel(rgb, target_h),
             self._resize_rgb_panel(head_rgb, target_h),
@@ -299,8 +299,8 @@ class TaskDStudentEnv(TaskDTeacherEnv):
             return torch.zeros(
                 batch,
                 self._img_channels,
-                self._image_hw,
-                self._image_hw,
+                self._image_h,
+                self._image_w,
                 device=self._device,
                 dtype=torch.float32,
             )
