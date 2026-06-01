@@ -41,6 +41,12 @@ def prep_depth(
     x = _to_bchw(depth)
 
     x = torch.nan_to_num(x, nan=depth_max, posinf=depth_max, neginf=0.0)
+    # Isaac mdp.image() maps inf -> 0 before obs reaches deploy code; treat as far clip (depth_max),
+    # matching raw camera buffers that prep_depth sees during training (inf/nan -> depth_max).
+    if not src_is_int:
+        invalid = (~torch.isfinite(x)) | (x <= 0.0)
+        if invalid.any():
+            x = torch.where(invalid, torch.full_like(x, depth_max), x)
 
     if x.shape[-2] != ih or x.shape[-1] != iw:
         x = F.interpolate(x, size=(ih, iw), mode="bilinear", align_corners=False)
