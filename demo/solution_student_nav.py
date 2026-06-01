@@ -354,8 +354,9 @@ class AlgSolution:
         if head_depth is None or ee_depth is None:
             raise RuntimeError("depth_only student requires head_depth and ee_depth in obs['image'].")
 
-        head = self._prep_depth(head_depth).reshape(proprio.shape[0], -1)
-        ee = self._prep_depth(ee_depth).reshape(proprio.shape[0], -1)
+        batch = proprio.shape[0]
+        head = self._prep_depth(head_depth).reshape(batch, -1)
+        ee = self._prep_depth(ee_depth).reshape(batch, -1)
         return torch.cat([head, ee, proprio_feat], dim=-1)
 
     def _nav_action_to_vel_cmd(self, nav_action: torch.Tensor) -> torch.Tensor:

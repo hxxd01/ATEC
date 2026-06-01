@@ -117,7 +117,11 @@ class TaskEObservationsCfg(BaseObservationsCfg):
         )
         ee_depth = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("ee_camera"), "data_type": "depth"},
+            params={
+                "sensor_cfg": SceneEntityCfg("ee_camera"),
+                "data_type": "depth",
+                "normalize": False,
+            },
         )
         video_rgb = ObsTerm(
             func=mdp.image,
@@ -125,7 +129,11 @@ class TaskEObservationsCfg(BaseObservationsCfg):
         )
         video_depth = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("video_cam"), "data_type": "depth"},
+            params={
+                "sensor_cfg": SceneEntityCfg("video_cam"),
+                "data_type": "depth",
+                "normalize": False,
+            },
         )
 
         def __post_init__(self):

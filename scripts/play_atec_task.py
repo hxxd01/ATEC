@@ -14,11 +14,7 @@ if _ROOT not in sys.path:
 
 from isaaclab.app import AppLauncher
 
-from demo.solution import AlgSolution
-
-print("[play] loading policy.pt (AlgSolution)...", flush=True)
-solution = AlgSolution()
-print("[play] AlgSolution loaded.", flush=True)
+# AlgSolution is constructed after CLI parse (see below) so --student_ckpt / policy size apply first.
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -80,11 +76,50 @@ parser.add_argument(
     default=25,
     help="FPS for saved camera-view videos.",
 )
+parser.add_argument(
+    "--student_ckpt",
+    type=str,
+    default=None,
+    help="Task D student nav checkpoint (.pt). Default: demo/model_900.pt via AlgSolution.",
+)
+parser.add_argument(
+    "--policy_img_hw",
+    type=int,
+    default=None,
+    help="Square policy depth input (e.g. 24 for 24x24 ckpt). Overrides demo/agent.yaml.",
+)
+parser.add_argument(
+    "--policy_img_h",
+    type=int,
+    default=None,
+    help="Policy depth input height (with --policy_img_w). Default from agent.yaml.",
+)
+parser.add_argument(
+    "--policy_img_w",
+    type=int,
+    default=None,
+    help="Policy depth input width (with --policy_img_h). Default from agent.yaml.",
+)
+parser.add_argument(
+    "--platform_depth",
+    action="store_true",
+    default=False,
+    help="Task D: keep 480x640 obs cameras, depth-only; solution prep_depth downsamples to policy size.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
+
+if args_cli.student_ckpt:
+    os.environ["STUDENT_CKPT_PATH"] = os.path.abspath(args_cli.student_ckpt)
+if args_cli.policy_img_hw is not None:
+    os.environ["STUDENT_POLICY_IMG_HW"] = str(int(args_cli.policy_img_hw))
+if args_cli.policy_img_h is not None:
+    os.environ["STUDENT_POLICY_IMG_H"] = str(int(args_cli.policy_img_h))
+if args_cli.policy_img_w is not None:
+    os.environ["STUDENT_POLICY_IMG_W"] = str(int(args_cli.policy_img_w))
 
 _is_task_b = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
 _is_task_d = isinstance(args_cli.task, str) and "TaskD" in args_cli.task
@@ -102,6 +137,12 @@ if args_cli.video:
 # -----------------------------------------------------------------------------
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+from demo.solution import AlgSolution
+
+print("[play] loading AlgSolution...", flush=True)
+solution = AlgSolution()
+print("[play] AlgSolution loaded.", flush=True)
 if hasattr(solution, "set_device"):
     solution.set_device(args_cli.device)
     print(f"[play] AlgSolution device -> {args_cli.device}", flush=True)

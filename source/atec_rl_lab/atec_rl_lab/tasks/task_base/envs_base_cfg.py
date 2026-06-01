@@ -210,7 +210,12 @@ class ObservationsCfg:
         )
         head_depth = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("head_camera"), "data_type": "depth"},
+            params={
+                "sensor_cfg": SceneEntityCfg("head_camera"),
+                "data_type": "depth",
+                # Keep inf/nan for prep_depth (train: scene buffer -> prep_depth maps invalid to depth_max).
+                "normalize": False,
+            },
         )
 
         ee_rgb = ObsTerm(
@@ -219,7 +224,11 @@ class ObservationsCfg:
         )
         ee_depth = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("ee_camera"), "data_type": "depth"},
+            params={
+                "sensor_cfg": SceneEntityCfg("ee_camera"),
+                "data_type": "depth",
+                "normalize": False,
+            },
         )
 
         ee_dual_rgb = ObsTerm(
@@ -228,7 +237,11 @@ class ObservationsCfg:
         )
         ee_dual_depth = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("ee_dual_camera"), "data_type": "depth"},
+            params={
+                "sensor_cfg": SceneEntityCfg("ee_dual_camera"),
+                "data_type": "depth",
+                "normalize": False,
+            },
         )
 
         def __post_init__(self):

@@ -20,7 +20,7 @@ python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper
 python scripts/rsl_rl/play.py   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0   --checkpoint /home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_piper_rough/2026-05-17_20-31-51/model_3200.pt   --headless
 
 #demo里面评分
-cd /home/ubuntu/ATEC2026_Simulation_Challenge && python scripts/play_atec_task.py   --task ATEC-TaskD-B2Piper   --headless   --enable_cameras  --video --video_length 1500 --debug  
+cd /home/ubuntu/ATEC2026_Simulation_Challenge && WQa45r2D3761zj9l --debug  
 
 
 python scripts/play_atec_task.py --task ATEC-TaskA-B2Piper --headless --debug  --video --video_length 2000
@@ -114,12 +114,13 @@ python scripts/collect_train_bc.py \
 # Native 24x32 sim (保宽高比，快；与 server 480x640 不同，上分前可 --platform_depth_train fine-tune)
 python scripts/train_nav_taskd_student.py \
   --ll_policy demo/policy.pt \
-  --num_envs 100 \
+  --num_envs 512 \
   --inner_steps 5 \
   --max_iter 10000 \
   --device cuda:0 \
   --headless \
-  --camera_hw 24 \
+  --policy_img_h 24 \
+  --policy_img_w 32 \
   --sim_camera_h 24 \
   --sim_camera_w 32 \
   --tiled_cameras \
