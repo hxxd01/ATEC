@@ -25,6 +25,11 @@ parser.add_argument(
 parser.add_argument("--inner_steps", type=int, default=5, help="Low-level sim steps per nav step (5 -> 10Hz nav).")
 parser.add_argument("--max_iter", type=int, default=8000)
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument(
+    "--resume-no-optimizer",
+    action="store_true",
+    help="Load model weights only; reset Adam (safer if resume destabilizes).",
+)
 parser.add_argument("--steps_per_env", type=int, default=24)
 parser.add_argument("--vx_min", type=float, default=-2.0)
 parser.add_argument("--vx_max", type=float, default=2.0)
@@ -143,6 +148,18 @@ parser.add_argument(
     default=0.295,
     help="End push stage when box center-of-mass world z drops below this value.",
 )
+parser.add_argument(
+    "--push-min-box-nominal-x",
+    type=float,
+    default=-0.8,
+    help="Push completes on box drop only if box nominal x (env-relative) exceeds this value.",
+)
+parser.add_argument(
+    "--push-right-reward-dist",
+    type=float,
+    default=1.0,
+    help="Cap lateral push progress/reward at this many meters.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 # Student policy always reads head/ee camera buffers.
@@ -216,6 +233,13 @@ def _merge_state_dict_partial(model_sd: dict, ckpt_sd: dict) -> tuple[dict, list
     return merged, loaded_keys, partial_keys, skipped_keys
 
 
+def _sync_ppo_learning_rate(runner) -> float:
+    """Keep PPO.adaptive schedule in sync with the optimizer LR loaded from checkpoint."""
+    lr = float(runner.alg.optimizer.param_groups[0]["lr"])
+    runner.alg.learning_rate = lr
+    return lr
+
+
 def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True) -> None:
     loaded = torch.load(ckpt_path, map_location=runner.device, weights_only=False)
     ckpt_sd = loaded["model_state_dict"]
@@ -227,15 +251,25 @@ def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True)
     can_load_optimizer = len(skipped_keys) == 0
     if load_optimizer and can_load_optimizer and "optimizer_state_dict" in loaded:
         runner.alg.optimizer.load_state_dict(loaded["optimizer_state_dict"])
+        lr = _sync_ppo_learning_rate(runner)
+        print(f"[INFO] Optimizer restored; learning_rate={lr:.2e}", flush=True)
     elif load_optimizer and not can_load_optimizer:
         print(
             "[WARN] Optimizer state skipped because checkpoint architecture differs "
             f"({len(skipped_keys)} tensors not loaded).",
             flush=True,
         )
+    elif not load_optimizer:
+        print("[INFO] Optimizer not loaded (--resume-no-optimizer); using fresh Adam.", flush=True)
 
     if can_load_optimizer and "iter" in loaded:
-        runner.current_learning_iteration = loaded["iter"]
+        # Checkpoints are saved after iteration `iter` completes; continue from the next one.
+        runner.current_learning_iteration = int(loaded["iter"]) + 1
+        print(
+            f"[INFO] Resume from checkpoint iter={loaded['iter']} -> next learning iteration "
+            f"{runner.current_learning_iteration}",
+            flush=True,
+        )
     elif "iter" in loaded:
         print(
             f"[WARN] Checkpoint iter={loaded['iter']} ignored due to partial load; restarting from iter 0.",
@@ -650,6 +684,8 @@ def main():
         depth_only=args_cli.depth_only,
         nav_log_interval=args_cli.nav_log_interval,
         push_box_drop_com_z=args_cli.push_box_drop_com_z,
+        push_min_box_nominal_x=args_cli.push_min_box_nominal_x,
+        push_right_reward_dist=args_cli.push_right_reward_dist,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
     if args_cli.debug_env_origins:
@@ -657,13 +693,12 @@ def main():
 
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
     if args_cli.resume:
-        print(
-            "[WARN] --resume: old 24x24-square checkpoints are incompatible with 24x32 policy input; "
-            "encoder weights will be partially skipped.",
-            flush=True,
-        )
         print(f"[INFO] Resuming PPO from: {args_cli.resume}", flush=True)
-        _load_ppo_checkpoint(runner, args_cli.resume, load_optimizer=True)
+        _load_ppo_checkpoint(
+            runner,
+            args_cli.resume,
+            load_optimizer=not args_cli.resume_no_optimizer,
+        )
     if args_cli.no_train_ckpt:
         print(f"[INFO] Loading no-train inference checkpoint: {args_cli.no_train_ckpt}", flush=True)
         _load_ppo_checkpoint(runner, args_cli.no_train_ckpt, load_optimizer=False)

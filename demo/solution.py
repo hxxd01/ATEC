@@ -102,9 +102,7 @@ class TaskDStudentActorCritic(nn.Module):
         obs_groups: dict,
         num_actions: int,
         *,
-        img_h: int = 24,
-        img_w: int = 32,
-        img_hw: int | None = None,
+        img_hw: int = 64,
         img_channels: int = 4,
         proprio_dim: int = 9,
         enc_dim: int = 128,
@@ -126,15 +124,11 @@ class TaskDStudentActorCritic(nn.Module):
         if critic_hidden_dims is None:
             critic_hidden_dims = [256, 128]
 
-        if img_hw is not None:
-            img_h = img_w = int(img_hw)
-
         self.obs_groups = obs_groups
-        self.img_h = int(img_h)
-        self.img_w = int(img_w)
+        self.img_hw = int(img_hw)
         self.img_channels = int(img_channels)
-        self.head_flat = self.img_channels * self.img_h * self.img_w
-        self.ee_flat = self.img_channels * self.img_h * self.img_w
+        self.head_flat = self.img_channels * self.img_hw * self.img_hw
+        self.ee_flat = self.img_channels * self.img_hw * self.img_hw
         self.proprio_dim = int(proprio_dim)
 
         self.head_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
@@ -193,9 +187,9 @@ class TaskDStudentActorCritic(nn.Module):
     def _encode_base(self, flat_obs: torch.Tensor) -> torch.Tensor:
         lead_shape = flat_obs.shape[:-1]
         x = flat_obs.reshape(-1, flat_obs.shape[-1])
-        head = x[:, : self.head_flat].view(-1, self.img_channels, self.img_h, self.img_w)
+        head = x[:, : self.head_flat].view(-1, self.img_channels, self.img_hw, self.img_hw)
         ee = x[:, self.head_flat : self.head_flat + self.ee_flat].view(
-            -1, self.img_channels, self.img_h, self.img_w
+            -1, self.img_channels, self.img_hw, self.img_hw
         )
         proprio = x[:, self.head_flat + self.ee_flat : self.head_flat + self.ee_flat + self.proprio_dim]
         out = self.fuse(torch.cat([self.head_encoder(head), self.ee_encoder(ee), self.proprio_mlp(proprio)], dim=-1))
@@ -235,20 +229,14 @@ class AlgSolution:
         demo_dir = os.path.dirname(os.path.abspath(__file__))
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        student_ckpt_path = demo_dir + "/model_900.pt"
+        student_ckpt_path = demo_dir + "/model_1100.pt"
         policy_cfg = _load_deploy_cfg(demo_dir)
-        legacy_hw = policy_cfg.get("img_hw")
-        if legacy_hw is not None and "img_h" not in policy_cfg:
-            self.image_h = int(legacy_hw)
-            self.image_w = int(legacy_hw)
-        else:
-            self.image_h = int(policy_cfg.get("img_h", 24))
-            self.image_w = int(policy_cfg.get("img_w", 32))
+        self.image_hw = int(policy_cfg.get("img_hw", 24))
+        self.depth_render_h = int(policy_cfg.get("depth_render_h", self.image_hw))
+        self.depth_render_w = int(policy_cfg.get("depth_render_w", self.image_hw))
         self.img_channels = int(policy_cfg.get("img_channels", 1))
         self.depth_only = self.img_channels == 1
         self.depth_max = float(policy_cfg.get("depth_max", os.environ.get("NAV_DEPTH_MAX", "5.0")))
-        self.platform_depth_h = int(policy_cfg.get("platform_depth_h", 480))
-        self.platform_depth_w = int(policy_cfg.get("platform_depth_w", 640))
 
         self.vx_min = float(os.environ.get("NAV_VX_MIN", "-2.0"))
         self.vx_max = float(os.environ.get("NAV_VX_MAX", "2.0"))
@@ -258,7 +246,7 @@ class AlgSolution:
         inner_steps = int(os.environ.get("NAV_INNER_STEPS", "5"))
         self.nav_hold_steps = max(1, inner_steps)
 
-        actor_dim = 2 * self.img_channels * self.image_h * self.image_w + 9
+        actor_dim = 2 * self.img_channels * self.image_hw * self.image_hw + 9
         critic_dim = actor_dim + self.CRITIC_EXTRA_DIM
         obs = {
             "policy": torch.zeros(1, actor_dim),
@@ -267,8 +255,7 @@ class AlgSolution:
         obs_groups = {"policy": ["policy"], "critic": ["critic"]}
 
         ac_kwargs = {
-            "img_h": self.image_h,
-            "img_w": self.image_w,
+            "img_hw": self.image_hw,
             "img_channels": self.img_channels,
             "proprio_dim": int(policy_cfg.get("proprio_dim", 9)),
             "enc_dim": int(policy_cfg.get("enc_dim", 128)),
@@ -289,9 +276,9 @@ class AlgSolution:
         self.nav_policy.load_state_dict(state, strict=True)
         self.nav_policy.eval()
         print(
-            f"[AlgSolution] depth: {self.platform_depth_h}x{self.platform_depth_w} "
-            f"-> bilinear {self.image_h}x{self.image_w} -> log1p -> "
-            f"policy {self.image_h}x{self.image_w}, ckpt={os.path.basename(student_ckpt_path)}",
+            f"[AlgSolution] depth: platform 480x640 -> bilinear {self.depth_render_h}x{self.depth_render_w} "
+            f"-> log1p -> {self.image_hw}x{self.image_hw} (train=deploy), "
+            f"ckpt={os.path.basename(student_ckpt_path)}",
             flush=True,
         )
 
@@ -333,8 +320,9 @@ class AlgSolution:
     def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
         return prep_depth(
             x.to(self.device),
-            image_h=self.image_h,
-            image_w=self.image_w,
+            image_hw=self.image_hw,
+            depth_render_h=self.depth_render_h,
+            depth_render_w=self.depth_render_w,
             depth_max=self.depth_max,
         )
 
@@ -354,9 +342,8 @@ class AlgSolution:
         if head_depth is None or ee_depth is None:
             raise RuntimeError("depth_only student requires head_depth and ee_depth in obs['image'].")
 
-        batch = proprio.shape[0]
-        head = self._prep_depth(head_depth).reshape(batch, -1)
-        ee = self._prep_depth(ee_depth).reshape(batch, -1)
+        head = self._prep_depth(head_depth).reshape(proprio.shape[0], -1)
+        ee = self._prep_depth(ee_depth).reshape(proprio.shape[0], -1)
         return torch.cat([head, ee, proprio_feat], dim=-1)
 
     def _nav_action_to_vel_cmd(self, nav_action: torch.Tensor) -> torch.Tensor:
@@ -445,6 +432,6 @@ class AlgSolution:
         return [
             "student_ckpt=model_1100.pt",
             f"hl_cmd=({float(cmd[0]):+.2f},{float(cmd[1]):+.2f},{float(cmd[2]):+.2f})",
-            f"img={self.img_channels}ch@{self.image_h}x{self.image_w} depth_only={self.depth_only}",
+            f"img={self.img_channels}ch@{self.image_hw} depth_only={self.depth_only}",
             f"nav_hold={self.nav_hold_steps} steps",
         ]

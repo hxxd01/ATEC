@@ -184,7 +184,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
     no_push_progress_timeout = DoneTerm(
         func=atec_mdp.PushStageStuckTimeout,
         params={
-            "stuck_time_s": 2.0,
+            "stuck_time_s": 4.0,
             "progress_eps": 0.05,
             "push_right_cap": 2.0,
             "approach_dist_min": 1.2,
@@ -194,7 +194,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
     final_max_x_stuck_timeout = DoneTerm(
         func=atec_mdp.FinalStageMaxXStuckTimeout,
         params={
-            "stuck_time_s": 3.0,
+            "stuck_time_s": 4.0,
             "progress_eps": 0.05,
             "final_stage_idx": 3,
         },

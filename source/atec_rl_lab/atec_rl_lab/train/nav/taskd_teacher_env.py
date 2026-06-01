@@ -75,6 +75,8 @@ class TaskDTeacherEnv(gym.Wrapper):
         curriculum_mid_nav_steps: int = 3500,
         nav_log_interval: int = 50,
         push_box_drop_com_z: float = 0.295,
+        push_min_box_nominal_x: float = -0.8,
+        push_right_reward_dist: float = 1.0,
     ):
         super().__init__(env)
         self._device = device
@@ -106,7 +108,7 @@ class TaskDTeacherEnv(gym.Wrapper):
                 dist=2.0,
                 push=True,
                 push_combined=True,
-                push_right_dist=2.0,
+                push_right_dist=1.0,
                 push_forward_dist=4.0,
                 sparse_bonus=6.0,
                 relative_robot_target=True,
@@ -222,6 +224,8 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._idx_push = 2
         self._idx_final = 3
         self._push_box_drop_z = float(push_box_drop_com_z)
+        self._push_min_box_nominal_x = float(push_min_box_nominal_x)
+        self._push_right_reward_dist = float(push_right_reward_dist)
 
         # Reward: progress toward stage target (bounded) + sparse bonus on reach.
         self._w_nav_dist = 3.0
@@ -307,6 +311,8 @@ class TaskDTeacherEnv(gym.Wrapper):
             f"vx=[{self._vx_min:.1f},{self._vx_max:.1f}] curriculum=[{self._curriculum_warmup_nav_steps},"
             f"{self._curriculum_mid_nav_steps}] stages={self._num_stages} "
             f"push_drop_com_z<{self._push_box_drop_z:.3f} "
+            f"push_min_box_nominal_x>{self._push_min_box_nominal_x:.2f} "
+            f"push_right_reward_dist={self._push_right_reward_dist:.2f} "
             f"nav_log_interval={self._nav_log_interval}",
             flush=True,
         )
@@ -792,6 +798,10 @@ class TaskDTeacherEnv(gym.Wrapper):
         raw = self._relative_axis_progress(sign, rx.squeeze(-1), self._stage_origin_x_buf)
         return torch.where(final, raw, torch.zeros_like(raw))
 
+    def _box_nominal_x(self, bx: torch.Tensor) -> torch.Tensor:
+        """Box root x in Task D nominal coords (env-relative, same frame as scoring thresholds)."""
+        return bx.squeeze(-1) - self._env_origin_x + float(self._pit_ref_ox)
+
     def _compute_push_right_progress(
         self,
         stage_idx: torch.Tensor,
@@ -801,7 +811,10 @@ class TaskDTeacherEnv(gym.Wrapper):
         push = self._main_push_stage_mask(stage_idx, valid)
         sign = torch.full_like(by.squeeze(-1), -1.0)
         raw = self._relative_axis_progress(sign, by.squeeze(-1), self._box_push_origin_y_buf)
-        cap = self._stage_push_right_dist[stage_idx]
+        cap = torch.minimum(
+            self._stage_push_right_dist[stage_idx],
+            torch.full_like(raw, self._push_right_reward_dist),
+        )
         capped = torch.clamp(raw, max=cap)
         return torch.where(push, capped, torch.zeros_like(capped))
 
@@ -1067,7 +1080,9 @@ class TaskDTeacherEnv(gym.Wrapper):
         final_remaining_x = torch.clamp(stage_dist - final_x_prog, min=0.0)
         dist_to_target = torch.where(final_mask, final_remaining_x, dist_to_target)
 
-        reached_push = main_push & (bz.squeeze(-1) < self._push_box_drop_z)
+        reached_push = main_push & (bz.squeeze(-1) < self._push_box_drop_z) & (
+            self._box_nominal_x(bx) > self._push_min_box_nominal_x
+        )
         reached_nav = valid & (~final_mask) & (dist_to_target <= self._stage_reach_tol)
         reached_final = final_mask & (final_x_prog >= stage_dist)
         reached = torch.where(main_push, reached_push, torch.where(final_mask, reached_final, reached_nav))
@@ -1100,6 +1115,10 @@ class TaskDTeacherEnv(gym.Wrapper):
             reached = torch.where(use_face, reached & face_ok, reached)
 
         right_cap = self._stage_push_right_dist[stage_idx]
+        right_cap = torch.minimum(
+            right_cap,
+            torch.full_like(right_cap, self._push_right_reward_dist),
+        )
         right_norm = torch.where(
             right_cap > 1.0e-6,
             torch.clamp(right_progress / right_cap, 0.0, 1.0),
@@ -1198,7 +1217,10 @@ class TaskDTeacherEnv(gym.Wrapper):
         self._ensure_box_push_origin(stage_idx, valid, bx, by)
         right_progress = self._compute_push_right_progress(stage_idx, valid, by)
         forward_progress = self._compute_push_forward_progress(stage_idx, valid, bx)
-        right_cap = self._stage_push_right_dist[stage_idx]
+        right_cap = torch.minimum(
+            self._stage_push_right_dist[stage_idx],
+            torch.full_like(right_progress, self._push_right_reward_dist),
+        )
         right_active = main_push & (right_progress < right_cap - 1.0e-4)
         forward_active = main_push & (bz.squeeze(-1) >= self._push_box_drop_z)
 
