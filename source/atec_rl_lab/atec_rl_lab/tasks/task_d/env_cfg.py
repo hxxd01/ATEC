@@ -177,7 +177,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         params={
             "stuck_time_s": 2.0,
             "progress_eps": 0.05,
-            "skip_stage_idx": 3,
+            "skip_stage_idx": 2,
         },
         time_out=False,
     )
@@ -191,15 +191,7 @@ class TaskDTerminationsCfg(BaseTerminationsCfg):
         },
         time_out=False,
     )
-    final_max_x_stuck_timeout = DoneTerm(
-        func=atec_mdp.FinalStageMaxXStuckTimeout,
-        params={
-            "stuck_time_s": 4.0,
-            "progress_eps": 0.05,
-            "final_stage_idx": 3,
-        },
-        time_out=False,
-    )
+    # final stage disabled in nav pipeline.
 
 def refresh_task_d_terrain_cfg(env_cfg: "TaskDEnvCfg") -> None:
     """Rebuild terrain grid after ``scene.num_envs`` is set. Call before ``gym.make``."""
