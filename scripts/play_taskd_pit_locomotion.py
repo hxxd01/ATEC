@@ -39,6 +39,22 @@ parser.add_argument(
     action="store_true",
     help="Load MARG asymmetric AC (estimator + elevation + privileged critic).",
 )
+parser.add_argument(
+    "--stochastic",
+    action="store_true",
+    help="Sample actions from the policy (matches training rollouts). Default: deterministic mean.",
+)
+parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="Print action/cmd/velocity stats every 50 steps.",
+)
+parser.add_argument(
+    "--warmup_steps",
+    type=int,
+    default=0,
+    help="Steps before recording (fills MARG proprio history; try 30-60).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
@@ -140,6 +156,7 @@ def main():
     env_cfg.command_lin_vel_x_min = float(args_cli.command_vx)
     env_cfg.command_lin_vel_x_max = float(args_cli.command_vx)
     env_cfg.command_curriculum_start_fraction = 1.0
+    env_cfg.apply_command_config()
     _configure_play_terrain(env_cfg, use_pit_curriculum=bool(args_cli.pit_curriculum))
 
     # Play: no DR, no command/pit curriculum updates.
@@ -178,12 +195,14 @@ def main():
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=None, device=device)
     print(f"[INFO] Loading checkpoint: {ckpt}", flush=True)
     runner.load(ckpt)
-    policy = runner.get_inference_policy(device=vec_env.unwrapped.device)
-
-    try:
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        policy_nn = runner.alg.actor_critic
+    runner.eval_mode()
+    policy_nn = runner.alg.policy
+    if args_cli.stochastic:
+        policy = lambda obs: policy_nn.act(obs)
+        print("[INFO] Using stochastic policy.act() (same as training rollouts)", flush=True)
+    else:
+        policy = runner.get_inference_policy(device=vec_env.unwrapped.device)
+        print("[INFO] Using deterministic act_inference() (policy mean actions)", flush=True)
 
     unwrapped = vec_env.unwrapped
     if args_cli.pit_curriculum:
@@ -199,23 +218,43 @@ def main():
     obs = vec_env.get_observations()
     dt = unwrapped.step_dt
     steps = 0
+    warmup = max(0, int(args_cli.warmup_steps))
     max_steps = int(args_cli.video_length) if args_cli.video else None
+    if args_cli.video and warmup > 0:
+        print(f"[INFO] Warmup {warmup} steps before video (MARG history fill)", flush=True)
 
     print(
         f"[INFO] command_vx={args_cli.command_vx} m/s, num_envs={args_cli.num_envs}, "
-        f"pit_width={env_cfg.pit_width_range}",
+        f"pit_width={env_cfg.pit_width_range}, stochastic={bool(args_cli.stochastic)}",
         flush=True,
     )
+
+    def _debug_step(step_idx: int, actions: torch.Tensor) -> None:
+        if not args_cli.debug or step_idx % 50 != 0:
+            return
+        robot = unwrapped.scene["robot"]
+        cmd_x = float(unwrapped.command_manager.get_command("base_velocity")[0, 0].item())
+        vx = float(robot.data.root_lin_vel_w[0, 0].item())
+        act_norm = float(actions[0].norm().item())
+        ep_len = int(unwrapped.episode_length_buf[0].item())
+        print(
+            f"[TaskDPitPlay debug] step={step_idx} cmd_x={cmd_x:.3f} vx={vx:.3f} "
+            f"|action|={act_norm:.3f} ep_len={ep_len}",
+            flush=True,
+        )
 
     while simulation_app.is_running():
         t0 = time.time()
         with torch.inference_mode():
-            actions = policy(obs)
+            actions = policy(obs).to(unwrapped.device)
+            _debug_step(steps, actions)
             obs, _, dones, _ = vec_env.step(actions)
             policy_nn.reset(dones)
         steps += 1
-        if max_steps is not None and steps >= max_steps:
-            print(f"[INFO] Recorded {steps} steps, stopping.", flush=True)
+        if steps == warmup and args_cli.video:
+            print(f"[INFO] Warmup done ({warmup} steps), recording starts now.", flush=True)
+        if max_steps is not None and steps >= warmup + max_steps:
+            print(f"[INFO] Recorded {steps - warmup} steps after warmup, stopping.", flush=True)
             break
         if args_cli.real_time:
             sleep_s = dt - (time.time() - t0)

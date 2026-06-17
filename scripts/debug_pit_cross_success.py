@@ -26,7 +26,12 @@ import torch
 
 import atec_rl_lab.tasks  # noqa: F401
 from atec_rl_lab.tasks.task_d.locomotion.env_cfg import UnitreeB2PiperTaskDPitLocomotionEnvCfg
-from atec_rl_lab.tasks.task_d.locomotion.pit_geometry import pit_cross_world_x, pit_geometry_for_envs
+from atec_rl_lab.tasks.task_d.locomotion.pit_geometry import (
+    log_pit_threshold_reference,
+    pit_cross_world_x,
+    pit_geometry_for_envs,
+    pit_success_local_x,
+)
 from atec_rl_lab.tasks.task_d.locomotion.terrain_curriculum import TaskDPitTerrainGenerator
 from atec_rl_lab.tasks.task_d.terrain import TASK_D_TERRAIN_CFG, PitAndPlatformTerrainCfg, TaskDTerrainImporter
 from atec_rl_lab.tasks.task_d.terrain import configure_task_d_terrain_for_num_envs
@@ -63,11 +68,13 @@ def main():
     robot = unwrapped.scene["robot"]
     origins = unwrapped.scene.env_origins
     cross_x = pit_cross_world_x(unwrapped)
-    post = 0.5
-    success_x = cross_x + post
+    success_local = pit_success_local_x(unwrapped)
+    success_x = origins[:, 0] + success_local
 
     center_w, size_lwh = pit_geometry_for_envs(unwrapped)
     local_x = robot.data.root_pos_w[:, 0] - origins[:, 0]
+
+    log_pit_threshold_reference(unwrapped)
 
     print("[DebugPitCross] env_origins[0]:", origins[0].tolist())
     print("[DebugPitCross] spawn root_pos_w[0]:", robot.data.root_pos_w[0].tolist())
@@ -75,7 +82,8 @@ def main():
     print("[DebugPitCross] pit center_w[0]:", center_w[0].tolist())
     print("[DebugPitCross] pit width[0]:", size_lwh[0, 1].item())
     print("[DebugPitCross] cross_x[0]:", cross_x[0].item())
-    print("[DebugPitCross] success_x[0]:", success_x[0].item())
+    print("[DebugPitCross] success local_x[0]:", success_local[0].item())
+    print("[DebugPitCross] success world_x[0]:", success_x[0].item())
 
     term_fn = unwrapped.termination_manager.get_term
     before = term_fn("pit_cross_success").clone()

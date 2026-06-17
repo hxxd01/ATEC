@@ -47,11 +47,11 @@ class UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCf
 @configclass
 class MargActorCriticCfg(RslRlPpoActorCriticCfg):
     class_name: str = "MargActorCritic"
-    actor_obs_normalization: bool = False
+    actor_obs_normalization: bool = True
     critic_obs_normalization: bool = False
     actor_hidden_dims: list = [512, 256, 128]
     critic_hidden_dims: list = [512, 256, 128]
-    activation: str = "elu"
+    activation: str = "relu"
     init_noise_std: float = 1.0
     estimator_hidden_dims: list = [128]
     elevation_hidden_dims: list = [128, 64]
@@ -60,7 +60,7 @@ class MargActorCriticCfg(RslRlPpoActorCriticCfg):
 @configclass
 class MargPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "MargPPO"
-    reg_loss_coef: float = 1.0
+    reg_loss_coef: float = 5.0
     value_loss_coef: float = 1.0
     use_clipped_value_loss: bool = True
     clip_param: float = 0.2

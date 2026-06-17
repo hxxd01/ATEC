@@ -11,7 +11,7 @@ from rsl_rl.algorithms.ppo import PPO
 class MargPPO(PPO):
     """PPO + MSE regression on estimator outputs (velocity + foot contact)."""
 
-    def __init__(self, policy, reg_loss_coef: float = 1.0, **kwargs):
+    def __init__(self, policy, reg_loss_coef: float = 5.0, **kwargs):
         self.reg_loss_coef = float(kwargs.pop("reg_loss_coef", reg_loss_coef))
         super().__init__(policy, **kwargs)
         if self.rnd is not None or self.symmetry is not None:

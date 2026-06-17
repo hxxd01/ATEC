@@ -106,3 +106,53 @@ def pit_cross_world_x(env) -> torch.Tensor:
 def pit_success_local_x(env, post_cross_distance: float = 0.5) -> torch.Tensor:
     """Local +x from ``env_origin`` required for a successful pit crossing."""
     return pit_cross_local_x(env) + float(post_cross_distance)
+
+
+def pit_near_local_x(env) -> torch.Tensor:
+    """Local +x of the pit near edge (robot side), for debug / visualization."""
+    _, size_lwh = pit_geometry_for_envs(env)
+    ox, _, _ = pit_center_local_offset()
+    half_width = 0.5 * size_lwh[:, 1]
+    return torch.full_like(half_width, float(ox)) - half_width
+
+
+def log_pit_threshold_reference(env, *, width_level: int | None = None) -> None:
+    """Print spawn / pit-edge / Task-D-nominal lines once (level=0 or given width row)."""
+    from atec_rl_lab.tasks.task_d.env_cfg import TASK_D_ROBOT_SPAWN_LOCAL
+    from atec_rl_lab.tasks.task_d.mdp.env_origin import (
+        TASK_D_MISSION_DONE_NOMINAL_X,
+        TASK_D_REWARD_NOMINAL_X,
+        TASK_D_ROBOT_SPAWN_NOMINAL_X,
+        task_d_nominal_x_to_local_x,
+    )
+
+    device = env.device
+    if width_level is not None:
+        levels = torch.full((env.num_envs,), int(width_level), device=device, dtype=torch.long)
+        terrain = env.scene.terrain
+        if hasattr(terrain, "terrain_levels"):
+            terrain.terrain_levels[:] = levels
+        width_range = _read_width_range(env)
+        max_level = _read_max_level(env)
+        width_m = float(pit_width_from_level(levels[:1], width_range, max_level).item())
+    else:
+        width_m = float(pit_width_from_level(_terrain_levels(env)[:1], _read_width_range(env), _read_max_level(env)).item())
+
+    spawn_local = float(TASK_D_ROBOT_SPAWN_LOCAL[0])
+    cross_local = float(pit_cross_local_x(env)[0].item())
+    success_local = float(pit_success_local_x(env)[0].item())
+    near_local = float(pit_near_local_x(env)[0].item())
+    reward_nominal_local = task_d_nominal_x_to_local_x(TASK_D_REWARD_NOMINAL_X)
+    mission_nominal_local = task_d_nominal_x_to_local_x(TASK_D_MISSION_DONE_NOMINAL_X)
+
+    print(
+        "[TaskDPitThresholds] coordinate reference (env-local +x from env_origin):\n"
+        f"  spawn nominal_x={TASK_D_ROBOT_SPAWN_NOMINAL_X:.1f} -> local_x={spawn_local:.2f}\n"
+        f"  pit near edge (analytic)          local_x={near_local:.2f}\n"
+        f"  pit far edge + buffer (curriculum) local_x={cross_local:.2f}  (width={width_m:.3f} m)\n"
+        f"  pit success (+post buffer)        local_x={success_local:.2f}\n"
+        f"  TaskD RewardCrossX nominal x={TASK_D_REWARD_NOMINAL_X:.1f} -> local_x={reward_nominal_local:.2f}\n"
+        f"  TaskD x_reached  nominal x={TASK_D_MISSION_DONE_NOMINAL_X:.1f} -> local_x={mission_nominal_local:.2f}\n"
+        "  NOTE: local_x>2.0 is NOT Task D nominal x>2 (that is local_x≈6.2).",
+        flush=True,
+    )

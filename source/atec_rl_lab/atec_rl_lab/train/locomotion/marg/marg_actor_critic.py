@@ -11,7 +11,9 @@ from rsl_rl.networks import EmpiricalNormalization, MLP
 from atec_rl_lab.train.locomotion.marg.constants import (
     MARG_CRITIC_PRIV_DIM,
     MARG_ELEVATION_OUT_DIM,
+    MARG_ESTIMATOR_CONTACT_DIM,
     MARG_ESTIMATOR_OUT_DIM,
+    MARG_ESTIMATOR_VEL_DIM,
     MARG_HEIGHT_MAP_DIM,
     MARG_HISTORY_DIM,
     MARG_PROPRIO_DIM,
@@ -29,11 +31,11 @@ class MargActorCritic(nn.Module):
         obs_groups,
         num_actions,
         *,
-        actor_obs_normalization: bool = False,
+        actor_obs_normalization: bool = True,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: list | None = None,
         critic_hidden_dims: list | None = None,
-        activation: str = "elu",
+        activation: str = "relu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         proprio_dim: int = MARG_PROPRIO_DIM,
@@ -193,7 +195,15 @@ class MargActorCritic(nn.Module):
         """MARG loss_reg: MSE(v_hat, v) + MSE(c_hat, c) using privileged targets."""
         est_out = self.estimator(self._obs_tensor(obs, "proprio_history"))
         targets = self._obs_tensor(obs, "critic_priv")[:, : self.estimator_out_dim]
-        return torch.nn.functional.mse_loss(est_out, targets)
+        v_dim = MARG_ESTIMATOR_VEL_DIM
+        c_dim = MARG_ESTIMATOR_CONTACT_DIM
+        v_hat = est_out[:, :v_dim]
+        c_hat = est_out[:, v_dim : v_dim + c_dim]
+        v_tgt = targets[:, :v_dim]
+        c_tgt = targets[:, v_dim : v_dim + c_dim]
+        loss_v = torch.nn.functional.mse_loss(v_hat, v_tgt)
+        loss_c = torch.nn.functional.mse_loss(c_hat, c_tgt)
+        return loss_v + loss_c
 
     def update_normalization(self, obs):
         if self.actor_obs_normalization:

@@ -6,6 +6,18 @@ python scripts/rsl_rl/play.py \
 & "C:\Windows\System32\OpenSSH\scp.exe" ubuntu@117.50.75.119:/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/unitree_b2_rough/2026-05-17_03-41-56/model_6600.pt "C:\Users\xxd\Desktop\"
 
 python scripts/train_taskd_pit_locomotion.py --marg --num_envs 4096 --headless
+
+python scripts/play_taskd_pit_locomotion.py   --marg   --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-18_02-53-29/model_100.pt   --video   --headless   --num_envs 1   --command_vx 1.0   --pit_level 0    --marg  --video_length 300
+python scripts/play_taskd_pit_locomotion.py \
+  --marg \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-18_00-52-07/model_700.pt \
+  --video \
+  --headless \
+  --num_envs 1 \
+  --command_vx 1.0 \
+  --pit_level 5  \
+  -- marg 
+
 python scripts/rsl_rl/play.py \ 
  --task ATEC-Isaac-Velocity-Rough-Unitree-B2-v0 \
  --video

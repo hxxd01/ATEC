@@ -13,7 +13,7 @@ if os.path.isdir(_ATEC_RL_LAB_SRC) and _ATEC_RL_LAB_SRC not in sys.path:
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Train Task D pit locomotion (B2Piper-flat rewards + priv obs).")
+parser = argparse.ArgumentParser(description="Train Task D pit locomotion (forward+track+upward rewards).")
 parser.add_argument("--num_envs", type=int, default=512, help="Parallel envs (512 recommended; 4096 bakes 11x4096 tiles).")
 parser.add_argument("--max_iterations", type=int, default=15000)
 parser.add_argument("--pit_width_min", type=float, default=0.4)
@@ -31,7 +31,7 @@ parser.add_argument(
     "--command_curriculum_start",
     type=float,
     default=0.1,
-    help="Initial vx max = min + start_frac * (max-min); default 0.1 -> 0.4 m/s when max=4.",
+    help="Initial vx max fraction via command curriculum (0.1 -> 0.4 m/s when max=4).",
 )
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument(
@@ -87,6 +87,7 @@ def main():
     vx_max = args_cli.command_vx_max if args_cli.command_vx is None else args_cli.command_vx
     env_cfg.command_lin_vel_x_max = float(vx_max)
     env_cfg.command_curriculum_start_fraction = float(args_cli.command_curriculum_start)
+    env_cfg.apply_command_config()
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
 
     agent_cfg = (

@@ -10,6 +10,20 @@ if False:  # TYPE_CHECKING
 # Reference pit tile origin (debug_taskd_env_origins.py); spawn local = nominal_world - this.
 TASK_D_PIT_TERRAIN_ORIGIN_XY = (-4.2, 0.0)
 
+# Nominal Task D spawn / reward lines on the reference tile (see env_cfg, RewardCrossX).
+TASK_D_ROBOT_SPAWN_NOMINAL_X = -3.0
+TASK_D_REWARD_NOMINAL_X = 2.0
+TASK_D_MISSION_DONE_NOMINAL_X = 3.5
+
+
+def task_d_nominal_x_to_local_x(nominal_x: float) -> float:
+    """Convert Task D nominal world x to env-local +x (same on every pit tile).
+
+    ``local_x = nominal_x - TASK_D_PIT_TERRAIN_ORIGIN_XY[0]``.
+    Example: nominal x=2.0 -> local_x=6.2 (NOT 2.0).
+    """
+    return float(nominal_x) - float(TASK_D_PIT_TERRAIN_ORIGIN_XY[0])
+
 
 def task_d_env_origin_xy(env) -> tuple[torch.Tensor, torch.Tensor]:
     """Return per-env terrain origin (x, y) in world frame, shape (num_envs,)."""
