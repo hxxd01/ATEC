@@ -11,6 +11,7 @@ from atec_rl_lab.tasks.task_d.terrain import (
 
 PIT_BORDER_WIDTH = 1.0
 PIT_DEPTH = 1.0
+PIT_CROSS_EDGE_BUFFER = 0.25
 
 
 def _cell_margins() -> tuple[float, float]:
@@ -89,8 +90,19 @@ def pit_geometry_for_envs(env) -> tuple[torch.Tensor, torch.Tensor]:
     return center_w, size_lwh
 
 
+def pit_cross_local_x(env) -> torch.Tensor:
+    """Local +x from ``env_origin`` to the pit far edge plus a small buffer."""
+    _, size_lwh = pit_geometry_for_envs(env)
+    ox, _, _ = pit_center_local_offset()
+    half_width = 0.5 * size_lwh[:, 1]
+    return torch.full_like(half_width, float(ox)) + half_width + float(PIT_CROSS_EDGE_BUFFER)
+
+
 def pit_cross_world_x(env) -> torch.Tensor:
     """World-frame x threshold: robot base x past pit far edge counts as crossed."""
-    center_w, size_lwh = pit_geometry_for_envs(env)
-    half_width = 0.5 * size_lwh[:, 1]
-    return center_w[:, 0] + half_width + 0.25
+    return env.scene.env_origins[:, 0] + pit_cross_local_x(env)
+
+
+def pit_success_local_x(env, post_cross_distance: float = 0.5) -> torch.Tensor:
+    """Local +x from ``env_origin`` required for a successful pit crossing."""
+    return pit_cross_local_x(env) + float(post_cross_distance)

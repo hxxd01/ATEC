@@ -42,3 +42,46 @@ class UnitreeB2PiperFlatPPORunnerCfg(UnitreeB2PiperRoughPPORunnerCfg):
 class UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
     max_iterations = 15000
     experiment_name = "taskd_pit_locomotion_b2piper"
+
+
+@configclass
+class MargActorCriticCfg(RslRlPpoActorCriticCfg):
+    class_name: str = "MargActorCritic"
+    actor_obs_normalization: bool = False
+    critic_obs_normalization: bool = False
+    actor_hidden_dims: list = [512, 256, 128]
+    critic_hidden_dims: list = [512, 256, 128]
+    activation: str = "elu"
+    init_noise_std: float = 1.0
+    estimator_hidden_dims: list = [128]
+    elevation_hidden_dims: list = [128, 64]
+
+
+@configclass
+class MargPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    class_name: str = "MargPPO"
+    reg_loss_coef: float = 1.0
+    value_loss_coef: float = 1.0
+    use_clipped_value_loss: bool = True
+    clip_param: float = 0.2
+    entropy_coef: float = 0.01
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    learning_rate: float = 1.0e-3
+    schedule: str = "adaptive"
+    gamma: float = 0.99
+    lam: float = 0.95
+    desired_kl: float = 0.01
+    max_grad_norm: float = 1.0
+
+
+@configclass
+class UnitreeB2PiperTaskDPitLocomotionMargPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
+    max_iterations = 15000
+    experiment_name = "taskd_pit_locomotion_b2piper_marg"
+    obs_groups = {
+        "policy": ["proprio", "proprio_history", "height_map"],
+        "critic": ["proprio", "proprio_history", "height_map", "critic_priv"],
+    }
+    policy = MargActorCriticCfg()
+    algorithm = MargPpoAlgorithmCfg()

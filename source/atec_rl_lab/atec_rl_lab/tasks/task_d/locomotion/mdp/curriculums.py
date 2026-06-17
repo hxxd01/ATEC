@@ -24,9 +24,9 @@ def task_d_pit_width_levels(
     reward_term_name: str = "track_lin_vel_xy_exp",
     success_fraction: float = 0.75,
 ) -> torch.Tensor:
-    """Promote envs to wider pits when velocity-tracking reward is strong or pit is crossed."""
+    """Promote resetting envs to wider pits when tracking reward is strong or the pit was crossed."""
     terrain = env.scene.terrain
-    if not hasattr(terrain, "terrain_levels") or not hasattr(terrain, "update_env_origins_from_levels"):
+    if not hasattr(terrain, "terrain_levels") or not hasattr(terrain, "promote_terrain_levels"):
         return torch.tensor(0.0, device=env.device)
 
     env_ids_t = torch.as_tensor(list(env_ids), device=env.device, dtype=torch.long)
@@ -36,29 +36,26 @@ def task_d_pit_width_levels(
     max_level = _read_max_level(env)
     width_range = _read_width_range(env)
 
-    promote = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    if env.common_step_counter % env.max_episode_length == 0:
-        reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
-        episode_sums = env.reward_manager._episode_sums[reward_term_name]
-        mean_rew = torch.mean(episode_sums[env_ids_t]) / env.max_episode_length_s
-        promote[env_ids_t] = mean_rew > success_fraction * reward_term_cfg.weight
+    reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
+    episode_sums = env.reward_manager._episode_sums[reward_term_name]
+    mean_rew = episode_sums[env_ids_t] / env.max_episode_length_s
+    promote = mean_rew > success_fraction * reward_term_cfg.weight
 
     robot = env.scene["robot"]
-    crossed = robot.data.root_pos_w[:, 0] >= pit_cross_world_x(env)
-    promote |= crossed
+    cross_x = pit_cross_world_x(env)
+    promote |= robot.data.root_pos_w[env_ids_t, 0] >= cross_x[env_ids_t]
 
-    new_levels = terrain.terrain_levels.clone()
-    new_levels[promote] = torch.clamp(new_levels[promote] + 1, max=max_level)
-    if promote.any():
-        terrain.update_env_origins_from_levels(new_levels)
+    promote_ids = env_ids_t[promote]
+    if promote_ids.numel() > 0:
+        terrain.promote_terrain_levels(promote_ids, max_level=max_level)
 
     mean_level = terrain.terrain_levels.float().mean()
     mean_width = pit_width_from_level(terrain.terrain_levels, width_range, max_level).mean()
-    if env.common_step_counter % env.max_episode_length == 0:
+    if promote_ids.numel() > 0 and env.common_step_counter % max(1, env.max_episode_length // 4) == 0:
         print(
             f"[TaskDPitCurriculum] mean_level={mean_level.item():.2f} "
             f"mean_width={mean_width.item():.3f}m "
-            f"promoted={int(promote.sum().item())}/{env.num_envs}",
+            f"promoted={int(promote_ids.numel())}/{int(env_ids_t.numel())} resetting envs",
             flush=True,
         )
     return mean_width

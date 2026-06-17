@@ -43,15 +43,29 @@ class TaskDPitCurriculumTerrainImporter(TaskDTerrainImporter):
         self.terrain_levels = torch.zeros(num_envs, device=self.device, dtype=torch.long)
         self._apply_env_origins()
 
-    def _apply_env_origins(self):
-        row_idx = self.terrain_levels
-        col_idx = self.terrain_types
-        self.env_origins = self.terrain_origins[row_idx, col_idx]
+    def _apply_env_origins(self, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = torch.arange(int(self.cfg.num_envs), device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        row_idx = self.terrain_levels[env_ids]
+        col_idx = self.terrain_types[env_ids]
+        self.env_origins[env_ids] = self.terrain_origins[row_idx, col_idx]
+
+    def promote_terrain_levels(self, env_ids: torch.Tensor, max_level: int) -> None:
+        """Increase pit-width row for selected envs and refresh only their ``env_origins``."""
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
+        self.terrain_levels[env_ids] = torch.clamp(self.terrain_levels[env_ids] + 1, max=int(max_level))
+        self._apply_env_origins(env_ids)
 
     def update_env_origins_from_levels(self, new_levels: torch.Tensor, env_ids: torch.Tensor | None = None):
-        """Update terrain row (pit width level) and refresh ``env_origins``."""
-        del env_ids
-        self.terrain_levels = new_levels.to(device=self.device, dtype=torch.long)
-        row_idx = self.terrain_levels
-        col_idx = self.terrain_types
-        self.env_origins = self.terrain_origins[row_idx, col_idx]
+        """Backward-compatible helper used by play scripts."""
+        if env_ids is None:
+            self.terrain_levels = new_levels.to(device=self.device, dtype=torch.long)
+            self._apply_env_origins()
+            return
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        self.terrain_levels[env_ids] = new_levels[env_ids].to(device=self.device, dtype=torch.long)
+        self._apply_env_origins(env_ids)

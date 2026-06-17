@@ -24,17 +24,20 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Use B2Piper model so arm mass/inertia are included in dynamics
         self.scene.robot = UNITREE_B2_PIPER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
-        self.scene.height_scanner_base.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
+        if self.scene.height_scanner_base is not None:
+            self.scene.height_scanner_base.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
 
-        # Observations: same as B2 but scoped to leg joints only
-        self.observations.policy.base_lin_vel.scale = 2.0
-        self.observations.policy.base_ang_vel.scale = 0.25
-        self.observations.policy.joint_pos.scale = 1.0
-        self.observations.policy.joint_vel.scale = 0.05
-        self.observations.policy.base_lin_vel = None
-        self.observations.policy.height_scan = None
-        self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
-        self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
+        # Observations: same as B2 but scoped to leg joints only (skip custom obs layouts e.g. MARG).
+        policy_obs = getattr(self.observations, "policy", None)
+        if policy_obs is not None:
+            policy_obs.base_lin_vel.scale = 2.0
+            policy_obs.base_ang_vel.scale = 0.25
+            policy_obs.joint_pos.scale = 1.0
+            policy_obs.joint_vel.scale = 0.05
+            policy_obs.base_lin_vel = None
+            policy_obs.height_scan = None
+            policy_obs.joint_pos.params["asset_cfg"].joint_names = self.joint_names
+            policy_obs.joint_vel.params["asset_cfg"].joint_names = self.joint_names
 
         # Actions: leg joints only
         self.actions.joint_pos.scale = {".*_hip_joint": 0.125, "^(?!.*_hip_joint).*": 0.25}
@@ -68,6 +71,10 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_apply_external_force_torque.params["asset_cfg"].body_names = [self.base_link_name]
         self.events.randomize_apply_external_force_torque.params["force_range"] = (-30.0, 30.0)
         self.events.randomize_apply_external_force_torque.params["torque_range"] = (-10.0, 10.0)
+
+        if getattr(self, "_skip_rough_reward_setup", False):
+            self.terminations.illegal_contact = None
+            return
 
         # Rewards (identical to B2 rough)
         self.rewards.is_terminated.weight = 0

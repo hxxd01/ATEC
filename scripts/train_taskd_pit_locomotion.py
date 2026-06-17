@@ -34,6 +34,11 @@ parser.add_argument(
     help="Initial vx max = min + start_frac * (max-min); default 0.1 -> 0.4 m/s when max=4.",
 )
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument(
+    "--marg",
+    action="store_true",
+    help="Use MARG asymmetric AC (estimator + elevation encoder + privileged critic + reg loss).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -50,17 +55,31 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 import atec_rl_lab.train  # noqa: F401
 from atec_rl_lab.tasks.task_d.locomotion.env_cfg import (
     UnitreeB2PiperTaskDPitLocomotionEnvCfg,
+    UnitreeB2PiperTaskDPitLocomotionMargEnvCfg,
     refresh_task_d_pit_locomotion_terrain_cfg,
 )
 from atec_rl_lab.train.locomotion.velocity.config.quadruped.unitree_b2_piper.agents.rsl_rl_ppo_cfg import (
+    UnitreeB2PiperTaskDPitLocomotionMargPPORunnerCfg,
     UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg,
 )
+from atec_rl_lab.train.locomotion.marg.marg_actor_critic import MargActorCritic
+from atec_rl_lab.train.locomotion.marg.marg_ppo import MargPPO
+
+import rsl_rl.runners.on_policy_runner as _runner_mod
+
+_runner_mod.MargActorCritic = MargActorCritic
+_runner_mod.MargPPO = MargPPO
 
 
 def main():
     device = args_cli.device if args_cli.device else "cuda"
 
-    env_cfg = UnitreeB2PiperTaskDPitLocomotionEnvCfg()
+    env_cfg_cls = (
+        UnitreeB2PiperTaskDPitLocomotionMargEnvCfg
+        if args_cli.marg
+        else UnitreeB2PiperTaskDPitLocomotionEnvCfg
+    )
+    env_cfg = env_cfg_cls()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.pit_width_range = (float(args_cli.pit_width_min), float(args_cli.pit_width_max))
     env_cfg.pit_curriculum_levels = int(args_cli.pit_curriculum_levels)
@@ -70,7 +89,11 @@ def main():
     env_cfg.command_curriculum_start_fraction = float(args_cli.command_curriculum_start)
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
 
-    agent_cfg = UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg()
+    agent_cfg = (
+        UnitreeB2PiperTaskDPitLocomotionMargPPORunnerCfg()
+        if args_cli.marg
+        else UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg()
+    )
     agent_cfg.max_iterations = args_cli.max_iterations
     agent_cfg.device = device
 
@@ -94,7 +117,7 @@ def main():
         f"[INFO] pit_width={env_cfg.pit_width_range}, levels={env_cfg.pit_curriculum_levels}, "
         f"vx=[{env_cfg.command_lin_vel_x_min}, {env_cfg.command_lin_vel_x_max}] m/s "
         f"(curriculum start_frac={env_cfg.command_curriculum_start_fraction}), "
-        f"num_envs={env_cfg.scene.num_envs}",
+        f"num_envs={env_cfg.scene.num_envs}, marg={bool(args_cli.marg)}",
         flush=True,
     )
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
