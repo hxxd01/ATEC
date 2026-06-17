@@ -31,3 +31,14 @@ class UnitreeB2PiperRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class UnitreeB2PiperFlatPPORunnerCfg(UnitreeB2PiperRoughPPORunnerCfg):
+    experiment_name = "unitree_b2_piper_flat"
+
+
+@configclass
+class UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
+    max_iterations = 15000
+    experiment_name = "taskd_pit_locomotion_b2piper"

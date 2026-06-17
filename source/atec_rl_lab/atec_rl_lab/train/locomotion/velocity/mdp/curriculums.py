@@ -22,6 +22,7 @@ def command_levels_lin_vel(
     env_ids: Sequence[int],
     reward_term_name: str,
     range_multiplier: Sequence[float] = (0.1, 1.0),
+    success_fraction: float = 0.8,
 ) -> None:
     """command_levels_lin_vel"""
     base_velocity_ranges = env.command_manager.get_term("base_velocity").cfg.ranges
@@ -50,8 +51,8 @@ def command_levels_lin_vel(
         reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
         delta_command = torch.tensor([-0.1, 0.1], device=env.device)
 
-        # If the tracking reward is above 80% of the maximum, increase the range of commands
-        if torch.mean(episode_sums[env_ids]) / env.max_episode_length_s > 0.8 * reward_term_cfg.weight:
+        # If the tracking reward is above success_fraction of the maximum, increase command range
+        if torch.mean(episode_sums[env_ids]) / env.max_episode_length_s > success_fraction * reward_term_cfg.weight:
             cur_vel_x = torch.tensor(base_velocity_ranges.lin_vel_x, device=env.device)
             cur_vel_y = torch.tensor(base_velocity_ranges.lin_vel_y, device=env.device)
 

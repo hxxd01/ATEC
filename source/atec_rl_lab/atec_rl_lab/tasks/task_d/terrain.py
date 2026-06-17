@@ -169,19 +169,44 @@ class TaskDTerrainImporter(BetterTerrainImporter):
         )
 
 
-def configure_task_d_terrain_for_num_envs(terrain_cfg: TerrainImporterCfg, num_envs: int) -> TerrainImporterCfg:
-    """Expand pit grid to cover ``num_envs`` with isolated tiles (gap between cells)."""
-    num_rows, num_cols = task_d_terrain_grid_shape(num_envs)
+def configure_task_d_terrain_for_num_envs(
+    terrain_cfg: TerrainImporterCfg,
+    num_envs: int,
+    *,
+    curriculum_levels: int | None = None,
+) -> TerrainImporterCfg:
+    """Expand pit grid to cover ``num_envs`` with isolated tiles (gap between cells).
+
+    When ``curriculum_levels`` is set, bake ``curriculum_levels`` pit-width rows (difficulty 0..1)
+    and ``num_cols`` columns for parallel envs; curriculum moves envs to higher rows over training.
+    """
     terrain_cfg.num_envs = int(num_envs)
     gen = terrain_cfg.terrain_generator
-    gen.num_rows = num_rows
-    gen.num_cols = num_cols
     gen.size = TASK_D_CELL_SIZE
     gen.use_cache = True
-    gen.curriculum = False
     pit_cfg = gen.sub_terrains.get("pit_and_platform")
     if isinstance(pit_cfg, PitAndPlatformTerrainCfg):
         pit_cfg.playable_size = TASK_D_PLAYABLE_SIZE
+
+    if curriculum_levels is not None:
+        levels = max(2, int(curriculum_levels))
+        num_rows = levels
+        # One column per env on the starting (narrowest) row; rows hold wider pits for curriculum.
+        num_cols = int(num_envs)
+        gen.num_rows = num_rows
+        gen.num_cols = num_cols
+        gen.curriculum = True
+        if num_rows * num_cols > 8000:
+            print(
+                f"[TaskDTerrain] WARNING: baking {num_rows}x{num_cols}={num_rows * num_cols} pit tiles "
+                f"(slow / high memory). Consider --num_envs <= 512 for development.",
+                flush=True,
+            )
+    else:
+        num_rows, num_cols = task_d_terrain_grid_shape(num_envs)
+        gen.num_rows = num_rows
+        gen.num_cols = num_cols
+        gen.curriculum = False
     return terrain_cfg
 
 
