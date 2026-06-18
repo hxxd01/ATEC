@@ -160,10 +160,69 @@ parser.add_argument(
     default=1.0,
     help="Cap lateral push progress/reward at this many meters.",
 )
+
+# ── Task D pit MARG locomotion (parallel path; does NOT use TaskDStudentActorCritic) ──
+pit_grp = parser.add_argument_group(
+    "pit MARG locomotion",
+    "Train/play pit-crossing with MargActorCritic + pit env rewards/terminations. "
+    "Independent from depth student nav below.",
+)
+pit_grp.add_argument(
+    "--pit_marg_locomotion",
+    action="store_true",
+    help="Train pit MARG (height_map 187D). Exits before student nav setup.",
+)
+pit_grp.add_argument(
+    "--pit_marg_play",
+    action="store_true",
+    help="Play/eval pit MARG checkpoint (same env + network as --pit_marg_locomotion).",
+)
+pit_grp.add_argument(
+    "--pit_checkpoint",
+    type=str,
+    default=None,
+    help="Checkpoint for --pit_marg_play (or use --checkpoint).",
+)
+pit_grp.add_argument("--checkpoint", type=str, default=None, help="Alias for --pit_checkpoint in pit play mode.")
+pit_grp.add_argument("--pit_width_min", type=float, default=0.4)
+pit_grp.add_argument("--pit_width_max", type=float, default=1.4)
+pit_grp.add_argument("--pit_curriculum_levels", type=int, default=11)
+pit_grp.add_argument("--pit_level", type=int, default=0, help="Fixed pit-width row for --pit_marg_play.")
+pit_grp.add_argument("--pit_curriculum", action="store_true", help="Full pit-width curriculum during play.")
+pit_grp.add_argument("--command_vx_min", type=float, default=0.0, help="Pit train: min forward cmd (m/s).")
+pit_grp.add_argument("--command_vx_max", type=float, default=4.0, help="Pit train: max forward cmd (m/s).")
+pit_grp.add_argument(
+    "--command_vx",
+    type=float,
+    default=None,
+    help="Pit play: fixed forward cmd (m/s). Pit train: alias for --command_vx_max.",
+)
+pit_grp.add_argument(
+    "--command_curriculum_start",
+    type=float,
+    default=0.1,
+    help="Pit train: initial vx curriculum fraction.",
+)
+pit_grp.add_argument("--pit_sim_easy", action="store_true", help="Pit train: sim-easy crossing overrides.")
+pit_grp.add_argument("--pit_sim_easy_vx", type=float, default=1.0)
+pit_grp.add_argument("--pit_spawn_x_offset", type=float, default=0.0)
+pit_grp.add_argument("--pit_spawn_local_x", type=float, default=None)
+pit_grp.add_argument("--pit_warmup_steps", type=int, default=0, help="MARG history warmup before pit play video.")
+pit_grp.add_argument("--pit_stochastic", action="store_true", help="Stochastic actions during pit play.")
+pit_grp.add_argument("--pit_debug", action="store_true", help="Print pit play stats every 50 steps.")
+pit_grp.add_argument("--pit_real_time", action="store_true", help="Real-time pit play loop.")
+
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-# Student policy always reads head/ee camera buffers.
-args_cli.enable_cameras = True
+if args_cli.pit_marg_locomotion and args_cli.pit_marg_play:
+    parser.error("Use only one of --pit_marg_locomotion or --pit_marg_play.")
+if args_cli.pit_marg_play and not (args_cli.pit_checkpoint or args_cli.checkpoint):
+    parser.error("--pit_marg_play requires --pit_checkpoint or --checkpoint.")
+# Student policy reads head/ee camera buffers; pit MARG uses height_scanner only.
+if not args_cli.pit_marg_locomotion and not args_cli.pit_marg_play:
+    args_cli.enable_cameras = True
+elif args_cli.pit_marg_play and args_cli.video:
+    args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -571,6 +630,22 @@ def _dump_deploy_agent_yaml(
 
 
 def main():
+    if args_cli.pit_marg_locomotion or args_cli.pit_marg_play:
+        from atec_rl_lab.train.pit_marg.taskd_pit_marg_runner import play_pit_marg, train_pit_marg
+
+        if args_cli.pit_marg_play:
+            play_pit_marg(args_cli, simulation_app)
+        else:
+            log_dir = train_pit_marg(args_cli)
+            print(f"[INFO] Pit MARG train done. log_dir={log_dir}", flush=True)
+            print(
+                "[INFO] Deploy/play: "
+                "python scripts/train_nav_taskd_student.py --pit_marg_play "
+                f"--pit_checkpoint {log_dir}/model_<iter>.pt --headless --num_envs 1",
+                flush=True,
+            )
+        return
+
     device = args_cli.device if args_cli.device else "cuda"
 
     env_cfg = TaskDEnvB2Cfg()

@@ -46,6 +46,8 @@ class StuckNoProgress(ManagerTermBase):
         stuck_time_s: float = 3.0,
         progress_eps: float = 0.03,
         grace_time_s: float = 1.0,
+        command_name: str = "base_velocity",
+        min_cmd_speed: float = 0.2,
     ) -> torch.Tensor:
         if not self._initialized:
             self._stuck_step_threshold = max(1, int(stuck_time_s / env.step_dt))
@@ -65,10 +67,25 @@ class StuckNoProgress(ManagerTermBase):
         robot = env.scene[asset_cfg.name]
         robot_x = robot.data.root_pos_w[:, 0]
 
+        # Only count "stuck" when a meaningful planar velocity command is active.
+        cmd_xy_speed = torch.full((env.num_envs,), float("inf"), device=env.device, dtype=torch.float32)
+        if hasattr(env, "command_manager") and env.command_manager is not None:
+            try:
+                cmd = env.command_manager.get_command(command_name)
+                if cmd is not None:
+                    if cmd.shape[-1] >= 2:
+                        cmd_xy_speed = torch.linalg.vector_norm(cmd[:, :2], dim=-1)
+                    else:
+                        cmd_xy_speed = torch.abs(cmd[:, 0])
+            except Exception:
+                # If command lookup fails, preserve old behavior by continuing to count.
+                pass
+        has_move_command = cmd_xy_speed > min_cmd_speed
+
         progressed = robot_x > (self._max_x + self._progress_eps)
         self._max_x = torch.maximum(self._max_x, robot_x)
         self._stuck_counter = torch.where(
-            progressed,
+            progressed | (~has_move_command),
             torch.zeros_like(self._stuck_counter),
             torch.where(
                 past_grace,

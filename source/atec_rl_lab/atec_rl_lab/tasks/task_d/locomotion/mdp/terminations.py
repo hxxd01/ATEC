@@ -25,7 +25,7 @@ def robot_local_x(
 
 def pit_cross_local_x_success_mask(
     env: ManagerBasedRLEnv,
-    post_cross_distance: float = 0.5,
+    post_cross_distance: float = 1.5,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """True when robot local +x passes the pit far edge (+ optional buffer).
@@ -40,7 +40,7 @@ def pit_cross_local_x_success_mask(
 
 def pit_cross_local_x_success_done(
     env: ManagerBasedRLEnv,
-    post_cross_distance: float = 0.5,
+    post_cross_distance: float = 1.5,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Terminate on successful pit crossing (local x past pit far edge)."""

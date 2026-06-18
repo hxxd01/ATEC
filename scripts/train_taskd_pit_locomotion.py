@@ -3,9 +3,7 @@
 import argparse
 import os
 import sys
-from datetime import datetime
 
-# Prefer this repo's source tree over an editable install from another checkout.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _ATEC_RL_LAB_SRC = os.path.join(_REPO_ROOT, "source", "atec_rl_lab")
 if os.path.isdir(_ATEC_RL_LAB_SRC) and _ATEC_RL_LAB_SRC not in sys.path:
@@ -39,12 +37,25 @@ parser.add_argument(
     action="store_true",
     help="Use MARG asymmetric AC (estimator + elevation encoder + privileged critic + reg loss).",
 )
+parser.add_argument(
+    "--sim_easy",
+    action="store_true",
+    help="Sim-only easy crossing mode: no DR/noise, relaxed penalties, fixed forward command.",
+)
+parser.add_argument(
+    "--sim_easy_vx",
+    type=float,
+    default=1.0,
+    help="Fixed forward command speed used with --sim_easy (m/s).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+from datetime import datetime
 
 import gymnasium as gym
 from rsl_rl.runners import OnPolicyRunner
@@ -55,31 +66,24 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 import atec_rl_lab.train  # noqa: F401
 from atec_rl_lab.tasks.task_d.locomotion.env_cfg import (
     UnitreeB2PiperTaskDPitLocomotionEnvCfg,
-    UnitreeB2PiperTaskDPitLocomotionMargEnvCfg,
     refresh_task_d_pit_locomotion_terrain_cfg,
 )
 from atec_rl_lab.train.locomotion.velocity.config.quadruped.unitree_b2_piper.agents.rsl_rl_ppo_cfg import (
-    UnitreeB2PiperTaskDPitLocomotionMargPPORunnerCfg,
     UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg,
 )
-from atec_rl_lab.train.locomotion.marg.marg_actor_critic import MargActorCritic
-from atec_rl_lab.train.locomotion.marg.marg_ppo import MargPPO
-
-import rsl_rl.runners.on_policy_runner as _runner_mod
-
-_runner_mod.MargActorCritic = MargActorCritic
-_runner_mod.MargPPO = MargPPO
+from atec_rl_lab.train.pit_marg.taskd_pit_marg_runner import train_pit_marg
 
 
 def main():
-    device = args_cli.device if args_cli.device else "cuda"
+    if args_cli.marg:
+        args_cli.max_iter = args_cli.max_iterations
+        args_cli.pit_sim_easy = args_cli.sim_easy
+        args_cli.pit_sim_easy_vx = args_cli.sim_easy_vx
+        train_pit_marg(args_cli)
+        return
 
-    env_cfg_cls = (
-        UnitreeB2PiperTaskDPitLocomotionMargEnvCfg
-        if args_cli.marg
-        else UnitreeB2PiperTaskDPitLocomotionEnvCfg
-    )
-    env_cfg = env_cfg_cls()
+    device = args_cli.device if args_cli.device else "cuda"
+    env_cfg = UnitreeB2PiperTaskDPitLocomotionEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.pit_width_range = (float(args_cli.pit_width_min), float(args_cli.pit_width_max))
     env_cfg.pit_curriculum_levels = int(args_cli.pit_curriculum_levels)
@@ -90,11 +94,7 @@ def main():
     env_cfg.apply_command_config()
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
 
-    agent_cfg = (
-        UnitreeB2PiperTaskDPitLocomotionMargPPORunnerCfg()
-        if args_cli.marg
-        else UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg()
-    )
+    agent_cfg = UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg()
     agent_cfg.max_iterations = args_cli.max_iterations
     agent_cfg.device = device
 
@@ -104,7 +104,6 @@ def main():
 
     env = gym.make("ATEC-TaskD-PitLocomotion-B2Piper-v0", cfg=env_cfg)
     vec_env = RslRlVecEnvWrapper(env)
-
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
     if args_cli.resume:
         print(f"[INFO] Resuming from {args_cli.resume}", flush=True)
@@ -112,15 +111,7 @@ def main():
 
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-
     print(f"[INFO] Logging to {log_dir}", flush=True)
-    print(
-        f"[INFO] pit_width={env_cfg.pit_width_range}, levels={env_cfg.pit_curriculum_levels}, "
-        f"vx=[{env_cfg.command_lin_vel_x_min}, {env_cfg.command_lin_vel_x_max}] m/s "
-        f"(curriculum start_frac={env_cfg.command_curriculum_start_fraction}), "
-        f"num_envs={env_cfg.scene.num_envs}, marg={bool(args_cli.marg)}",
-        flush=True,
-    )
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
     env.close()
 

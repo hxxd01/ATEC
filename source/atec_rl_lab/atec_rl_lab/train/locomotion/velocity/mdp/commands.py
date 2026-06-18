@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
     """Command generator that generates a velocity command in SE(2) from uniform distribution with threshold.
 
-    This command generator automatically detects "pits" terrain and applies restrictions:
+    This command generator automatically detects pit terrain and applies restrictions:
     - For pit terrains: only allow forward movement (no lateral or rotational movement)
     """
 
@@ -43,7 +43,10 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
         """Resample velocity commands with threshold."""
         super()._resample_command(env_ids)
         # set small commands to zero
-        self.vel_command_b[env_ids, :2] *= (torch.norm(self.vel_command_b[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
+        threshold = float(self.cfg.zero_cmd_speed_threshold)
+        self.vel_command_b[env_ids, :2] *= (
+            torch.norm(self.vel_command_b[env_ids, :2], dim=1) > threshold
+        ).unsqueeze(1)
 
     def _update_command(self):
         """Update commands and apply terrain-aware restrictions in real-time.
@@ -57,8 +60,9 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
         # First, call parent's update command
         super()._update_command()
 
-        # Check which robots are currently on pit terrain (real-time check every step)
-        on_pits = is_robot_on_terrain(self._env, "pits")
+        # Check which robots are currently on pit terrain (real-time check every step).
+        # Task D uses "pit_and_platform"; keep legacy "pits" alias for compatibility.
+        on_pits = is_robot_on_terrain(self._env, "pit_and_platform") | is_robot_on_terrain(self._env, "pits")
 
         # Find robots that just left pit terrain (need to resample)
         left_pit_mask = self.was_on_pit & ~on_pits
@@ -89,6 +93,7 @@ class UniformThresholdVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
     """Configuration for the uniform threshold velocity command generator."""
 
     class_type: type = UniformThresholdVelocityCommand
+    zero_cmd_speed_threshold: float = 0.2
 
 
 class DiscreteCommandController(CommandTerm):

@@ -41,8 +41,24 @@ python scripts/play_atec_task.py --task ATEC-TaskA-B2Piper --headless --debug  -
 #看tensorboard
 source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && tensorboard --logdir=/home/ubuntu/ATEC2026_Simulation_Challenge/logs/rsl_rl/taskd_student_b2piper_depth --host 127.0.0.1 --port 6010
 source /home/zhongyuan/anaconda3/etc/profile.d/conda.sh && conda activate xxd && tensorboard --logdir=/home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper_depth --host 127.0.0.1 --port 6010
-
+python scripts/train_taskd_pit_locomotion.py \
+  --marg \
+  --pit_width_min 1.4 \
+  --pit_width_max 1.4 \
+  --pit_curriculum_levels 11 \
+  --num_envs 4096 \
+  --headless
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-18_21-47-57/model_1000.pt
 --device cuda:1
+
+python scripts/train_taskd_pit_locomotion.py \
+  --marg \
+  --pit_width_min 1.4 \
+  --pit_width_max 1.4 \
+  --pit_curriculum_levels 2 \
+  --num_envs 4096 \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-19_00-42-05/model_1200.pt \
+  --headless
 python scripts/train_nav_taskd_student.py \
   --ll_policy demo/policy.pt \
   --num_envs 32 \
@@ -62,7 +78,13 @@ python scripts/rsl_rl/play.py \
   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0 \
   --checkpoint logs/rsl_rl/unitree_b2_piper_rough/2026-05-22_22-16-08/model_3300.pt \
   --headless --video --video_length 2000
-
+python scripts/play_taskd_pit_locomotion.py \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-19_00-13-03/model_1100.pt \
+  --marg \
+  --pit_width_min 1.4 --pit_width_max 1.4 \
+  --num_envs 1 --command_vx 0.6 \
+  --headless \
+  --video --video_length 200 
 
 python scripts/rsl_rl/train.py \
   --task ATEC-Isaac-Velocity-Rough-Unitree-B2Piper-v0 \
@@ -165,3 +187,11 @@ python scripts/train_nav_taska_student.py \
   --time_penalty_per_env_step 0.002 \
   --device cuda:0 \
   --headless
+python scripts/play_taskd_pit_locomotion.py \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-19_01-17-22/model_1200.pt \
+  --marg \
+  --pit_width_min 1.4 --pit_width_max 1.4 \
+  --num_envs 1 \
+  --command_vx 0.6 \
+  --headless \
+  --video --video_length 200

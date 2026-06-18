@@ -17,6 +17,7 @@ from isaaclab.sensors import RayCasterCfg, patterns
 
 import atec_rl_lab.tasks.task_d.locomotion.mdp as task_d_loco_mdp
 import atec_rl_lab.train.locomotion.velocity.mdp as mdp
+from atec_rl_lab.tasks.task_a.mdp.terminations import StuckNoProgress
 from atec_rl_lab.tasks.task_d.locomotion.terrain_curriculum import (
     TaskDPitCurriculumTerrainImporter,
     TaskDPitTerrainGenerator,
@@ -204,8 +205,8 @@ class TaskDPitLocomotionCurriculumCfg(CurriculumCfg):
     pit_width_levels = CurrTerm(
         func=task_d_loco_mdp.task_d_pit_width_levels,
         params={
-            "reward_term_name": "track_lin_vel_xy_exp",
-            "success_fraction": 0.75,
+            "post_cross_distance": 1.5,
+            "success_term_name": "pit_cross_success",
         },
     )
 
@@ -217,9 +218,26 @@ class TaskDPitLocomotionTerminationsCfg(TerminationsCfg):
         params={"minimum_height": 0.25, "asset_cfg": SceneEntityCfg("robot")},
         time_out=False,
     )
+    bad_orientation = DoneTerm(
+        func=mdp.bad_orientation,
+        params={"limit_angle": 0.7, "asset_cfg": SceneEntityCfg("robot")},
+        time_out=False,
+    )
     pit_cross_success = DoneTerm(
         func=task_d_loco_mdp.pit_cross_local_x_success_done,
-        params={"post_cross_distance": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+        params={"post_cross_distance": 1.5, "asset_cfg": SceneEntityCfg("robot")},
+        time_out=False,
+    )
+    stuck_no_progress = DoneTerm(
+        func=StuckNoProgress,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "stuck_time_s": 2.5,
+            "progress_eps": 0.03,
+            "grace_time_s": 1.0,
+            "command_name": "base_velocity",
+            "min_cmd_speed": 0.2,
+        },
         time_out=False,
     )
 
@@ -239,11 +257,34 @@ class UnitreeB2PiperTaskDPitLocomotionEnvCfg(UnitreeB2PiperRoughEnvCfg):
     command_lin_vel_x_min: float = 0.0
     command_lin_vel_x_max: float = 4.0
     command_curriculum_start_fraction: float = 0.1
-    upward_reward_weight: float = 3.0
-    track_lin_vel_xy_reward_weight: float = 6.0
+    command_zero_speed_threshold: float = 0.0
+    marg_track_lin_vel_xy_weight: float = 0.0
+    marg_track_ang_vel_z_weight: float = 0.0
+    marg_lin_vel_z_l2_weight: float = -2.0
+    marg_ang_vel_xy_l2_weight: float = -0.05
+    marg_joint_torque_l2_weight: float = -1.0e-5
+    marg_action_rate_l2_weight: float = -0.01
+    marg_joint_acc_l2_weight: float = -2.5e-7
+    marg_collision_weight: float = -1.0
+    marg_orientation_l2_weight: float = -0.2
+    marg_joint_motion_limit_weight: float = -0.02
+    marg_feet_air_time_weight: float = 1.0
+    marg_feet_stumble_weight: float = -1.0
+    marg_feet_center_weight: float = -0.01
     forward_progress_reward_weight: float = 8.0
-    pit_success_post_cross_distance: float = 0.5
-    pit_cross_success_reward: float = 30.0
+    forward_vx_speed_capped_reward_weight: float = 10.0
+    forward_vx_speed_cap_mps: float = 5.0
+    upward_reward_weight: float = 2.0
+    pit_cross_success_reward_weight: float = 1.0
+    pit_cross_success_reward_value: float = 500.0
+    pit_success_post_cross_distance: float = 1.5
+    fall_minimum_height: float = 0.25
+    bad_orientation_limit_angle: float = 0.7
+    no_progress_stuck_time_s: float = 4.0
+    no_progress_eps: float = 0.03
+    no_progress_grace_time_s: float = 2.0
+    no_progress_command_name: str = "base_velocity"
+    no_progress_min_cmd_speed: float = 0.2
     disable_dr_and_obs_noise: bool = True
 
     def apply_command_config(self) -> None:
@@ -260,6 +301,7 @@ class UnitreeB2PiperTaskDPitLocomotionEnvCfg(UnitreeB2PiperRoughEnvCfg):
         self.commands.base_velocity.heading_command = False
         self.commands.base_velocity.rel_standing_envs = 0.0
         self.commands.base_velocity.resampling_time_range = (10.0, 10.0)
+        self.commands.base_velocity.zero_cmd_speed_threshold = float(self.command_zero_speed_threshold)
 
     def _disable_dr_and_obs_noise(self) -> None:
         """Turn off domain randomization and observation noise/corruption only."""
@@ -282,6 +324,144 @@ class UnitreeB2PiperTaskDPitLocomotionEnvCfg(UnitreeB2PiperRoughEnvCfg):
                 term = getattr(group, term_name, None)
                 if term is not None and hasattr(term, "noise"):
                     term.noise = None
+
+    def _align_task_rewards(self) -> None:
+        """Align reward terms to MARG Table I."""
+        keep = {
+            "forward_progress",
+            "forward_vx_speed_capped",
+            "upward",
+            "pit_cross_success",
+            "track_lin_vel_xy_exp",
+            "track_ang_vel_z_exp",
+            "lin_vel_z_l2",
+            "ang_vel_xy_l2",
+            "joint_torques_l2",
+            "action_rate_l2",
+            "joint_acc_l2",
+            "undesired_contacts",
+            "flat_orientation_l2",
+            "joint_pos_penalty",
+            "feet_air_time",
+            "feet_stumble",
+            "feet_center",
+        }
+        for reward_name in dir(self.rewards):
+            if reward_name.startswith("_"):
+                continue
+            reward_term = getattr(self.rewards, reward_name, None)
+            if reward_term is None or callable(reward_term):
+                continue
+            if reward_name not in keep:
+                setattr(self.rewards, reward_name, None)
+
+        self.rewards.forward_progress = RewTerm(
+            func=task_d_loco_mdp.forward_world_x_progress,
+            weight=float(self.forward_progress_reward_weight),
+        )
+        if float(self.forward_vx_speed_capped_reward_weight) > 0.0:
+            self.rewards.forward_vx_speed_capped = RewTerm(
+                func=task_d_loco_mdp.forward_world_x_speed_capped,
+                weight=float(self.forward_vx_speed_capped_reward_weight),
+                params={
+                    "asset_cfg": SceneEntityCfg("robot"),
+                    "v_cap": float(self.forward_vx_speed_cap_mps),
+                },
+            )
+        else:
+            self.rewards.forward_vx_speed_capped = None
+        if float(self.upward_reward_weight) > 0.0:
+            self.rewards.upward = RewTerm(
+                func=mdp.upward,
+                weight=float(self.upward_reward_weight),
+            )
+        else:
+            self.rewards.upward = None
+        if float(self.pit_cross_success_reward_weight) > 0.0:
+            self.rewards.pit_cross_success = RewTerm(
+                func=task_d_loco_mdp.PitCrossSuccessBonus,
+                weight=float(self.pit_cross_success_reward_weight),
+                params={
+                    "reward_value": float(self.pit_cross_success_reward_value),
+                    "post_cross_distance": float(self.pit_success_post_cross_distance),
+                    "asset_cfg": SceneEntityCfg("robot"),
+                },
+            )
+        else:
+            self.rewards.pit_cross_success = None
+        if float(self.marg_track_lin_vel_xy_weight) > 0.0:
+            self.rewards.track_lin_vel_xy_exp = RewTerm(
+                func=mdp.track_lin_vel_xy_exp,
+                weight=float(self.marg_track_lin_vel_xy_weight),
+                params={"command_name": "base_velocity", "std": 0.5},
+            )
+        else:
+            self.rewards.track_lin_vel_xy_exp = None
+        if float(self.marg_track_ang_vel_z_weight) > 0.0:
+            self.rewards.track_ang_vel_z_exp = RewTerm(
+                func=mdp.track_ang_vel_z_exp,
+                weight=float(self.marg_track_ang_vel_z_weight),
+                params={"command_name": "base_velocity", "std": 0.5},
+            )
+        else:
+            self.rewards.track_ang_vel_z_exp = None
+        self.rewards.lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=float(self.marg_lin_vel_z_l2_weight))
+        self.rewards.ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=float(self.marg_ang_vel_xy_l2_weight))
+        self.rewards.joint_torques_l2 = RewTerm(
+            func=mdp.joint_torques_l2,
+            weight=float(self.marg_joint_torque_l2_weight),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=self.joint_names)},
+        )
+        self.rewards.action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=float(self.marg_action_rate_l2_weight))
+        self.rewards.joint_acc_l2 = RewTerm(
+            func=mdp.joint_acc_l2,
+            weight=float(self.marg_joint_acc_l2_weight),
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=self.joint_names)},
+        )
+        self.rewards.undesired_contacts = RewTerm(
+            func=mdp.undesired_contacts,
+            weight=float(self.marg_collision_weight),
+            params={
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=[f"^(?!.*{self.foot_link_name}).*"]
+                ),
+                "threshold": 1.0,
+            },
+        )
+        self.rewards.flat_orientation_l2 = RewTerm(
+            func=mdp.flat_orientation_l2,
+            weight=float(self.marg_orientation_l2_weight),
+        )
+        self.rewards.joint_pos_penalty = RewTerm(
+            func=mdp.joint_pos_penalty,
+            weight=float(self.marg_joint_motion_limit_weight),
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": SceneEntityCfg("robot", joint_names=self.joint_names),
+                "stand_still_scale": 1.0,
+                "velocity_threshold": 0.0,
+                "command_threshold": 0.0,
+            },
+        )
+        self.rewards.feet_air_time = RewTerm(
+            func=mdp.feet_air_time,
+            weight=float(self.marg_feet_air_time_weight),
+            params={
+                "command_name": "base_velocity",
+                "threshold": 0.5,
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[self.foot_link_name]),
+            },
+        )
+        self.rewards.feet_stumble = RewTerm(
+            func=mdp.feet_stumble,
+            weight=float(self.marg_feet_stumble_weight),
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[self.foot_link_name])},
+        )
+        self.rewards.feet_center = RewTerm(
+            func=task_d_loco_mdp.marg_feet_center_penalty,
+            weight=float(self.marg_feet_center_weight),
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
 
     def _build_terrain_cfg(self):
         num_envs = int(self.scene.num_envs)
@@ -327,42 +507,66 @@ class UnitreeB2PiperTaskDPitLocomotionEnvCfg(UnitreeB2PiperRoughEnvCfg):
             critic_obs.height_scan = None
         self.curriculum.terrain_levels = None
         self.disable_zero_weight_rewards()
-        # Parent rough cfg disables command curriculum; restore for pit locomotion.
-        self.curriculum.command_levels_lin_vel = CurrTerm(
-            func=mdp.command_levels_lin_vel,
+        # Enable velocity command curriculum only when xy tracking reward is active.
+        if float(self.marg_track_lin_vel_xy_weight) > 0.0:
+            self.curriculum.command_levels_lin_vel = CurrTerm(
+                func=mdp.command_levels_lin_vel,
+                params={
+                    "reward_term_name": "track_lin_vel_xy_exp",
+                    "range_multiplier": (
+                        float(self.command_curriculum_start_fraction),
+                        1.0,
+                    ),
+                    "success_fraction": 0.6,
+                },
+            )
+        else:
+            self.curriculum.command_levels_lin_vel = None
+        self.curriculum.pit_width_levels = CurrTerm(
+            func=task_d_loco_mdp.task_d_pit_width_levels,
             params={
-                "reward_term_name": "track_lin_vel_xy_exp",
-                "range_multiplier": (
-                    float(self.command_curriculum_start_fraction),
-                    1.0,
-                ),
-                "success_fraction": 0.6,
+                "post_cross_distance": float(self.pit_success_post_cross_distance),
+                "success_term_name": "pit_cross_success",
             },
         )
         if self.scene.terrain.terrain_generator is not None:
             self.scene.terrain.terrain_generator.curriculum = True
 
-        self.rewards.forward_progress = RewTerm(
-            func=task_d_loco_mdp.forward_world_x_progress,
-            weight=float(self.forward_progress_reward_weight),
-        )
-        self.rewards.pit_cross_success = RewTerm(
-            func=task_d_loco_mdp.PitCrossSuccessBonus,
-            weight=1.0,
+        self._align_task_rewards()
+
+        self.terminations.fall_in_pit = DoneTerm(
+            func=mdp.root_height_below_minimum,
             params={
-                "reward_value": float(self.pit_cross_success_reward),
-                "post_cross_distance": float(self.pit_success_post_cross_distance),
+                "minimum_height": float(self.fall_minimum_height),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
+            time_out=False,
         )
-        self.rewards.upward.weight = float(self.upward_reward_weight)
-        self.rewards.track_lin_vel_xy_exp.weight = float(self.track_lin_vel_xy_reward_weight)
-
+        self.terminations.bad_orientation = DoneTerm(
+            func=mdp.bad_orientation,
+            params={
+                "limit_angle": float(self.bad_orientation_limit_angle),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+            time_out=False,
+        )
         self.terminations.pit_cross_success = DoneTerm(
             func=task_d_loco_mdp.pit_cross_local_x_success_done,
             params={
                 "post_cross_distance": float(self.pit_success_post_cross_distance),
                 "asset_cfg": SceneEntityCfg("robot"),
+            },
+            time_out=False,
+        )
+        self.terminations.stuck_no_progress = DoneTerm(
+            func=StuckNoProgress,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "stuck_time_s": float(self.no_progress_stuck_time_s),
+                "progress_eps": float(self.no_progress_eps),
+                "grace_time_s": float(self.no_progress_grace_time_s),
+                "command_name": str(self.no_progress_command_name),
+                "min_cmd_speed": float(self.no_progress_min_cmd_speed),
             },
             time_out=False,
         )
@@ -387,10 +591,17 @@ class UnitreeB2PiperTaskDPitLocomotionEnvCfg(UnitreeB2PiperRoughEnvCfg):
         dr_msg = ", no DR/no-noise" if self.disable_dr_and_obs_noise else ""
         print(
             f"[TaskDPitLoco] command vx curriculum: [{vx_min:.1f}, {init_vx_max:.1f}] -> [{vx_min:.1f}, {vx_max:.1f}] m/s, "
-            f"rewards: forward={self.forward_progress_reward_weight}, "
-            f"track_vel_xy={self.track_lin_vel_xy_reward_weight}, upward={self.upward_reward_weight}, "
-            f"pit_cross_success={self.pit_cross_success_reward}, "
-            f"terminations=fall_in_pit+pit_cross_success, spawn=TaskD default{dr_msg}, no depth",
+            "rewards=MARG Table I aligned "
+            f"+ task-drive(forward={self.forward_progress_reward_weight}, "
+            f"vx_capped={self.forward_vx_speed_capped_reward_weight}@cap={self.forward_vx_speed_cap_mps:.1f}, "
+            f"upward={self.upward_reward_weight}, "
+            f"pit_success={self.pit_cross_success_reward_weight}x{self.pit_cross_success_reward_value:.0f}) "
+            f"(lin_xy={self.marg_track_lin_vel_xy_weight}, ang_z={self.marg_track_ang_vel_z_weight}, "
+            f"feet_center={self.marg_feet_center_weight}), "
+            f"terminations=fall_in_pit(z<{self.fall_minimum_height})+"
+            f"bad_orientation(>{self.bad_orientation_limit_angle:.2f}rad)+"
+            f"stuck_no_progress({self.no_progress_stuck_time_s:.1f}s)+pit_cross_success, "
+            f"spawn=TaskD default{dr_msg}, no depth",
             flush=True,
         )
 
@@ -417,7 +628,7 @@ class UnitreeB2PiperTaskDPitLocomotionMargEnvCfg(UnitreeB2PiperTaskDPitLocomotio
 
         print(
             "[TaskDPitLoco-MARG] obs=proprio(43)+history(258)+height(187), "
-            "critic_priv(42), flat rewards (forward+track+upward), MargActorCritic",
+            "critic_priv(42), MARG Table-I rewards, MargActorCritic",
             flush=True,
         )
 

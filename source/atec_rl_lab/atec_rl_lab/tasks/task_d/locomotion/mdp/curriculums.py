@@ -7,12 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from atec_rl_lab.tasks.task_d.locomotion.pit_geometry import (
-    pit_cross_world_x,
-    pit_width_from_level,
-    _read_max_level,
-    _read_width_range,
-)
+from atec_rl_lab.tasks.task_d.locomotion.mdp.terminations import pit_cross_local_x_success_mask
+from atec_rl_lab.tasks.task_d.locomotion.pit_geometry import pit_width_from_level, _read_max_level, _read_width_range
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -21,10 +17,14 @@ if TYPE_CHECKING:
 def task_d_pit_width_levels(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
-    reward_term_name: str = "track_lin_vel_xy_exp",
-    success_fraction: float = 0.75,
+    post_cross_distance: float = 1.5,
+    success_term_name: str = "pit_cross_success",
 ) -> torch.Tensor:
-    """Promote envs to wider pits when velocity-tracking reward is strong or pit is crossed."""
+    """Promote only reset envs after true pit-cross success.
+
+    This keeps pit-width curriculum aligned with episode success criteria and avoids
+    global promotion from partial/temporary crossings in other environments.
+    """
     terrain = env.scene.terrain
     if not hasattr(terrain, "terrain_levels") or not hasattr(terrain, "update_env_origins_from_levels"):
         return torch.tensor(0.0, device=env.device)
@@ -37,28 +37,21 @@ def task_d_pit_width_levels(
     width_range = _read_width_range(env)
 
     promote = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    if env.common_step_counter % env.max_episode_length == 0:
-        reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
-        episode_sums = env.reward_manager._episode_sums[reward_term_name]
-        mean_rew = torch.mean(episode_sums[env_ids_t]) / env.max_episode_length_s
-        promote[env_ids_t] = mean_rew > success_fraction * reward_term_cfg.weight
+    if success_term_name in env.termination_manager.active_terms:
+        success_done = env.termination_manager.get_term(success_term_name)
+        promote[env_ids_t] = success_done[env_ids_t]
+    else:
+        success = pit_cross_local_x_success_mask(env, post_cross_distance=post_cross_distance)
+        promote[env_ids_t] = success[env_ids_t]
 
-    robot = env.scene["robot"]
-    crossed = robot.data.root_pos_w[:, 0] >= pit_cross_world_x(env)
-    promote |= crossed
+    promoted_ids = promote.nonzero(as_tuple=True)[0]
+    if promoted_ids.numel() > 0:
+        if hasattr(terrain, "promote_terrain_levels"):
+            terrain.promote_terrain_levels(promoted_ids, max_level=max_level)
+        else:
+            new_levels = terrain.terrain_levels.clone()
+            new_levels[promoted_ids] = torch.clamp(new_levels[promoted_ids] + 1, max=max_level)
+            terrain.update_env_origins_from_levels(new_levels, env_ids=promoted_ids)
 
-    new_levels = terrain.terrain_levels.clone()
-    new_levels[promote] = torch.clamp(new_levels[promote] + 1, max=max_level)
-    if promote.any():
-        terrain.update_env_origins_from_levels(new_levels)
-
-    mean_level = terrain.terrain_levels.float().mean()
     mean_width = pit_width_from_level(terrain.terrain_levels, width_range, max_level).mean()
-    if env.common_step_counter % env.max_episode_length == 0:
-        print(
-            f"[TaskDPitCurriculum] mean_level={mean_level.item():.2f} "
-            f"mean_width={mean_width.item():.3f}m "
-            f"promoted={int(promote.sum().item())}/{env.num_envs}",
-            flush=True,
-        )
     return mean_width

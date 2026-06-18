@@ -37,6 +37,7 @@ class MargActorCritic(nn.Module):
         critic_hidden_dims: list | None = None,
         activation: str = "relu",
         init_noise_std: float = 1.0,
+        max_noise_std: float = 2.0,
         noise_std_type: str = "scalar",
         proprio_dim: int = MARG_PROPRIO_DIM,
         history_dim: int = MARG_HISTORY_DIM,
@@ -90,6 +91,8 @@ class MargActorCritic(nn.Module):
         )
 
         self.noise_std_type = noise_std_type
+        self.max_noise_std = float(max_noise_std)
+        self.min_noise_std = 1e-3
         if noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif noise_std_type == "log":
@@ -103,7 +106,8 @@ class MargActorCritic(nn.Module):
         print(
             f"[MargActorCritic] estimator {self.history_dim}->{self.estimator_out_dim}, "
             f"elevation {self.height_map_dim}->{self.elevation_out_dim}, "
-            f"actor_in={actor_in}, critic_in={critic_in}",
+            f"actor_in={actor_in}, critic_in={critic_in}, "
+            f"noise_std=[{init_noise_std:.2f}, {self.max_noise_std:.2f}]",
             flush=True,
         )
         print(f"[MargActorCritic] actor MLP: {self.actor}", flush=True)
@@ -161,12 +165,16 @@ class MargActorCritic(nn.Module):
         elev_out = self.elevation(height)
         return torch.cat([proprio, priv, elev_out], dim=-1)
 
-    def update_distribution(self, actor_obs: torch.Tensor):
-        mean = self.actor(actor_obs)
+    def _clamped_action_std(self, mean: torch.Tensor) -> torch.Tensor:
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         else:
             std = torch.exp(self.log_std).expand_as(mean)
+        return torch.clamp(std, min=self.min_noise_std, max=self.max_noise_std)
+
+    def update_distribution(self, actor_obs: torch.Tensor):
+        mean = self.actor(actor_obs)
+        std = self._clamped_action_std(mean)
         self.distribution = Normal(mean, std)
 
     def act(self, obs, **kwargs):

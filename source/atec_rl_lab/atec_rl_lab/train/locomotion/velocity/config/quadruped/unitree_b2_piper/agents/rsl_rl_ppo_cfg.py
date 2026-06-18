@@ -52,7 +52,8 @@ class MargActorCriticCfg(RslRlPpoActorCriticCfg):
     actor_hidden_dims: list = [512, 256, 128]
     critic_hidden_dims: list = [512, 256, 128]
     activation: str = "relu"
-    init_noise_std: float = 1.0
+    init_noise_std: float = 0.6
+    max_noise_std: float = 2.0
     estimator_hidden_dims: list = [128]
     elevation_hidden_dims: list = [128, 64]
 
@@ -64,7 +65,7 @@ class MargPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     value_loss_coef: float = 1.0
     use_clipped_value_loss: bool = True
     clip_param: float = 0.2
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.005
     num_learning_epochs: int = 5
     num_mini_batches: int = 4
     learning_rate: float = 1.0e-3
@@ -81,7 +82,9 @@ class UnitreeB2PiperTaskDPitLocomotionMargPPORunnerCfg(UnitreeB2PiperFlatPPORunn
     experiment_name = "taskd_pit_locomotion_b2piper_marg"
     obs_groups = {
         "policy": ["proprio", "proprio_history", "height_map"],
-        "critic": ["proprio", "proprio_history", "height_map", "critic_priv"],
+        # Asymmetric critic uses proprio + elevation(height_map) + privileged state.
+        # Proprio history is only for estimator in actor path.
+        "critic": ["proprio", "height_map", "critic_priv"],
     }
     policy = MargActorCriticCfg()
     algorithm = MargPpoAlgorithmCfg()

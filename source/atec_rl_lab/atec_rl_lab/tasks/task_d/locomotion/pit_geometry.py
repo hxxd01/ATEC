@@ -103,7 +103,7 @@ def pit_cross_world_x(env) -> torch.Tensor:
     return env.scene.env_origins[:, 0] + pit_cross_local_x(env)
 
 
-def pit_success_local_x(env, post_cross_distance: float = 0.5) -> torch.Tensor:
+def pit_success_local_x(env, post_cross_distance: float = 1.5) -> torch.Tensor:
     """Local +x from ``env_origin`` required for a successful pit crossing."""
     return pit_cross_local_x(env) + float(post_cross_distance)
 
