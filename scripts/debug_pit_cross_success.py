@@ -25,6 +25,7 @@ import gymnasium as gym
 import torch
 
 import atec_rl_lab.tasks  # noqa: F401
+from atec_rl_lab.tasks.task_d.locomotion.mdp.events import TASK_D_PIT_MARG_SPAWN_Z
 from atec_rl_lab.tasks.task_d.locomotion.env_cfg import UnitreeB2PiperTaskDPitLocomotionEnvCfg
 from atec_rl_lab.tasks.task_d.locomotion.pit_geometry import (
     log_pit_threshold_reference,
@@ -92,7 +93,7 @@ def main():
     env_ids = torch.tensor([0], device=unwrapped.device, dtype=torch.long)
     pose = robot.data.root_pos_w[0].clone()
     pose[0] = success_x[0] + 0.05
-    pose[2] = 0.8
+    pose[2] = float(TASK_D_PIT_MARG_SPAWN_Z)
     quat = robot.data.root_quat_w[0]
     robot.write_root_pose_to_sim(torch.cat([pose, quat]).unsqueeze(0), env_ids=env_ids)
     robot.write_root_velocity_to_sim(torch.zeros(1, 6, device=unwrapped.device), env_ids=env_ids)

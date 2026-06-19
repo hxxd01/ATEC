@@ -55,11 +55,15 @@ class TaskDMargDepthPitE2EEnv(gym.Wrapper):
         depth_render_w: int | None = None,
         include_teacher_obs: bool = False,
         marg_from_obs_manager: bool = False,
+        head_depth_only: bool | None = None,
     ):
         super().__init__(env)
         self._device = device
         self._include_teacher_obs = bool(include_teacher_obs)
         self._marg_from_obs_manager = bool(marg_from_obs_manager)
+        if head_depth_only is None:
+            head_depth_only = bool(getattr(self.unwrapped.cfg, "head_depth_only", True))
+        self._head_depth_only = bool(head_depth_only)
         self._image_h = int(image_h)
         self._image_w = int(image_w)
         self._depth_render_h = int(depth_render_h) if depth_render_h is not None else self._image_h
@@ -68,7 +72,8 @@ class TaskDMargDepthPitE2EEnv(gym.Wrapper):
         self._depth_only = bool(depth_only)
         self._img_channels = 1 if self._depth_only else 4
         self._depth_flat_per_cam = self._img_channels * self._image_h * self._image_w
-        self._depth_dim = 2 * self._depth_flat_per_cam
+        num_cams = 1 if self._head_depth_only else 2
+        self._depth_dim = num_cams * self._depth_flat_per_cam
 
         self.num_envs = int(self.unwrapped.num_envs)
         self.device = self._device
@@ -100,10 +105,11 @@ class TaskDMargDepthPitE2EEnv(gym.Wrapper):
         self._cached_obs: dict[str, torch.Tensor] | None = None
         teacher_msg = f"+height_map({MARG_HEIGHT_MAP_DIM})" if self._include_teacher_obs else ""
         marg_src = "obs_manager" if self._marg_from_obs_manager else "wrapper"
+        cam_tag = "head" if self._head_depth_only else "head+ee"
         print(
             f"[TaskDMargDepthPitE2E] obs=proprio({MARG_PROPRIO_DIM})+history({MARG_HISTORY_DIM})+"
             f"depth({self._depth_dim})+critic_priv({MARG_CRITIC_PRIV_DIM}){teacher_msg}, "
-            f"marg_src={marg_src}, depth={self._img_channels}ch head+ee @ {self._image_h}x{self._image_w}, "
+            f"marg_src={marg_src}, depth={self._img_channels}ch {cam_tag} @ {self._image_h}x{self._image_w}, "
             f"actions={LEG_ACTION_DIM}",
             flush=True,
         )
@@ -125,8 +131,6 @@ class TaskDMargDepthPitE2EEnv(gym.Wrapper):
             x,
             image_h=self._image_h,
             image_w=self._image_w,
-            depth_render_h=self._depth_render_h,
-            depth_render_w=self._depth_render_w,
             depth_max=self._depth_max,
         )
 
@@ -190,8 +194,11 @@ class TaskDMargDepthPitE2EEnv(gym.Wrapper):
         else:
             obs = self._marg_obs_manual(batch)
         head = self._camera_depth_flat("head_camera", batch)
-        ee = self._camera_depth_flat("ee_camera", batch)
-        obs["depth"] = torch.cat([head, ee], dim=-1)
+        if self._head_depth_only:
+            obs["depth"] = head
+        else:
+            ee = self._camera_depth_flat("ee_camera", batch)
+            obs["depth"] = torch.cat([head, ee], dim=-1)
         return obs
 
     def get_observations(self) -> tuple[dict[str, torch.Tensor], dict]:

@@ -50,6 +50,7 @@ class MargDepthPitActorCritic(nn.Module):
         estimator_hidden_dims: list | None = None,
         depth_hidden_dims: list | None = None,
         elevation_out_dim: int = MARG_ELEVATION_OUT_DIM,
+        head_depth_only: bool | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -70,7 +71,20 @@ class MargDepthPitActorCritic(nn.Module):
         self.img_w = int(img_w)
         self.depth_channels = int(depth_channels)
         self.depth_flat_per_cam = self.depth_channels * self.img_h * self.img_w
-        self.depth_dim = int(depth_dim) if depth_dim is not None else 2 * self.depth_flat_per_cam
+        if depth_dim is None and isinstance(obs, dict) and "depth" in obs:
+            depth_dim = int(obs["depth"].shape[-1])
+        if depth_dim is None:
+            depth_dim = self.depth_flat_per_cam if head_depth_only else 2 * self.depth_flat_per_cam
+        if head_depth_only is None:
+            head_depth_only = int(depth_dim) <= self.depth_flat_per_cam
+        self.depth_dim = int(depth_dim)
+        self.head_depth_only = bool(head_depth_only)
+        self.num_depth_cams = max(1, self.depth_dim // self.depth_flat_per_cam)
+        if self.depth_dim != self.num_depth_cams * self.depth_flat_per_cam:
+            raise ValueError(
+                f"depth_dim {self.depth_dim} is not a multiple of per-cam flat "
+                f"{self.depth_flat_per_cam} ({self.depth_channels}x{self.img_h}x{self.img_w})"
+            )
         self.proprio_dim = int(proprio_dim)
         self.history_dim = int(history_dim)
         self.critic_priv_dim = int(critic_priv_dim)
@@ -81,8 +95,12 @@ class MargDepthPitActorCritic(nn.Module):
 
         self.estimator = MLP(self.history_dim, self.estimator_out_dim, estimator_hidden_dims, activation)
         self.head_depth_encoder = ConvEncoder(in_ch=self.depth_channels, out_dim=enc_dim)
-        self.ee_depth_encoder = ConvEncoder(in_ch=self.depth_channels, out_dim=enc_dim)
-        self.depth_fusion = MLP(enc_dim + enc_dim, self.elevation_out_dim, depth_hidden_dims, activation)
+        if self.head_depth_only:
+            self.ee_depth_encoder = None
+            self.depth_fusion = MLP(enc_dim, self.elevation_out_dim, depth_hidden_dims, activation)
+        else:
+            self.ee_depth_encoder = ConvEncoder(in_ch=self.depth_channels, out_dim=enc_dim)
+            self.depth_fusion = MLP(enc_dim + enc_dim, self.elevation_out_dim, depth_hidden_dims, activation)
 
         actor_in = self.proprio_dim + self.estimator_out_dim + self.elevation_out_dim
         critic_in = self.proprio_dim + self.critic_priv_dim + self.elevation_out_dim
@@ -112,9 +130,10 @@ class MargDepthPitActorCritic(nn.Module):
         self.distribution = None
         Normal.set_default_validate_args(False)
 
+        cam_tag = "head" if self.head_depth_only else "head+ee"
         print(
             f"[MargDepthPitActorCritic] estimator {self.history_dim}->{self.estimator_out_dim}, "
-            f"depth CNN 2x{self.depth_channels}x{self.img_h}x{self.img_w}->{self.elevation_out_dim}, "
+            f"depth CNN {cam_tag} {self.depth_channels}x{self.img_h}x{self.img_w}->{self.elevation_out_dim}, "
             f"actor_in={actor_in}, critic_in={critic_in}, actions={num_actions}",
             flush=True,
         )
@@ -134,21 +153,28 @@ class MargDepthPitActorCritic(nn.Module):
                     f"Observation '{key}' dim {obs[key].shape[-1]} != expected {dim}."
                 )
 
-    def _split_depth(self, depth_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        half = self.depth_flat_per_cam
-        if depth_flat.shape[-1] != 2 * half:
-            raise ValueError(
-                f"depth dim {depth_flat.shape[-1]} != expected {2 * half} "
-                f"(2 x {self.depth_channels}x{self.img_h}x{self.img_w})"
-            )
+    def _reshape_head_depth(self, depth_flat: torch.Tensor) -> torch.Tensor:
         batch = depth_flat.shape[0]
-        head = depth_flat[:, :half].reshape(batch, self.depth_channels, self.img_h, self.img_w)
-        ee = depth_flat[:, half:].reshape(batch, self.depth_channels, self.img_h, self.img_w)
-        return head, ee
+        if self.head_depth_only:
+            flat = depth_flat
+        else:
+            flat = depth_flat[:, : self.depth_flat_per_cam]
+        return flat.reshape(batch, self.depth_channels, self.img_h, self.img_w)
+
+    def _reshape_ee_depth(self, depth_flat: torch.Tensor) -> torch.Tensor:
+        batch = depth_flat.shape[0]
+        ee = depth_flat[:, self.depth_flat_per_cam :]
+        return ee.reshape(batch, self.depth_channels, self.img_h, self.img_w)
 
     def _encode_depth(self, depth_flat: torch.Tensor) -> torch.Tensor:
-        head, ee = self._split_depth(depth_flat)
-        feat = torch.cat([self.head_depth_encoder(head), self.ee_depth_encoder(ee)], dim=-1)
+        head = self._reshape_head_depth(depth_flat)
+        head_feat = self.head_depth_encoder(head)
+        if self.head_depth_only:
+            return self.depth_fusion(head_feat)
+        if self.ee_depth_encoder is None:
+            raise RuntimeError("ee_depth_encoder missing in dual-camera mode")
+        ee = self._reshape_ee_depth(depth_flat)
+        feat = torch.cat([head_feat, self.ee_depth_encoder(ee)], dim=-1)
         return self.depth_fusion(feat)
 
     def reset(self, dones=None):

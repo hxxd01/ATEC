@@ -66,6 +66,63 @@ parser.add_argument(
     default=0,
     help="Steps before recording (fills MARG proprio history; try 30-60).",
 )
+parser.add_argument(
+    "--pit_dr_light",
+    action="store_true",
+    help="Match train reset DR (joints, spawn xy/z/yaw, init velocity). Default: fixed spawn.",
+)
+parser.add_argument(
+    "--pit_spawn_x_jitter",
+    type=float,
+    default=None,
+    help="Override spawn x jitter (m). With --pit_dr_light defaults to 0.5.",
+)
+parser.add_argument("--pit_dr_spawn_y_jitter", type=float, default=None, help="Override robot spawn y jitter toward right (m), [0, value]. Default 0.5.")
+parser.add_argument(
+    "--pit_dr_spawn_z",
+    type=float,
+    default=None,
+    help="DR spawn base z (m). Default 0.545 with --pit_dr_light.",
+)
+parser.add_argument("--pit_dr_spawn_z_jitter", type=float, default=None, help="DR spawn z jitter ± (m).")
+parser.add_argument(
+    "--pit_dr_yaw_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("MIN", "MAX"),
+    help="Yaw random range in rad (default -0.15 0.15 with --pit_dr_light).",
+)
+parser.add_argument(
+    "--pit_dr_joint_scale",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("MIN", "MAX"),
+    help="Joint reset scale range (default 0.5 1.5 with --pit_dr_light).",
+)
+parser.add_argument(
+    "--no_pit_box",
+    action="store_true",
+    help="Disable Task D push box (box on by default at teleop pushed pose).",
+)
+parser.add_argument(
+    "--pit_box_default_spawn",
+    action="store_true",
+    help="Use Task D default box spawn (1.2, 1.6, 0.5) instead of teleop pushed pose.",
+)
+parser.add_argument(
+    "--pit_box_x_jitter_down",
+    type=float,
+    default=None,
+    help="Box x jitter downward from pushed max x (m). Default 0.5.",
+)
+parser.add_argument(
+    "--pit_box_y_jitter",
+    type=float,
+    default=None,
+    help="Box y jitter ± (m). Default 0.5.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:

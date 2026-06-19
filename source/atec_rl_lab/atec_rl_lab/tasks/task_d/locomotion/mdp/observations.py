@@ -201,12 +201,12 @@ def _prep_depth_tensor(
         sys.path.insert(0, str(_demo_dir))
     from depth_preprocess import prep_depth as _prep_depth_shared  # noqa: E402
 
+    # Source resolution comes from the camera tensor (e.g. 480x640 platform); prep_depth bilinear → policy size.
+    del depth_render_h, depth_render_w
     return _prep_depth_shared(
         x,
         image_h=int(image_h),
         image_w=int(image_w),
-        depth_render_h=depth_render_h,
-        depth_render_w=depth_render_w,
         depth_max=float(depth_max),
     )
 
@@ -216,7 +216,7 @@ def marg_depth_flat(
     head_sensor_cfg: SceneEntityCfg = SceneEntityCfg("head_camera"),
     ee_sensor_cfg: SceneEntityCfg = SceneEntityCfg("ee_camera"),
 ) -> torch.Tensor:
-    """Flatten head+ee depth for depth student (matches demo/server prep_depth pipeline)."""
+    """Flatten head (+ optional ee) depth for depth student (matches demo/server prep_depth pipeline)."""
     cfg = env.cfg
     policy_h = int(getattr(cfg, "depth_policy_h", 24))
     policy_w = int(getattr(cfg, "depth_policy_w", 32))
@@ -264,7 +264,10 @@ def marg_depth_flat(
         except Exception:
             return torch.zeros(batch, flat_per_cam, device=env.device, dtype=torch.float32)
 
-    return torch.cat([_flat(head_sensor_cfg.name), _flat(ee_sensor_cfg.name)], dim=-1)
+    head_flat = _flat(head_sensor_cfg.name)
+    if bool(getattr(cfg, "head_depth_only", False)):
+        return head_flat
+    return torch.cat([head_flat, _flat(ee_sensor_cfg.name)], dim=-1)
 
 
 def marg_critic_privileged(

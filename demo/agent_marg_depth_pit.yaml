@@ -2,6 +2,7 @@ policy:
   img_h: 24
   img_w: 32
   depth_channels: 1
+  head_depth_only: true
   depth_max: 5.0
   enc_dim: 128
   elevation_out_dim: 16

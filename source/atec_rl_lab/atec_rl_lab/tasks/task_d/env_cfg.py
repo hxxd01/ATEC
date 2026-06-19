@@ -105,7 +105,7 @@ def reset_root_state_absolute(
     env,
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    world_pos: tuple[float, float, float] = (-3.0, 0.0, 0.8),
+    world_pos: tuple[float, float, float] = _TASK_D_ROBOT_SPAWN_WORLD,
 ):
     """Reset asset root pose to a fixed world position (ignore env_origin offset)."""
     asset = env.scene[asset_cfg.name]

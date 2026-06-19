@@ -2,3 +2,4 @@ h5py
 fastapi
 uvicorn
 python-multipart
+pyyaml

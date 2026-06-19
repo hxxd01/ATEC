@@ -24,6 +24,17 @@ def main() -> None:
     parser.add_argument("--traj", type=str, default=DEFAULT_TRAJ)
     parser.add_argument("--pit_ckpt", type=str, default=DEFAULT_CKPT)
     parser.add_argument("--pit_command_vx", type=float, default=0.6)
+    parser.add_argument(
+        "--pit_handoff_warmup",
+        type=int,
+        default=40,
+        help="Pit steps after teleop with ramped actions + history fill (match pit play warmup).",
+    )
+    parser.add_argument(
+        "--ee_depth",
+        action="store_true",
+        help="Use head+ee depth (old dual-camera checkpoints). Default: head only.",
+    )
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--video_length", type=int, default=600, help="Pit phase steps; teleop steps added automatically.")
     parser.add_argument("--headless", action="store_true", default=True)
@@ -43,12 +54,14 @@ def main() -> None:
         str(float(args.pit_command_vx)),
         "--num_envs",
         str(int(args.num_envs)),
-        "--platform_depth",
     ]
     if args.video:
         cmd += ["--video", "--video_length", str(int(args.video_length))]
     if args.headless:
         cmd.append("--headless")
+    if args.ee_depth:
+        cmd.append("--ee_depth")
+    cmd.extend(["--pit_handoff_warmup", str(int(args.pit_handoff_warmup))])
     cmd.extend(extra)
 
     print("[play_taskd_teleop_pit]", " ".join(cmd), flush=True)

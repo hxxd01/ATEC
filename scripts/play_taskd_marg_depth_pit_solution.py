@@ -64,6 +64,11 @@ parser.add_argument("--depth_only", action="store_true", default=True)
 parser.add_argument("--depth_max", type=float, default=5.0)
 parser.add_argument("--tiled_cameras", action="store_true", default=True)
 parser.add_argument(
+    "--ee_depth",
+    action="store_true",
+    help="Also render ee camera (default: head depth only). Required for old head+ee checkpoints.",
+)
+parser.add_argument(
     "--with_box",
     action="store_true",
     default=True,
@@ -237,12 +242,14 @@ def _build_platform_obs(unwrapped, device: str) -> dict:
     proprio = torch.cat([lin_vel, ang_vel, cmd, gravity, joint_pos, joint_vel, last_action], dim=-1)
 
     head_cam = unwrapped.scene["head_camera"]
-    ee_cam = unwrapped.scene["ee_camera"]
     head_depth = head_cam.data.output["depth"].to(device)
-    ee_depth = ee_cam.data.output["depth"].to(device)
+    image = {"head_depth": head_depth}
+    ee_cam = getattr(unwrapped.scene, "ee_camera", None)
+    if ee_cam is not None:
+        image["ee_depth"] = ee_cam.data.output["depth"].to(device)
     return {
         "proprio": proprio,
-        "image": {"head_depth": head_depth, "ee_depth": ee_depth},
+        "image": image,
     }
 
 
@@ -332,6 +339,7 @@ def _attach_play_cameras(env_cfg, args_cli, *, attach_depth_obs: bool) -> None:
         tiled=use_tiled,
         camera_far_clip=5.0,
         update_period=phys_dt,
+        head_depth_only=not bool(getattr(args_cli, "ee_depth", False)),
     )
     if attach_depth_obs:
         attach_dagger_depth_obs(
@@ -340,6 +348,7 @@ def _attach_play_cameras(env_cfg, args_cli, *, attach_depth_obs: bool) -> None:
             policy_w=int(args_cli.policy_img_w),
             depth_max=float(args_cli.depth_max),
             depth_only=bool(args_cli.depth_only),
+            head_depth_only=not bool(getattr(args_cli, "ee_depth", False)),
         )
 
 

@@ -13,7 +13,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
-from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.sensors import MultiMeshRayCasterCfg, RayCasterCfg, patterns
 
 import atec_rl_lab.tasks.task_d.locomotion.mdp as task_d_loco_mdp
 import atec_rl_lab.train.locomotion.velocity.mdp as mdp
@@ -619,6 +619,43 @@ class UnitreeB2PiperTaskDPitLocomotionEnvCfg(UnitreeB2PiperRoughEnvCfg):
         )
 
 
+def configure_pit_marg_height_scanner(env_cfg, *, include_box: bool = False) -> None:
+    """Configure MARG elevation scanner: ground only, or ground + per-env Task D box."""
+    prim_path = "{ENV_REGEX_NS}/Robot/" + env_cfg.base_link_name
+    offset = RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0))
+    pattern = patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0])
+
+    if include_box:
+        env_cfg.scene.height_scanner = MultiMeshRayCasterCfg(
+            prim_path=prim_path,
+            offset=offset,
+            ray_alignment="yaw",
+            pattern_cfg=pattern,
+            debug_vis=False,
+            mesh_prim_paths=[
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    prim_expr="/World/ground",
+                    is_shared=True,
+                    track_mesh_transforms=False,
+                ),
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    prim_expr="{ENV_REGEX_NS}/Box",
+                    track_mesh_transforms=True,
+                ),
+            ],
+        )
+    else:
+        env_cfg.scene.height_scanner = RayCasterCfg(
+            prim_path=prim_path,
+            offset=offset,
+            ray_alignment="yaw",
+            pattern_cfg=pattern,
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+    env_cfg.scene.height_scanner.update_period = env_cfg.decimation * env_cfg.sim.dt
+
+
 @configclass
 class UnitreeB2PiperTaskDPitLocomotionMargEnvCfg(UnitreeB2PiperTaskDPitLocomotionEnvCfg):
     """Task D pit locomotion with MARG asymmetric AC observations (height map + privileged critic)."""
@@ -630,20 +667,13 @@ class UnitreeB2PiperTaskDPitLocomotionMargEnvCfg(UnitreeB2PiperTaskDPitLocomotio
     depth_render_w: int | None = None
     depth_max: float = 5.0
     depth_only: bool = True
+    head_depth_only: bool = True
 
     def __post_init__(self):
         super().__post_init__()
 
         # Height scanner for MARG elevation obs (not used by B2Piper-flat rewards).
-        self.scene.height_scanner = RayCasterCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/" + self.base_link_name,
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-            ray_alignment="yaw",
-            pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
-            debug_vis=False,
-            mesh_prim_paths=["/World/ground"],
-        )
-        self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+        configure_pit_marg_height_scanner(self, include_box=False)
 
         print(
             "[TaskDPitLoco-MARG] obs=proprio(43)+history(258)+height(187), "

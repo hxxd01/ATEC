@@ -16,7 +16,18 @@ if str(_demo_dir) not in sys.path:
     sys.path.insert(0, str(_demo_dir))
 from depth_preprocess import prep_depth as _prep_depth_shared  # noqa: E402
 
-from atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvB2Cfg, apply_task_d_camera_depth_clip
+from atec_rl_lab.tasks.task_d.env_cfg import (
+    TASK_D_NAV_DEPTH_MAX,
+    TASK_D_PLATFORM_CAMERA_FAR,
+    TaskDEnvB2Cfg,
+    apply_task_d_camera_depth_clip,
+)
+from atec_rl_lab.tasks.task_d.locomotion.mdp.events import (
+    PIT_BOX_SPAWN_X_JITTER_DOWN,
+    PIT_BOX_SPAWN_Y_JITTER,
+    TASK_D_PIT_PUSHED_BOX_LOCAL,
+    task_d_pit_marg_spawn_local,
+)
 from atec_rl_lab.tasks.task_d.env_cfg import (
     TASK_D_BOX_SPAWN_LOCAL,
     TASK_D_ROBOT_SPAWN_LOCAL,
@@ -35,15 +46,136 @@ LEG_ACTION_DIM = 12
 DEFAULT_PIT_SPAWN_X_JITTER = 0.0
 
 
+def resolve_pit_camera_far_clip(cli_value: float | None) -> float:
+    """Match ``train_nav_taskd_student._resolve_camera_far_clip`` (default platform 50 m)."""
+    return float(TASK_D_PLATFORM_CAMERA_FAR if cli_value is None else cli_value)
+
+
+def resolve_pit_depth_pipeline(args) -> tuple[int, int, int, int, str]:
+    """Match ``train_nav_taskd_student._resolve_depth_pipeline`` (native vs platform depth)."""
+    policy_h = int(getattr(args, "policy_img_h", 24))
+    policy_w = int(getattr(args, "policy_img_w", 32))
+    if getattr(args, "camera_hw", None) is not None:
+        side = int(args.camera_hw)
+        policy_h = policy_w = side
+    depth_render_h = getattr(args, "depth_render_h", None)
+    depth_render_w = getattr(args, "depth_render_w", None)
+    if depth_render_h is not None:
+        policy_h = int(depth_render_h)
+    if depth_render_w is not None:
+        policy_w = int(depth_render_w)
+
+    platform = bool(
+        getattr(args, "platform_depth_train", False) or getattr(args, "pit_platform_depth", False)
+    )
+    if platform:
+        cam_h = int(getattr(args, "platform_depth_h", 480))
+        cam_w = int(getattr(args, "platform_depth_w", 640))
+        return cam_h, cam_w, policy_h, policy_w, "platform"
+
+    sim_h = getattr(args, "sim_camera_h", None)
+    sim_w = getattr(args, "sim_camera_w", None)
+    cam_h = int(sim_h) if sim_h is not None else policy_h
+    cam_w = int(sim_w) if sim_w is not None else policy_w
+    return cam_h, cam_w, policy_h, policy_w, "native"
+
+
+# Light reset-time DR for pit MARG / depth student (sim-only; keep disable_dr_and_obs_noise=True).
+PIT_DR_LIGHT_JOINT_SCALE = (0.5, 1.5)
+PIT_DR_LIGHT_SPAWN_X_JITTER = 0.5
+# One-sided spawn y toward robot right (+y is left in Task D pit coords).
+PIT_DR_LIGHT_SPAWN_Y_JITTER_RIGHT = 0.5
+# Teleop upright base_link z≈0.529; DR center slightly above + symmetric jitter (covers stand + small drop/settle).
+PIT_DR_LIGHT_SPAWN_Z = 0.545
+PIT_DR_LIGHT_SPAWN_Z_JITTER = 0.025
+PIT_DR_LIGHT_YAW_RANGE = (-0.15, 0.15)
+PIT_DR_LIGHT_LIN_VEL_X = (0.0, 0.35)
+PIT_DR_LIGHT_LIN_VEL_Y = (-0.05, 0.05)
+PIT_DR_LIGHT_ANG_VEL_Z = (-0.12, 0.12)
+
+
+def _pit_dr_arg(args, name: str, default):
+    val = getattr(args, name, None)
+    return default if val is None else val
+
+
+def apply_pit_dr_light(env_cfg, args) -> None:
+    """Enable mild reset DR: leg joints, spawn xy/yaw, small initial root velocity."""
+    if not bool(getattr(args, "pit_dr_light", False)):
+        return
+    if bool(getattr(args, "pit_sim_easy", False) or getattr(args, "sim_easy", False)):
+        print("[TaskDPitDR] skipped (--pit_sim_easy / --sim_easy clears DR)", flush=True)
+        return
+
+    joint_scale = _pit_dr_arg(args, "pit_dr_joint_scale", PIT_DR_LIGHT_JOINT_SCALE)
+    x_jitter = float(_pit_dr_arg(args, "pit_spawn_x_jitter", PIT_DR_LIGHT_SPAWN_X_JITTER))
+    y_jitter_right = float(
+        _pit_dr_arg(args, "pit_dr_spawn_y_jitter", PIT_DR_LIGHT_SPAWN_Y_JITTER_RIGHT)
+    )
+    spawn_z = float(_pit_dr_arg(args, "pit_dr_spawn_z", PIT_DR_LIGHT_SPAWN_Z))
+    z_jitter = float(_pit_dr_arg(args, "pit_dr_spawn_z_jitter", PIT_DR_LIGHT_SPAWN_Z_JITTER))
+    yaw_range = _pit_dr_arg(args, "pit_dr_yaw_range", PIT_DR_LIGHT_YAW_RANGE)
+    lin_vx = _pit_dr_arg(args, "pit_dr_lin_vel_x", PIT_DR_LIGHT_LIN_VEL_X)
+    lin_vy = _pit_dr_arg(args, "pit_dr_lin_vel_y", PIT_DR_LIGHT_LIN_VEL_Y)
+    ang_wz = _pit_dr_arg(args, "pit_dr_ang_vel_z", PIT_DR_LIGHT_ANG_VEL_Z)
+
+    env_cfg.events.reset_joints_default.params["position_range"] = tuple(float(v) for v in joint_scale)
+    env_cfg.events.reset_joints_default.params["velocity_range"] = (0.0, 0.0)
+
+    params = env_cfg.events.reset_robot_task_d.params
+    local_pos = params.get("local_pos")
+    if local_pos is None:
+        local_pos = task_d_pit_marg_spawn_local()
+    params["local_pos"] = (float(local_pos[0]), float(local_pos[1]), spawn_z)
+    params["local_pos_x_jitter"] = x_jitter
+    params["local_pos_y_jitter"] = 0.0
+    params["local_pos_y_jitter_right"] = y_jitter_right
+    params["local_pos_z_jitter"] = z_jitter
+    params["yaw_range"] = tuple(float(v) for v in yaw_range)
+    params["lin_vel_x_range"] = tuple(float(v) for v in lin_vx)
+    params["lin_vel_y_range"] = tuple(float(v) for v in lin_vy)
+    params["ang_vel_z_range"] = tuple(float(v) for v in ang_wz)
+
+    print(
+        f"[TaskDPitDR] light DR: joint_scale={joint_scale}, "
+        f"spawn jitter x±{x_jitter:.2f} y right [0,{y_jitter_right:.2f}] z={spawn_z:.3f}±{z_jitter:.3f}, "
+        f"yaw={yaw_range}, init_vel vx={lin_vx} vy={lin_vy} wz={ang_wz}",
+        flush=True,
+    )
+
+
+def pit_head_depth_only(args) -> bool:
+    """Pit depth student: head camera only unless --ee_depth."""
+    return not bool(getattr(args, "ee_depth", False))
+
+
+def attach_pit_scene_cameras(env_cfg, args) -> None:
+    """Attach head (+ optional ee) scene cameras; ee is None when head-only (no ee render)."""
+    head_only = pit_head_depth_only(args)
+    env_cfg.head_depth_only = head_only
+    ref = TaskDEnvB2Cfg()
+    env_cfg.scene.head_camera = copy.deepcopy(ref.scene.head_camera)
+    if head_only:
+        env_cfg.scene.ee_camera = None
+    else:
+        env_cfg.scene.ee_camera = copy.deepcopy(ref.scene.ee_camera)
+    print(
+        f"[TaskDMargDepthPit] scene cameras={'head only' if head_only else 'head+ee'} "
+        f"(ee_camera={'off' if head_only else 'on'})",
+        flush=True,
+    )
+
+
 def apply_pit_train_spawn(env_cfg, args) -> tuple[float, float, float]:
     """Set base spawn local_pos and optional uniform ±x jitter on each episode reset."""
     base = tuple(float(v) for v in TASK_D_ROBOT_SPAWN_LOCAL)
     spawn_local_x = getattr(args, "pit_spawn_local_x", None)
     spawn_x_offset = float(getattr(args, "pit_spawn_x_offset", 0.0))
     if spawn_local_x is not None:
-        local_pos = (float(spawn_local_x), base[1], base[2])
+        local_x = float(spawn_local_x)
     else:
-        local_pos = (base[0] + spawn_x_offset, base[1], base[2])
+        local_x = base[0] + spawn_x_offset
+    local_pos = task_d_pit_marg_spawn_local(local_x=local_x)
 
     jitter_arg = getattr(args, "pit_spawn_x_jitter", None)
     jitter = DEFAULT_PIT_SPAWN_X_JITTER if jitter_arg is None else float(jitter_arg)
@@ -62,16 +194,32 @@ def apply_pit_train_spawn(env_cfg, args) -> tuple[float, float, float]:
 
 def attach_task_d_box(
     env_cfg,
+    args=None,
     *,
     box_local_pos: tuple[float, float, float] | None = None,
+    use_pushed_spawn: bool = True,
 ) -> tuple[float, float, float]:
-    """Add Task D push box (0.8x1.0x0.6) + reset on episode reset (matches platform Task D)."""
+    """Add Task D box (0.8x1.0x0.6) + reset on episode reset.
+
+    Default: teleop pushed pose (``TASK_D_PIT_PUSHED_BOX_LOCAL``) with x jitter downward and y jitter.
+    When present, the MARG height scanner also raycasts against ``{ENV_REGEX_NS}/Box``.
+    """
     from isaaclab.assets import RigidObjectCfg
     from isaaclab.managers import EventTermCfg as EventTerm
     from isaaclab.managers import SceneEntityCfg
     import isaaclab.sim as sim_utils
+    import atec_rl_lab.tasks.task_d.locomotion.mdp as task_d_loco_mdp
 
-    local_pos = tuple(float(v) for v in (box_local_pos or TASK_D_BOX_SPAWN_LOCAL))
+    if box_local_pos is not None:
+        local_pos = tuple(float(v) for v in box_local_pos)
+        use_pushed = False
+    elif use_pushed_spawn:
+        local_pos = tuple(float(v) for v in TASK_D_PIT_PUSHED_BOX_LOCAL)
+        use_pushed = True
+    else:
+        local_pos = tuple(float(v) for v in TASK_D_BOX_SPAWN_LOCAL)
+        use_pushed = False
+
     env_cfg.scene.box = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Box",
         spawn=sim_utils.CuboidCfg(
@@ -87,15 +235,51 @@ def attach_task_d_box(
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=local_pos),
     )
-    env_cfg.events.reset_box_root = EventTerm(
-        func=reset_root_state_at_env_origin,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("box"),
-            "local_pos": local_pos,
-        },
-    )
-    print(f"[TaskDPitPlay] Task D box enabled at local_pos={local_pos}", flush=True)
+
+    if use_pushed:
+        x_down = float(
+            PIT_BOX_SPAWN_X_JITTER_DOWN
+            if args is None or getattr(args, "pit_box_x_jitter_down", None) is None
+            else args.pit_box_x_jitter_down
+        )
+        y_jitter = float(
+            PIT_BOX_SPAWN_Y_JITTER
+            if args is None or getattr(args, "pit_box_y_jitter", None) is None
+            else args.pit_box_y_jitter
+        )
+        env_cfg.events.reset_box_root = EventTerm(
+            func=task_d_loco_mdp.reset_box_at_task_d_spawn,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("box"),
+                "local_pos": local_pos,
+                "local_pos_x_jitter_down": x_down,
+                "local_pos_y_jitter": y_jitter,
+            },
+        )
+        print(
+            f"[TaskDPitBox] pushed box local_pos={local_pos}, "
+            f"x jitter -[0,{x_down:.2f}] y±{y_jitter:.2f} (height_scanner includes box)",
+            flush=True,
+        )
+    else:
+        env_cfg.events.reset_box_root = EventTerm(
+            func=reset_root_state_at_env_origin,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("box"),
+                "local_pos": local_pos,
+            },
+        )
+        print(
+            f"[TaskDPitBox] default spawn box at local_pos={local_pos} "
+            f"(height_scanner includes box)",
+            flush=True,
+        )
+
+    from atec_rl_lab.tasks.task_d.locomotion.env_cfg import configure_pit_marg_height_scanner
+
+    configure_pit_marg_height_scanner(env_cfg, include_box=True)
     return local_pos
 
 
@@ -109,7 +293,8 @@ def pit_env_wants_box(args) -> bool:
 def apply_pit_box_if_requested(env_cfg, args) -> tuple[float, float, float] | None:
     if not pit_env_wants_box(args):
         return None
-    return attach_task_d_box(env_cfg)
+    use_pushed = not bool(getattr(args, "pit_box_default_spawn", False))
+    return attach_task_d_box(env_cfg, args, use_pushed_spawn=use_pushed)
 
 
 def configure_pit_e2e_env_cfg(args) -> UnitreeB2PiperTaskDPitLocomotionMargEnvCfg:
@@ -135,11 +320,10 @@ def configure_pit_e2e_env_cfg(args) -> UnitreeB2PiperTaskDPitLocomotionMargEnvCf
     env_cfg.apply_command_config()
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
 
-    ref = TaskDEnvB2Cfg()
-    env_cfg.scene.head_camera = copy.deepcopy(ref.scene.head_camera)
-    env_cfg.scene.ee_camera = copy.deepcopy(ref.scene.ee_camera)
+    attach_pit_scene_cameras(env_cfg, args)
     apply_pit_train_spawn(env_cfg, args)
     apply_pit_box_if_requested(env_cfg, args)
+    apply_pit_dr_light(env_cfg, args)
     return env_cfg
 
 
@@ -181,12 +365,80 @@ def configure_pit_e2e_dagger_env_cfg(args) -> UnitreeB2PiperTaskDPitLocomotionMa
     env_cfg.apply_command_config()
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
 
-    ref = TaskDEnvB2Cfg()
-    env_cfg.scene.head_camera = copy.deepcopy(ref.scene.head_camera)
-    env_cfg.scene.ee_camera = copy.deepcopy(ref.scene.ee_camera)
+    attach_pit_scene_cameras(env_cfg, args)
     apply_pit_train_spawn(env_cfg, args)
     apply_pit_box_if_requested(env_cfg, args)
+    apply_pit_dr_light(env_cfg, args)
     return env_cfg
+
+
+def configure_pit_dagger_play_env_cfg(args) -> tuple:
+    """Full PitLocomotion play cfg (train / DAgger play / platform ablation).
+
+    Returns ``(env_cfg, spawn_local_xyz)`` with obs_manager proprio+history+depth attached.
+    """
+    from atec_rl_lab.train.pit_marg.taskd_pit_marg_runner import apply_play_spawn, configure_play_terrain
+
+    env_cfg = configure_pit_e2e_dagger_env_cfg(args)
+    cam_h, cam_w, policy_h, policy_w, depth_mode = resolve_pit_depth_pipeline(args)
+    camera_far_clip = resolve_pit_camera_far_clip(getattr(args, "camera_far_clip", None))
+    command_vx = getattr(args, "command_vx", None)
+    if command_vx is not None:
+        vx = float(command_vx)
+        env_cfg.command_lin_vel_x_min = vx
+        env_cfg.command_lin_vel_x_max = vx
+    env_cfg.command_curriculum_start_fraction = 1.0
+    env_cfg.apply_command_config()
+    configure_play_terrain(
+        env_cfg,
+        pit_level=int(getattr(args, "pit_level", 10)),
+        use_pit_curriculum=bool(getattr(args, "pit_curriculum", False)),
+    )
+    spawn_local = apply_play_spawn(
+        env_cfg,
+        spawn_x_offset=float(getattr(args, "spawn_x_offset", 0.0)),
+        spawn_local_x=getattr(args, "spawn_local_x", None),
+    )
+    env_cfg.curriculum.command_levels_lin_vel = None
+    env_cfg.curriculum.pit_width_levels = None
+    if hasattr(env_cfg.observations, "policy") and env_cfg.observations.policy is not None:
+        env_cfg.observations.policy.enable_corruption = False
+
+    decimation = int(getattr(env_cfg, "decimation", 4))
+    sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
+    phys_dt = decimation * sim_dt
+    head_depth_only = not bool(getattr(args, "ee_depth", False))
+    depth_only = bool(getattr(args, "depth_only", True))
+    depth_max = float(getattr(args, "depth_max", TASK_D_NAV_DEPTH_MAX))
+    configure_pit_e2e_cameras(
+        env_cfg,
+        camera_height=cam_h,
+        camera_width=cam_w,
+        depth_only=depth_only,
+        tiled=bool(getattr(args, "tiled_cameras", True)),
+        camera_far_clip=camera_far_clip,
+        update_period=phys_dt,
+        head_depth_only=head_depth_only,
+    )
+    attach_dagger_depth_obs(
+        env_cfg,
+        policy_h=policy_h,
+        policy_w=policy_w,
+        depth_max=depth_max,
+        depth_only=depth_only,
+        depth_render_h=cam_h if depth_mode == "platform" else None,
+        depth_render_w=cam_w if depth_mode == "platform" else None,
+        head_depth_only=head_depth_only,
+    )
+    cam_tag = "head" if head_depth_only else "head+ee"
+    print(
+        "[TaskDMargDepthPit] play env: PitLocomotion, obs=proprio+proprio_history+depth, "
+        f"12D leg, cmd_vx=[{env_cfg.command_lin_vel_x_min}, {env_cfg.command_lin_vel_x_max}], "
+        f"depth={depth_mode} sim={cam_h}x{cam_w} policy={policy_h}x{policy_w} ({cam_tag}), "
+        f"camera_far_clip={camera_far_clip:.1f}m, depth_max={depth_max:.1f}m",
+        flush=True,
+    )
+    return env_cfg, spawn_local
 
 
 def attach_dagger_depth_obs(
@@ -198,8 +450,12 @@ def attach_dagger_depth_obs(
     depth_only: bool,
     depth_render_h: int | None = None,
     depth_render_w: int | None = None,
+    head_depth_only: bool | None = None,
 ) -> None:
     """Enable depth obs group on Marg pit env (obs manager; shared by DAgger, e2e PPO, play)."""
+    if head_depth_only is None:
+        head_depth_only = bool(getattr(env_cfg, "head_depth_only", True))
+    env_cfg.head_depth_only = bool(head_depth_only)
     env_cfg.depth_policy_h = int(policy_h)
     env_cfg.depth_policy_w = int(policy_w)
     env_cfg.depth_max = float(depth_max)
@@ -207,16 +463,70 @@ def attach_dagger_depth_obs(
     env_cfg.depth_render_h = depth_render_h
     env_cfg.depth_render_w = depth_render_w
     env_cfg.observations.depth = copy.deepcopy(TaskDPitMargObservationsCfg.DepthCfg())
-    depth_dim = 2 * (1 if depth_only else 4) * int(policy_h) * int(policy_w)
+    num_cams = 1 if head_depth_only else 2
+    depth_dim = num_cams * (1 if depth_only else 4) * int(policy_h) * int(policy_w)
+    cam_tag = "head" if head_depth_only else "head+ee"
+    src_tag = ""
+    if depth_render_h is not None and depth_render_w is not None:
+        if int(depth_render_h) != int(policy_h) or int(depth_render_w) != int(policy_w):
+            src_tag = f", prep_depth {int(depth_render_h)}x{int(depth_render_w)}→{int(policy_h)}x{int(policy_w)}"
     print(
         f"[TaskDMargDepthPit] depth obs via obs_manager: "
-        f"{depth_dim}D ({'depth' if depth_only else 'rgb+depth'} head+ee @ {policy_h}x{policy_w})",
+        f"{depth_dim}D ({'depth' if depth_only else 'rgb+depth'} {cam_tag} @ {policy_h}x{policy_w}{src_tag})",
         flush=True,
     )
 
 
 # Alias: same obs-manager depth path for e2e PPO and DAgger.
 attach_marg_depth_obs = attach_dagger_depth_obs
+
+
+def apply_taskd_pit_student_command(env_cfg, command_vx: float = 0.6) -> None:
+    """Fix Task D ``command_manager.base_velocity`` for pit student deploy (matches pit-loco play)."""
+    vx = float(command_vx)
+    cmd = env_cfg.commands.base_velocity
+    cmd.ranges.lin_vel_x = (vx, vx)
+    cmd.ranges.lin_vel_y = (0.0, 0.0)
+    cmd.ranges.ang_vel_z = (0.0, 0.0)
+    cmd.ranges.heading = (0.0, 0.0)
+    cmd.heading_command = False
+    cmd.rel_standing_envs = 0.0
+    cmd.resampling_time_range = (10.0, 10.0)
+    print(
+        f"[TaskDMargDepthPit] Task D command_manager base_velocity fixed vx={vx:.2f} m/s",
+        flush=True,
+    )
+
+
+def attach_taskd_platform_marg_student_obs(
+    env_cfg,
+    args,
+    *,
+    policy_h: int | None = None,
+    policy_w: int | None = None,
+    depth_max: float = 5.0,
+) -> None:
+    """Task D B2 play: MARG proprio/history + depth via obs_manager (platform proprio kept for teleop)."""
+    head_depth_only = not bool(getattr(args, "ee_depth", False))
+    ph = int(policy_h if policy_h is not None else getattr(args, "pit_cam_h", 24))
+    pw = int(policy_w if policy_w is not None else getattr(args, "pit_cam_w", 32))
+    marg = TaskDPitMargObservationsCfg()
+    env_cfg.observations.marg_proprio = copy.deepcopy(marg.proprio)
+    env_cfg.observations.marg_proprio_history = copy.deepcopy(marg.proprio_history)
+    attach_dagger_depth_obs(
+        env_cfg,
+        policy_h=ph,
+        policy_w=pw,
+        depth_max=float(depth_max),
+        depth_only=True,
+        head_depth_only=head_depth_only,
+    )
+    # Depth comes from marg_depth_flat; drop platform image obs group (teleop uses proprio only).
+    env_cfg.observations.image = None
+    print(
+        "[TaskDMargDepthPit] Task D platform deploy: obs_manager marg_proprio + marg_proprio_history + depth",
+        flush=True,
+    )
 
 
 class TaskDStudentPitE2EEnv(gym.Wrapper):
@@ -305,8 +615,6 @@ class TaskDStudentPitE2EEnv(gym.Wrapper):
             x,
             image_h=self._image_h,
             image_w=self._image_w,
-            depth_render_h=self._depth_render_h,
-            depth_render_w=self._depth_render_w,
             depth_max=self._depth_max,
         )
 
@@ -382,14 +690,22 @@ def configure_pit_e2e_cameras(
     tiled: bool,
     camera_far_clip: float,
     update_period: float,
+    head_depth_only: bool | None = None,
 ) -> None:
-    """Match student nav camera pipeline on pit env."""
+    """Match student nav camera pipeline on pit env (head only by default; no ee render)."""
     from isaaclab.sensors import CameraCfg, TiledCameraCfg
+
+    if head_depth_only is None:
+        head_depth_only = bool(getattr(env_cfg, "head_depth_only", True))
+    env_cfg.head_depth_only = bool(head_depth_only)
+    if head_depth_only:
+        env_cfg.scene.ee_camera = None
 
     apply_task_d_camera_depth_clip(env_cfg.scene, float(camera_far_clip))
     cam_cfg_cls = TiledCameraCfg if tiled else CameraCfg
     data_types = ["depth"] if depth_only else ["rgb", "depth"]
-    for cam_name in ("head_camera", "ee_camera"):
+    cam_names = ("head_camera",) if head_depth_only else ("head_camera", "ee_camera")
+    for cam_name in cam_names:
         cam = getattr(env_cfg.scene, cam_name, None)
         if cam is None:
             continue
@@ -408,6 +724,12 @@ def configure_pit_e2e_cameras(
         )
     if depth_only:
         align_taskd_image_obs_for_cameras(env_cfg)
+    cam_tag = "head" if head_depth_only else "head+ee"
+    print(
+        f"[TaskDMargDepthPit] cameras={cam_tag}, sim={camera_height}x{camera_width}, "
+        f"depth_only={depth_only}, tiled={tiled}",
+        flush=True,
+    )
 
 
 def align_taskd_image_obs_for_cameras(env_cfg, *, depth_only: bool = True) -> None:
@@ -421,3 +743,7 @@ def align_taskd_image_obs_for_cameras(env_cfg, *, depth_only: bool = True) -> No
     for term_name in ("head_rgb", "ee_rgb", "ee_dual_rgb"):
         if hasattr(image_obs, term_name):
             setattr(image_obs, term_name, None)
+    if bool(getattr(env_cfg, "head_depth_only", True)):
+        for term_name in ("ee_depth", "ee_dual_depth"):
+            if hasattr(image_obs, term_name):
+                setattr(image_obs, term_name, None)

@@ -24,6 +24,7 @@ from rsl_rl.runners import OnPolicyRunner
 import atec_rl_lab.train  # noqa: F401
 import atec_rl_lab.tasks.task_d.locomotion.mdp as task_d_loco_mdp
 from atec_rl_lab.tasks.task_d.env_cfg import TASK_D_ROBOT_SPAWN_LOCAL
+from atec_rl_lab.tasks.task_d.locomotion.mdp.events import task_d_pit_marg_spawn_local
 from atec_rl_lab.tasks.task_d.locomotion.env_cfg import (
     UnitreeB2PiperTaskDPitLocomotionMargEnvCfg,
     refresh_task_d_pit_locomotion_terrain_cfg,
@@ -121,6 +122,15 @@ def build_train_env_cfg(args: Any):
         _apply_sim_easy_mode(env_cfg, args)
     env_cfg.apply_command_config()
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
+    from atec_rl_lab.train.nav.taskd_student_pit_e2e_env import (
+        apply_pit_box_if_requested,
+        apply_pit_dr_light,
+        apply_pit_train_spawn,
+    )
+
+    apply_pit_train_spawn(env_cfg, args)
+    apply_pit_box_if_requested(env_cfg, args)
+    apply_pit_dr_light(env_cfg, args)
     return env_cfg
 
 
@@ -147,6 +157,14 @@ def build_play_env_cfg(args: Any):
         spawn_x_offset=float(_get(args, "pit_spawn_x_offset", _get(args, "spawn_x_offset", 0.0))),
         spawn_local_x=_get(args, "pit_spawn_local_x", _get(args, "spawn_local_x", None)),
     )
+
+    from atec_rl_lab.train.nav.taskd_student_pit_e2e_env import (
+        apply_pit_box_if_requested,
+        apply_pit_dr_light,
+    )
+
+    apply_pit_box_if_requested(env_cfg, args)
+    apply_pit_dr_light(env_cfg, args)
 
     env_cfg.curriculum.command_levels_lin_vel = None
     env_cfg.curriculum.pit_width_levels = None
@@ -209,9 +227,14 @@ def apply_play_spawn(
     """Configure Task D play spawn on env-local +x (positive = toward pit)."""
     base = tuple(float(v) for v in TASK_D_ROBOT_SPAWN_LOCAL)
     if spawn_local_x is not None:
-        local_pos = (float(spawn_local_x), base[1], base[2])
+        local_x = float(spawn_local_x)
     else:
-        local_pos = (base[0] + float(spawn_x_offset), base[1], base[2])
+        local_x = base[0] + float(spawn_x_offset)
+    # Pit-loco / MARG student envs only; full Task D platform keeps env_cfg z=0.8.
+    if getattr(env_cfg.events, "reset_robot_task_d", None) is not None:
+        local_pos = task_d_pit_marg_spawn_local(local_x=local_x)
+    else:
+        local_pos = (local_x, base[1], base[2])
     _robot_spawn_reset_params(env_cfg)["local_pos"] = local_pos
     print(
         f"[TaskDPitPlay] spawn local_pos={local_pos} "
@@ -349,7 +372,8 @@ def play_pit_marg(args: Any, simulation_app) -> None:
     print(
         f"[TaskDPitMarg] command_vx={command_vx} m/s, spawn_local_x={float(spawn_local[0]):.3f}, "
         f"num_envs={args.num_envs}, pit_width={env_cfg.pit_width_range}, "
-        f"success_post={env_cfg.pit_success_post_cross_distance}m, stochastic={stochastic}",
+        f"success_post={env_cfg.pit_success_post_cross_distance}m, stochastic={stochastic}, "
+        f"pit_dr_light={bool(_get(args, 'pit_dr_light', False))}",
         flush=True,
     )
     if record_video and warmup > 0:
@@ -391,10 +415,10 @@ def _dump_pit_marg_deploy_notes(log_dir: str, env_cfg) -> None:
     notes = {
         "network": "MargActorCritic (proprio + proprio_history + height_map 187D)",
         "train_env": "UnitreeB2PiperTaskDPitLocomotionMargEnvCfg",
-        "play_script": "scripts/play_taskd_pit_locomotion.py --marg --checkpoint <model.pt>",
+        "play_script": "scripts/play_taskd_pit_locomotion.py --marg --checkpoint <model.pt> [--pit_dr_light]",
         "play_via_student_script": (
             "scripts/train_nav_taskd_student.py --pit_marg_play --pit_checkpoint <model.pt> "
-            "[--video --pit_level N --command_vx 0.6]"
+            "[--video --pit_level N --command_vx 0.6 --pit_dr_light]"
         ),
         "pit_success_post_cross_distance": float(env_cfg.pit_success_post_cross_distance),
         "not_compatible_with": "demo/server.py depth student nav (different obs + network)",

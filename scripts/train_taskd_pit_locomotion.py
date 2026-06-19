@@ -48,6 +48,36 @@ parser.add_argument(
     default=1.0,
     help="Fixed forward command speed used with --sim_easy (m/s).",
 )
+parser.add_argument(
+    "--pit_dr_light",
+    action="store_true",
+    help="Mild pit reset DR (joints, spawn xy/yaw, initial velocity). Off by default.",
+)
+parser.add_argument("--pit_spawn_x_offset", type=float, default=0.0)
+parser.add_argument("--pit_spawn_local_x", type=float, default=None)
+parser.add_argument("--pit_spawn_x_jitter", type=float, default=None)
+parser.add_argument(
+    "--no_pit_box",
+    action="store_true",
+    help="Disable Task D push box in pit MARG env (box on by default at teleop pushed pose).",
+)
+parser.add_argument(
+    "--pit_box_default_spawn",
+    action="store_true",
+    help="Use Task D default box spawn (1.2, 1.6, 0.5) instead of teleop pushed pose.",
+)
+parser.add_argument(
+    "--pit_box_x_jitter_down",
+    type=float,
+    default=None,
+    help="Box x jitter downward from pushed max x (m). Default 0.5.",
+)
+parser.add_argument(
+    "--pit_box_y_jitter",
+    type=float,
+    default=None,
+    help="Box y jitter ± (m). Default 0.5.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -93,6 +123,10 @@ def main():
     env_cfg.command_curriculum_start_fraction = float(args_cli.command_curriculum_start)
     env_cfg.apply_command_config()
     refresh_task_d_pit_locomotion_terrain_cfg(env_cfg)
+    from atec_rl_lab.train.nav.taskd_student_pit_e2e_env import apply_pit_dr_light, apply_pit_train_spawn
+
+    apply_pit_train_spawn(env_cfg, args_cli)
+    apply_pit_dr_light(env_cfg, args_cli)
 
     agent_cfg = UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg()
     agent_cfg.max_iterations = args_cli.max_iterations

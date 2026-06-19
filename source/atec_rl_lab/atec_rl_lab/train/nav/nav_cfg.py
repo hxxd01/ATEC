@@ -164,6 +164,7 @@ class MargDepthPitActorCriticCfg(RslRlPpoActorCriticCfg):
     img_h: int = 24
     img_w: int = 32
     depth_channels: int = 1
+    head_depth_only: bool = True
     enc_dim: int = 128
     elevation_out_dim: int = 16
     estimator_hidden_dims: list = [128]

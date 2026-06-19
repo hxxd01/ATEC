@@ -70,8 +70,13 @@ parser.add_argument(
 )
 parser.add_argument(
     "--platform_depth_train",
+    "--pit_platform_depth",
     action="store_true",
-    help="Match demo/server.py: sim cameras 480x640 float depth, then prep_depth -> policy_img_h/w.",
+    help=(
+        "Sim cameras at platform resolution (default 480x640), prep_depth bilinear+log1p -> "
+        "--policy_img_h/w (e.g. 24x32). Use with --student_pit_dagger/--student_pit_e2e to match "
+        "demo/server.py deploy before platform fine-tune."
+    ),
 )
 parser.add_argument(
     "--platform_depth_h",
@@ -112,7 +117,12 @@ parser.add_argument(
 parser.add_argument(
     "--depth_only",
     action="store_true",
-    help="Use depth maps only (head+ee). Isaac cameras render depth only (no RGB).",
+    help="Use depth maps only. Isaac cameras render depth only (no RGB). Pit default: head only.",
+)
+parser.add_argument(
+    "--ee_depth",
+    action="store_true",
+    help="Also render ee camera depth (default pit student: head depth only).",
 )
 parser.add_argument(
     "--tiled_cameras",
@@ -218,8 +228,45 @@ pit_grp.add_argument(
     default=None,
     help=(
         "Uniform random ± jitter on env-local spawn x at reset (m). "
-        "Default 0 (off) for student pit train; pass e.g. 0.5 to enable uniform ± jitter."
+        "Default 0 (off); with --pit_dr_light defaults to 0.5 m."
     ),
+)
+pit_grp.add_argument(
+    "--pit_dr_light",
+    action="store_true",
+    help=(
+        "Pit reset DR: joint scale 0.5-1.5, spawn xy jitter ±0.5 m, "
+        "z=0.545±0.025 m, yaw ±0.15 rad, small initial vx/vy/wz (sim-only; keeps obs noise off)."
+    ),
+)
+pit_grp.add_argument("--pit_dr_spawn_y_jitter", type=float, default=None, help="Override --pit_dr_light robot spawn y jitter toward right (m), [0, value]. Default 0.5.")
+pit_grp.add_argument(
+    "--pit_dr_spawn_z",
+    type=float,
+    default=None,
+    help="DR spawn base z (m). Default 0.545 (teleop stand ~0.529, slightly higher).",
+)
+pit_grp.add_argument(
+    "--pit_dr_spawn_z_jitter",
+    type=float,
+    default=None,
+    help="Uniform ± z jitter on spawn (m). Default 0.025 with --pit_dr_light.",
+)
+pit_grp.add_argument(
+    "--pit_dr_yaw_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("MIN", "MAX"),
+    help="Override yaw random range in rad (default -0.15 0.15).",
+)
+pit_grp.add_argument(
+    "--pit_dr_joint_scale",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("MIN", "MAX"),
+    help="Override reset_joints_by_scale range (default 0.5 1.5).",
 )
 pit_grp.add_argument("--pit_warmup_steps", type=int, default=0, help="MARG history warmup before pit play video.")
 pit_grp.add_argument("--pit_stochastic", action="store_true", help="Stochastic actions during pit play.")
@@ -228,7 +275,24 @@ pit_grp.add_argument("--pit_real_time", action="store_true", help="Real-time pit
 pit_grp.add_argument(
     "--no_pit_box",
     action="store_true",
-    help="Disable Task D push box in pit student DAgger/PPO train env (box is on by default).",
+    help="Disable Task D push box in pit env (box is on by default at teleop pushed pose).",
+)
+pit_grp.add_argument(
+    "--pit_box_default_spawn",
+    action="store_true",
+    help="Use Task D default box spawn (1.2, 1.6, 0.5) instead of teleop pushed pose.",
+)
+pit_grp.add_argument(
+    "--pit_box_x_jitter_down",
+    type=float,
+    default=None,
+    help="Box x jitter downward from pushed max x (m). Default 0.5.",
+)
+pit_grp.add_argument(
+    "--pit_box_y_jitter",
+    type=float,
+    default=None,
+    help="Box y jitter ± (m). Default 0.5.",
 )
 
 e2e_grp = parser.add_argument_group(
@@ -256,7 +320,11 @@ e2e_grp.add_argument(
 e2e_grp.add_argument(
     "--student_pit_dagger",
     action="store_true",
-    help="DAgger train depth student with frozen MARG height-map teacher (--pit_teacher_ckpt required).",
+    help=(
+        "DAgger train depth student with frozen MARG height-map teacher (--pit_teacher_ckpt required). "
+        "Add --pit_platform_depth (alias --platform_depth_train) to fine-tune with 480x640→24x32 depth "
+        "matching platform deploy; default is native sim_camera=policy size (24x32)."
+    ),
 )
 e2e_grp.add_argument(
     "--pit_teacher_ckpt",
@@ -772,6 +840,7 @@ def _run_student_pit_e2e_train(args_cli, device: str, *, dagger: bool = False) -
 
     cam_h, cam_w, policy_h, policy_w, depth_mode = _resolve_depth_pipeline(args_cli)
     camera_far_clip = _resolve_camera_far_clip(args_cli.camera_far_clip)
+    head_depth_only = not bool(getattr(args_cli, "ee_depth", False))
     if dagger or finetune:
         # Finetune from DAgger BC: keep same cmd/env as BC (fixed vx≈0.6 unless CLI overrides).
         env_cfg = configure_pit_e2e_dagger_env_cfg(args_cli)
@@ -788,6 +857,7 @@ def _run_student_pit_e2e_train(args_cli, device: str, *, dagger: bool = False) -
         tiled=args_cli.tiled_cameras,
         camera_far_clip=camera_far_clip,
         update_period=phys_dt,
+        head_depth_only=head_depth_only,
     )
     attach_dagger_depth_obs(
         env_cfg,
@@ -797,12 +867,14 @@ def _run_student_pit_e2e_train(args_cli, device: str, *, dagger: bool = False) -
         depth_only=bool(args_cli.depth_only),
         depth_render_h=cam_h if depth_mode == "platform" else None,
         depth_render_w=cam_w if depth_mode == "platform" else None,
+        head_depth_only=head_depth_only,
     )
     mode_tag = "DAgger" if dagger else ("Finetune-PPO" if finetune else "PPO")
     box_tag = "with Task D box" if not bool(getattr(args_cli, "no_pit_box", False)) else "no box"
+    depth_cam_tag = "head" if head_depth_only else "head+ee"
     print(
         f"[TaskDMargDepthPit] mode={mode_tag}, vec_env=RslRlVecEnvWrapper, "
-        f"obs=proprio+proprio_history+depth(+height_map teacher-only), "
+        f"obs=proprio+proprio_history+depth({depth_cam_tag})(+height_map teacher-only), "
         f"env={box_tag}, "
         f"depth pipeline={depth_mode}, sim={cam_h}x{cam_w}, "
         f"policy={policy_h}x{policy_w}, depth_only={args_cli.depth_only}, "
@@ -826,6 +898,7 @@ def _run_student_pit_e2e_train(args_cli, device: str, *, dagger: bool = False) -
     agent_cfg.policy.img_h = policy_h
     agent_cfg.policy.img_w = policy_w
     agent_cfg.policy.depth_channels = 1 if args_cli.depth_only else 4
+    agent_cfg.policy.head_depth_only = head_depth_only
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     log_dir = os.path.join(log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
@@ -924,20 +997,42 @@ def _run_student_pit_e2e_train(args_cli, device: str, *, dagger: bool = False) -
         "mode": mode_name,
         "init_ckpt": os.path.abspath(args_cli.resume) if finetune and args_cli.resume else None,
         "teacher_ckpt": os.path.abspath(args_cli.pit_teacher_ckpt) if dagger else None,
+        "head_depth_only": head_depth_only,
+        "depth_pipeline": {
+            "mode": depth_mode,
+            "sim_camera_h": int(cam_h),
+            "sim_camera_w": int(cam_w),
+            "policy_img_h": int(policy_h),
+            "policy_img_w": int(policy_w),
+            "prep": "demo/depth_preprocess.prep_depth (bilinear + log1p, depth_max=5)",
+        },
         "obs_groups": {
             "proprio": "43D MARG leg proprio + cmd",
             "proprio_history": "258D",
-            "depth": f"head+ee depth flat 2x{policy_h}x{policy_w}",
+            "depth": f"{depth_cam_tag} depth flat {policy_h}x{policy_w}",
             "critic_priv": "42D privileged (train only)",
         },
         "network": (
-            "MargDepthPitActorCritic: estimator(history)->7, depthCNN(head+ee)->16, "
+            f"MargDepthPitActorCritic: estimator(history)->7, depthCNN({depth_cam_tag})->16, "
             "actor MLP 512-256-128 -> 12 legs (same layout as MargActorCritic w/ depth replacing elevation)"
         ),
-        "deploy": "demo/server.py depth + MARG proprio; need solution pit_marg_depth mode (not nav GRU)",
+        "deploy": "demo/server.py 480x640 depth + MARG proprio; solution_marg_depth_pit.py prep_depth->24x32",
         "nav_student": "unchanged (TaskDStudentActorCritic separate)",
     }
     dump_yaml(os.path.join(log_dir, "params", "deploy_pit_e2e.yaml"), deploy_notes)
+    _dump_pit_marg_deploy_agent_yaml(
+        log_dir,
+        policy_h=policy_h,
+        policy_w=policy_w,
+        depth_only=bool(args_cli.depth_only),
+        depth_max=float(args_cli.depth_max),
+        head_depth_only=head_depth_only,
+        depth_mode=depth_mode,
+        sim_cam_h=cam_h,
+        sim_cam_w=cam_w,
+        platform_h=int(args_cli.platform_depth_h),
+        platform_w=int(args_cli.platform_depth_w),
+    )
 
     phase = "DAgger" if dagger else ("Finetune" if finetune else "e2e")
     print(f"[INFO] Pit MARG-depth {phase} logging to {log_dir}", flush=True)
@@ -1077,6 +1172,50 @@ def _dump_deploy_agent_yaml(
         }
     }
     dump_yaml(os.path.join(log_dir, "params", "deploy_agent.yaml"), deploy)
+
+
+def _dump_pit_marg_deploy_agent_yaml(
+    log_dir: str,
+    *,
+    policy_h: int,
+    policy_w: int,
+    depth_only: bool,
+    depth_max: float,
+    head_depth_only: bool,
+    depth_mode: str,
+    sim_cam_h: int,
+    sim_cam_w: int,
+    platform_h: int,
+    platform_w: int,
+) -> None:
+    """Write demo/agent_marg_depth_pit.yaml-compatible deploy block for solution_marg_depth_pit.py."""
+    deploy = {
+        "policy": {
+            "img_h": int(policy_h),
+            "img_w": int(policy_w),
+            "depth_channels": 1 if depth_only else 4,
+            "head_depth_only": bool(head_depth_only),
+            "depth_max": float(depth_max),
+            "depth_render_h": int(sim_cam_h),
+            "depth_render_w": int(sim_cam_w),
+            "platform_depth_h": int(platform_h),
+            "platform_depth_w": int(platform_w),
+            "depth_pipeline": depth_mode,
+            "enc_dim": 128,
+            "elevation_out_dim": 16,
+            "estimator_hidden_dims": [128],
+            "depth_hidden_dims": [128, 64],
+            "actor_obs_normalization": True,
+            "critic_obs_normalization": False,
+            "actor_hidden_dims": [512, 256, 128],
+            "critic_hidden_dims": [512, 256, 128],
+            "init_noise_std": 0.6,
+            "max_noise_std": 2.0,
+            "noise_std_type": "scalar",
+        }
+    }
+    dump_yaml(os.path.join(log_dir, "params", "deploy_agent.yaml"), deploy)
+    dump_yaml(os.path.join(log_dir, "params", "agent_marg_depth_pit.yaml"), deploy)
 
 
 def main():
