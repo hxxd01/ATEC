@@ -57,6 +57,8 @@ class TaskDStudentActorCritic(nn.Module):
         critic_hidden_dims: list | None = None,
         init_noise_std: float = 0.5,
         noise_std_type: str = "scalar",
+        leg_action_dim: int = 12,
+        nav_action_dim: int = 3,
         **kwargs,
     ):
         if kwargs:
@@ -78,6 +80,15 @@ class TaskDStudentActorCritic(nn.Module):
         self.head_flat = self.img_channels * self.img_h * self.img_w
         self.ee_flat = self.img_channels * self.img_h * self.img_w
         self.proprio_dim = int(proprio_dim)
+        self.leg_action_dim = int(leg_action_dim)
+        self.nav_action_dim = int(nav_action_dim)
+        self.num_actions = int(num_actions)
+        if self.num_actions not in (self.nav_action_dim, self.leg_action_dim):
+            raise ValueError(
+                f"num_actions={self.num_actions} must be nav_action_dim={self.nav_action_dim} "
+                f"or leg_action_dim={self.leg_action_dim}"
+            )
+        self._use_pit_head = self.num_actions == self.leg_action_dim
 
         self.head_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
         self.ee_encoder = ConvEncoder(in_ch=self.img_channels, out_dim=enc_dim)
@@ -106,21 +117,27 @@ class TaskDStudentActorCritic(nn.Module):
         )
 
         self.memory_a = Memory(
-            fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_dim=rnn_hidden_dim
+            fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim
         )
         self.memory_c = Memory(
             fuse_dim + (64 if self._critic_priv_dim > 0 else 0),
             type=rnn_type,
             num_layers=rnn_num_layers,
-            hidden_dim=rnn_hidden_dim,
+            hidden_size=rnn_hidden_dim,
         )
 
-        # Keep actor head shape BC-compatible: 256 -> 256 -> action_dim
-        self.actor = nn.Sequential(
+        # Nav head (BC checkpoint keys: actor.*) + optional pit e2e leg head (12D actions).
+        self.nav_actor = nn.Sequential(
             nn.Linear(rnn_hidden_dim, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, num_actions),
+            nn.Linear(256, self.nav_action_dim),
         )
+        self.pit_actor = nn.Sequential(
+            nn.Linear(rnn_hidden_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, self.leg_action_dim),
+        )
+        self.actor = self.nav_actor
         critic_in_dim = fuse_dim + (64 if self._critic_priv_dim > 0 else 0)
         self.critic = MLP(rnn_hidden_dim, 1, critic_hidden_dims, "elu")
         self.actor_obs_normalizer = (
@@ -178,6 +195,9 @@ class TaskDStudentActorCritic(nn.Module):
         out = self.fuse(torch.cat([h_feat, e_feat, p_feat], dim=-1))
         return out.view(*lead_shape, -1)
 
+    def _actor_head(self) -> nn.Module:
+        return self.pit_actor if self._use_pit_head else self.nav_actor
+
     def _encode_actor(self, flat_obs: torch.Tensor) -> torch.Tensor:
         return self._encode_base(flat_obs)
 
@@ -191,17 +211,17 @@ class TaskDStudentActorCritic(nn.Module):
         return torch.cat([base, priv_feat], dim=-1)
 
     def update_distribution(self, encoded_obs: torch.Tensor):
-        mean = self.actor(encoded_obs)
+        mean = self._actor_head()(encoded_obs)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         else:
             std = torch.exp(self.log_std).expand_as(mean)
         self.distribution = Normal(mean, std)
 
-    def act(self, obs: dict, masks=None, hidden_state=None) -> torch.Tensor:
+    def act(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
         encoded = self._encode_actor(self._get_flat_obs(obs, self.obs_groups["policy"]))
         encoded = self.actor_obs_normalizer(encoded)
-        out_mem = self.memory_a(encoded, masks, hidden_state).squeeze(0)
+        out_mem = self.memory_a(encoded, masks, hidden_states).squeeze(0)
         self.update_distribution(out_mem)
         return self.distribution.sample()
 
@@ -209,12 +229,12 @@ class TaskDStudentActorCritic(nn.Module):
         encoded = self._encode_actor(self._get_flat_obs(obs, self.obs_groups["policy"]))
         encoded = self.actor_obs_normalizer(encoded)
         out_mem = self.memory_a(encoded).squeeze(0)
-        return self.actor(out_mem)
+        return self._actor_head()(out_mem)
 
-    def evaluate(self, obs: dict, masks=None, hidden_state=None) -> torch.Tensor:
+    def evaluate(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
         encoded = self._encode_critic(self._get_flat_obs(obs, self.obs_groups["critic"]))
         encoded = self.critic_obs_normalizer(encoded)
-        out_mem = self.memory_c(encoded, masks, hidden_state).squeeze(0)
+        out_mem = self.memory_c(encoded, masks, hidden_states).squeeze(0)
         return self.critic(out_mem)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -233,8 +253,8 @@ class TaskDStudentActorCritic(nn.Module):
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
 
     def get_hidden_states(self):
-        return self.memory_a.hidden_state, self.memory_c.hidden_state
+        return self.memory_a.hidden_states, self.memory_c.hidden_states
 
     def detach_hidden_states(self, dones=None):
-        self.memory_a.detach_hidden_state(dones)
-        self.memory_c.detach_hidden_state(dones)
+        self.memory_a.detach_hidden_states(dones)
+        self.memory_c.detach_hidden_states(dones)

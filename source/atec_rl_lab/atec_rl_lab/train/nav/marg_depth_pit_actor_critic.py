@@ -1,4 +1,4 @@
-"""MARG-style asymmetric actor-critic with Estimator + Elevation encoders."""
+"""MARG-style pit actor-critic: depth CNN replaces elevation MLP (deploy-friendly)."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from atec_rl_lab.train.locomotion.marg.constants import (
     MARG_ESTIMATOR_CONTACT_DIM,
     MARG_ESTIMATOR_OUT_DIM,
     MARG_ESTIMATOR_VEL_DIM,
-    MARG_HEIGHT_MAP_DIM,
     MARG_HISTORY_DIM,
     MARG_PROPRIO_DIM,
 )
+from atec_rl_lab.train.nav.taskd_student_actor_critic import ConvEncoder
 
 
-class MargActorCritic(nn.Module):
-    """Asymmetric AC: actor uses proprio + estimated state + elevation; critic adds privileged state."""
+class MargDepthPitActorCritic(nn.Module):
+    """MARG asymmetric AC: estimator(history) + depth CNN (replaces height-map elevation)."""
 
     is_recurrent = False
 
@@ -41,14 +41,19 @@ class MargActorCritic(nn.Module):
         noise_std_type: str = "scalar",
         proprio_dim: int = MARG_PROPRIO_DIM,
         history_dim: int = MARG_HISTORY_DIM,
-        height_map_dim: int = MARG_HEIGHT_MAP_DIM,
+        depth_dim: int | None = None,
+        img_h: int = 24,
+        img_w: int = 32,
+        depth_channels: int = 1,
+        enc_dim: int = 128,
         critic_priv_dim: int = MARG_CRITIC_PRIV_DIM,
         estimator_hidden_dims: list | None = None,
-        elevation_hidden_dims: list | None = None,
+        depth_hidden_dims: list | None = None,
+        elevation_out_dim: int = MARG_ELEVATION_OUT_DIM,
         **kwargs,
     ):
         if kwargs:
-            print(f"[MargActorCritic] Ignoring extra kwargs: {list(kwargs)}")
+            print(f"[MargDepthPitActorCritic] Ignoring extra kwargs: {list(kwargs)}")
         super().__init__()
 
         if actor_hidden_dims is None:
@@ -57,23 +62,27 @@ class MargActorCritic(nn.Module):
             critic_hidden_dims = [512, 256, 128]
         if estimator_hidden_dims is None:
             estimator_hidden_dims = [128]
-        if elevation_hidden_dims is None:
-            elevation_hidden_dims = [128, 64]
+        if depth_hidden_dims is None:
+            depth_hidden_dims = [128, 64]
 
         self.obs_groups = obs_groups
+        self.img_h = int(img_h)
+        self.img_w = int(img_w)
+        self.depth_channels = int(depth_channels)
+        self.depth_flat_per_cam = self.depth_channels * self.img_h * self.img_w
+        self.depth_dim = int(depth_dim) if depth_dim is not None else 2 * self.depth_flat_per_cam
         self.proprio_dim = int(proprio_dim)
         self.history_dim = int(history_dim)
-        self.height_map_dim = int(height_map_dim)
         self.critic_priv_dim = int(critic_priv_dim)
         self.estimator_out_dim = MARG_ESTIMATOR_OUT_DIM
-        self.elevation_out_dim = MARG_ELEVATION_OUT_DIM
+        self.elevation_out_dim = int(elevation_out_dim)
 
         self._validate_obs(obs)
 
-        # Estimator: history -> (v_hat, c_hat)
         self.estimator = MLP(self.history_dim, self.estimator_out_dim, estimator_hidden_dims, activation)
-        # Elevation encoder: relative height map -> features
-        self.elevation = MLP(self.height_map_dim, self.elevation_out_dim, elevation_hidden_dims, activation)
+        self.head_depth_encoder = ConvEncoder(in_ch=self.depth_channels, out_dim=enc_dim)
+        self.ee_depth_encoder = ConvEncoder(in_ch=self.depth_channels, out_dim=enc_dim)
+        self.depth_fusion = MLP(enc_dim + enc_dim, self.elevation_out_dim, depth_hidden_dims, activation)
 
         actor_in = self.proprio_dim + self.estimator_out_dim + self.elevation_out_dim
         critic_in = self.proprio_dim + self.critic_priv_dim + self.elevation_out_dim
@@ -104,30 +113,43 @@ class MargActorCritic(nn.Module):
         Normal.set_default_validate_args(False)
 
         print(
-            f"[MargActorCritic] estimator {self.history_dim}->{self.estimator_out_dim}, "
-            f"elevation {self.height_map_dim}->{self.elevation_out_dim}, "
-            f"actor_in={actor_in}, critic_in={critic_in}, "
-            f"noise_std=[{init_noise_std:.2f}, {self.max_noise_std:.2f}]",
+            f"[MargDepthPitActorCritic] estimator {self.history_dim}->{self.estimator_out_dim}, "
+            f"depth CNN 2x{self.depth_channels}x{self.img_h}x{self.img_w}->{self.elevation_out_dim}, "
+            f"actor_in={actor_in}, critic_in={critic_in}, actions={num_actions}",
             flush=True,
         )
-        print(f"[MargActorCritic] actor MLP: {self.actor}", flush=True)
-        print(f"[MargActorCritic] critic MLP: {self.critic}", flush=True)
 
     def _validate_obs(self, obs: dict) -> None:
         expected = {
             "proprio": self.proprio_dim,
             "proprio_history": self.history_dim,
-            "height_map": self.height_map_dim,
+            "depth": self.depth_dim,
             "critic_priv": self.critic_priv_dim,
         }
         for key, dim in expected.items():
             if key not in obs:
-                raise KeyError(f"MargActorCritic requires observation group '{key}'")
+                raise KeyError(f"MargDepthPitActorCritic requires observation group '{key}'")
             if obs[key].shape[-1] != dim:
                 raise ValueError(
-                    f"Observation '{key}' dim {obs[key].shape[-1]} != expected {dim}. "
-                    "Check MARG observation terms in env cfg."
+                    f"Observation '{key}' dim {obs[key].shape[-1]} != expected {dim}."
                 )
+
+    def _split_depth(self, depth_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        half = self.depth_flat_per_cam
+        if depth_flat.shape[-1] != 2 * half:
+            raise ValueError(
+                f"depth dim {depth_flat.shape[-1]} != expected {2 * half} "
+                f"(2 x {self.depth_channels}x{self.img_h}x{self.img_w})"
+            )
+        batch = depth_flat.shape[0]
+        head = depth_flat[:, :half].reshape(batch, self.depth_channels, self.img_h, self.img_w)
+        ee = depth_flat[:, half:].reshape(batch, self.depth_channels, self.img_h, self.img_w)
+        return head, ee
+
+    def _encode_depth(self, depth_flat: torch.Tensor) -> torch.Tensor:
+        head, ee = self._split_depth(depth_flat)
+        feat = torch.cat([self.head_depth_encoder(head), self.ee_depth_encoder(ee)], dim=-1)
+        return self.depth_fusion(feat)
 
     def reset(self, dones=None):
         pass
@@ -147,23 +169,20 @@ class MargActorCritic(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def _obs_tensor(self, obs: dict, key: str) -> torch.Tensor:
-        return obs[key]
-
     def _encode_actor(self, obs: dict) -> torch.Tensor:
-        proprio = self._obs_tensor(obs, "proprio")
-        history = self._obs_tensor(obs, "proprio_history")
-        height = self._obs_tensor(obs, "height_map")
+        proprio = obs["proprio"]
+        history = obs["proprio_history"]
+        depth = obs["depth"]
         est_out = self.estimator(history)
-        elev_out = self.elevation(height)
-        return torch.cat([proprio, est_out, elev_out], dim=-1)
+        depth_out = self._encode_depth(depth)
+        return torch.cat([proprio, est_out, depth_out], dim=-1)
 
     def _encode_critic(self, obs: dict) -> torch.Tensor:
-        proprio = self._obs_tensor(obs, "proprio")
-        height = self._obs_tensor(obs, "height_map")
-        priv = self._obs_tensor(obs, "critic_priv")
-        elev_out = self.elevation(height)
-        return torch.cat([proprio, priv, elev_out], dim=-1)
+        proprio = obs["proprio"]
+        depth = obs["depth"]
+        priv = obs["critic_priv"]
+        depth_out = self._encode_depth(depth)
+        return torch.cat([proprio, priv, depth_out], dim=-1)
 
     def _clamped_action_std(self, mean: torch.Tensor) -> torch.Tensor:
         if self.noise_std_type == "scalar":
@@ -212,9 +231,8 @@ class MargActorCritic(nn.Module):
         return self._encode_critic(obs)
 
     def estimator_regression_loss(self, obs) -> torch.Tensor:
-        """MARG loss_reg: MSE(v_hat, v) + MSE(c_hat, c) using privileged targets."""
-        est_out = self.estimator(self._obs_tensor(obs, "proprio_history"))
-        targets = self._obs_tensor(obs, "critic_priv")[:, : self.estimator_out_dim]
+        est_out = self.estimator(obs["proprio_history"])
+        targets = obs["critic_priv"][:, : self.estimator_out_dim]
         v_dim = MARG_ESTIMATOR_VEL_DIM
         c_dim = MARG_ESTIMATOR_CONTACT_DIM
         v_hat = est_out[:, :v_dim]

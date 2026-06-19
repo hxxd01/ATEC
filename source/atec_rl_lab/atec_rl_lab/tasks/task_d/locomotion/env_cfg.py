@@ -165,10 +165,23 @@ class TaskDPitMargObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
+    @configclass
+    class DepthCfg(ObsGroup):
+        depth = ObsTerm(
+            func=task_d_loco_mdp.marg_depth_flat,
+            clip=(-1.0, 1.0),
+            scale=1.0,
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     proprio: ProprioCfg = ProprioCfg()
     proprio_history: ProprioHistoryCfg = ProprioHistoryCfg()
     height_map: HeightMapCfg = HeightMapCfg()
     critic_priv: CriticPrivCfg = CriticPrivCfg()
+    depth: DepthCfg | None = None
 
 
 @configclass
@@ -611,6 +624,12 @@ class UnitreeB2PiperTaskDPitLocomotionMargEnvCfg(UnitreeB2PiperTaskDPitLocomotio
     """Task D pit locomotion with MARG asymmetric AC observations (height map + privileged critic)."""
 
     observations: TaskDPitMargObservationsCfg = TaskDPitMargObservationsCfg()
+    depth_policy_h: int = 24
+    depth_policy_w: int = 32
+    depth_render_h: int | None = None
+    depth_render_w: int | None = None
+    depth_max: float = 5.0
+    depth_only: bool = True
 
     def __post_init__(self):
         super().__post_init__()

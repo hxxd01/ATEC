@@ -320,8 +320,9 @@ class AlgSolution:
     def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
         return prep_depth(
             x.to(self.device),
-            image_h=self.image_hw,
-            image_w=self.image_hw,
+            image_hw=self.image_hw,
+            depth_render_h=self.depth_render_h,
+            depth_render_w=self.depth_render_w,
             depth_max=self.depth_max,
         )
 

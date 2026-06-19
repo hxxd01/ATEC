@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
@@ -78,6 +81,30 @@ def _foot_body_ids(env: ManagerBasedEnv, body_names: list[str] | None) -> list[i
     return foot_ids
 
 
+def _resolve_contact_foot_sensor_ids(
+    contact_sensor: ContactSensor,
+    contact_sensor_cfg: SceneEntityCfg,
+    foot_body_names: list[str] | None,
+) -> list[int]:
+    """Resolve foot indices in the contact sensor (handles unresolved SceneEntityCfg)."""
+    body_ids = contact_sensor_cfg.body_ids
+    if isinstance(body_ids, int):
+        return [body_ids]
+    if isinstance(body_ids, list) and len(body_ids) > 0:
+        return body_ids
+
+    names = contact_sensor_cfg.body_names
+    if names is None:
+        names = foot_body_names if foot_body_names is not None else ".*_foot"
+    foot_sensor_ids, _ = contact_sensor.find_bodies(names, preserve_order=contact_sensor_cfg.preserve_order)
+    if len(foot_sensor_ids) == 0:
+        raise RuntimeError(
+            f"No contact sensor bodies matched {names!r}; "
+            f"available={contact_sensor.body_names}"
+        )
+    return foot_sensor_ids
+
+
 def _marg_proprio_vector(
     env: ManagerBasedEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -145,6 +172,12 @@ def marg_proprio_history(
     return hist.reshape(env.num_envs, MARG_HISTORY_DIM)
 
 
+def marg_proprio_history_read(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return stacked proprio history without advancing (use after inner env already updated it)."""
+    hist = _get_proprio_history_buffer(env)
+    return hist.reshape(env.num_envs, MARG_HISTORY_DIM)
+
+
 def marg_height_map(
     env: ManagerBasedEnv,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
@@ -152,6 +185,86 @@ def marg_height_map(
 ) -> torch.Tensor:
     """Egocentric relative height map (187D) for the elevation encoder."""
     return vel_mdp.height_scan(env, sensor_cfg=sensor_cfg, offset=offset)
+
+
+def _prep_depth_tensor(
+    x: torch.Tensor,
+    *,
+    image_h: int,
+    image_w: int,
+    depth_render_h: int | None,
+    depth_render_w: int | None,
+    depth_max: float,
+) -> torch.Tensor:
+    _demo_dir = Path(__file__).resolve().parents[7] / "demo"
+    if str(_demo_dir) not in sys.path:
+        sys.path.insert(0, str(_demo_dir))
+    from depth_preprocess import prep_depth as _prep_depth_shared  # noqa: E402
+
+    return _prep_depth_shared(
+        x,
+        image_h=int(image_h),
+        image_w=int(image_w),
+        depth_render_h=depth_render_h,
+        depth_render_w=depth_render_w,
+        depth_max=float(depth_max),
+    )
+
+
+def marg_depth_flat(
+    env: ManagerBasedEnv,
+    head_sensor_cfg: SceneEntityCfg = SceneEntityCfg("head_camera"),
+    ee_sensor_cfg: SceneEntityCfg = SceneEntityCfg("ee_camera"),
+) -> torch.Tensor:
+    """Flatten head+ee depth for depth student (matches demo/server prep_depth pipeline)."""
+    cfg = env.cfg
+    policy_h = int(getattr(cfg, "depth_policy_h", 24))
+    policy_w = int(getattr(cfg, "depth_policy_w", 32))
+    depth_max = float(getattr(cfg, "depth_max", 5.0))
+    depth_only = bool(getattr(cfg, "depth_only", True))
+    render_h = getattr(cfg, "depth_render_h", None)
+    render_w = getattr(cfg, "depth_render_w", None)
+    flat_per_cam = (1 if depth_only else 4) * policy_h * policy_w
+    batch = env.num_envs
+
+    def _flat(cam_name: str) -> torch.Tensor:
+        try:
+            cam = env.scene[cam_name]
+            out = cam.data.output
+            if depth_only:
+                if "depth" not in out:
+                    raise KeyError(f"{cam_name} missing depth")
+                return _prep_depth_tensor(
+                    out["depth"].to(device=env.device),
+                    image_h=policy_h,
+                    image_w=policy_w,
+                    depth_render_h=render_h,
+                    depth_render_w=render_w,
+                    depth_max=depth_max,
+                ).reshape(batch, -1)
+            if "rgb" not in out or "depth" not in out:
+                raise KeyError(f"{cam_name} missing rgb/depth")
+            rgb = out["rgb"].to(device=env.device).float()
+            if rgb.max() > 1.5:
+                rgb = rgb / 255.0
+            rgb = rgb.permute(0, 3, 1, 2).contiguous()
+            if rgb.shape[-2:] != (policy_h, policy_w):
+                rgb = F.interpolate(
+                    rgb, size=(policy_h, policy_w), mode="bilinear", align_corners=False
+                )
+            depth = _prep_depth_tensor(
+                out["depth"].to(device=env.device),
+                image_h=policy_h,
+                image_w=policy_w,
+                depth_render_h=render_h,
+                depth_render_w=render_w,
+                depth_max=depth_max,
+            )
+            return torch.cat([rgb, depth], dim=1).reshape(batch, -1)
+        except Exception:
+            return torch.zeros(batch, flat_per_cam, device=env.device, dtype=torch.float32)
+
+    return torch.cat([_flat(head_sensor_cfg.name), _flat(ee_sensor_cfg.name)], dim=-1)
 
 
 def marg_critic_privileged(
@@ -169,9 +282,9 @@ def marg_critic_privileged(
     base_lin_vel = vel_mdp.base_lin_vel(env, asset_cfg=asset_cfg)
 
     contact_sensor: ContactSensor = env.scene.sensors[contact_sensor_cfg.name]
-    foot_sensor_ids = contact_sensor_cfg.body_ids
-    if foot_sensor_ids is None or len(foot_sensor_ids) == 0:
-        foot_sensor_ids = list(range(len(foot_ids)))
+    foot_sensor_ids = _resolve_contact_foot_sensor_ids(
+        contact_sensor, contact_sensor_cfg, foot_body_names
+    )
     contact_forces = contact_sensor.data.net_forces_w_history[:, -1, foot_sensor_ids, :]
     foot_contact = (contact_forces.norm(dim=-1) > 1.0).to(dtype=torch.float32)
 

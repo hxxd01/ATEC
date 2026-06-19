@@ -50,7 +50,9 @@ class MargPPO(PPO):
                         advantages_batch.std() + 1e-8
                     )
 
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.update_policy_distribution(
+                obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]
+            )
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
 

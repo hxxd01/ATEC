@@ -8,7 +8,12 @@ from datetime import datetime
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Train Task D student policy (BC warm-start + PPO).")
-parser.add_argument("--ll_policy", type=str, required=True, help="Low-level locomotion policy (.pt)")
+parser.add_argument(
+    "--ll_policy",
+    type=str,
+    default=None,
+    help="Low-level locomotion JIT (.pt). Required for nav student; not used for pit e2e / pit MARG modes.",
+)
 parser.add_argument("--bc_ckpt", type=str, default=None, help="BC checkpoint path (best.pt/last.pt)")
 parser.add_argument("--num_envs", type=int, default=32)
 parser.add_argument(
@@ -207,10 +212,78 @@ pit_grp.add_argument("--pit_sim_easy", action="store_true", help="Pit train: sim
 pit_grp.add_argument("--pit_sim_easy_vx", type=float, default=1.0)
 pit_grp.add_argument("--pit_spawn_x_offset", type=float, default=0.0)
 pit_grp.add_argument("--pit_spawn_local_x", type=float, default=None)
+pit_grp.add_argument(
+    "--pit_spawn_x_jitter",
+    type=float,
+    default=None,
+    help=(
+        "Uniform random ± jitter on env-local spawn x at reset (m). "
+        "Default 0 (off) for student pit train; pass e.g. 0.5 to enable uniform ± jitter."
+    ),
+)
 pit_grp.add_argument("--pit_warmup_steps", type=int, default=0, help="MARG history warmup before pit play video.")
 pit_grp.add_argument("--pit_stochastic", action="store_true", help="Stochastic actions during pit play.")
 pit_grp.add_argument("--pit_debug", action="store_true", help="Print pit play stats every 50 steps.")
 pit_grp.add_argument("--pit_real_time", action="store_true", help="Real-time pit play loop.")
+pit_grp.add_argument(
+    "--no_pit_box",
+    action="store_true",
+    help="Disable Task D push box in pit student DAgger/PPO train env (box is on by default).",
+)
+
+e2e_grp = parser.add_argument_group(
+    "student pit e2e",
+    "Shared student depth encoder + GRU; pit_actor outputs 12 leg actions (demo/server.py obs). "
+    "Same pit env rewards/terminations; no --ll_policy.",
+)
+e2e_grp.add_argument(
+    "--student_pit_e2e",
+    action="store_true",
+    help=(
+        "Single-stage PPO fine-tune for MargDepthPitActorCritic (100% student rollouts, no teacher). "
+        "Same Marg env + obs_manager as DAgger/play. "
+        "With --resume on a DAgger BC ckpt: loads weights only, iter resets to 0 (finetune phase)."
+    ),
+)
+e2e_grp.add_argument(
+    "--finetune_from_dagger",
+    action="store_true",
+    help=(
+        "Explicit: --student_pit_e2e + --resume <dagger model_*.pt>. "
+        "Loads BC weights, fresh optimizer, iter=0, env/cmd matched to DAgger (vx≈0.6 unless overridden)."
+    ),
+)
+e2e_grp.add_argument(
+    "--student_pit_dagger",
+    action="store_true",
+    help="DAgger train depth student with frozen MARG height-map teacher (--pit_teacher_ckpt required).",
+)
+e2e_grp.add_argument(
+    "--pit_teacher_ckpt",
+    type=str,
+    default=None,
+    help="MARG pit teacher checkpoint (MargActorCritic) for --student_pit_dagger.",
+)
+e2e_grp.add_argument("--dagger_coef", type=float, default=1.0, help="BC loss weight on teacher leg actions.")
+e2e_grp.add_argument(
+    "--dagger_beta",
+    type=float,
+    default=1.0,
+    help="Initial rollout mix: P(execute teacher action). Decays to --dagger_beta_end.",
+)
+e2e_grp.add_argument("--dagger_beta_end", type=float, default=0.0)
+e2e_grp.add_argument("--dagger_beta_decay_iters", type=int, default=4000)
+e2e_grp.add_argument(
+    "--no_teacher_warmstart",
+    action="store_true",
+    help="Skip copying teacher estimator into depth student at init.",
+)
+e2e_grp.add_argument(
+    "--student_encoder_ckpt",
+    type=str,
+    default=None,
+    help="Warm-start shared encoder/GRU from nav student or BC ckpt (loads encoders only, fresh pit head).",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -218,10 +291,26 @@ if args_cli.pit_marg_locomotion and args_cli.pit_marg_play:
     parser.error("Use only one of --pit_marg_locomotion or --pit_marg_play.")
 if args_cli.pit_marg_play and not (args_cli.pit_checkpoint or args_cli.checkpoint):
     parser.error("--pit_marg_play requires --pit_checkpoint or --checkpoint.")
-# Student policy reads head/ee camera buffers; pit MARG uses height_scanner only.
-if not args_cli.pit_marg_locomotion and not args_cli.pit_marg_play:
-    args_cli.enable_cameras = True
-elif args_cli.pit_marg_play and args_cli.video:
+if args_cli.student_pit_dagger and not args_cli.pit_teacher_ckpt:
+    parser.error("--student_pit_dagger requires --pit_teacher_ckpt.")
+if args_cli.student_pit_dagger and args_cli.student_pit_e2e:
+    parser.error("Use only one of --student_pit_dagger or --student_pit_e2e.")
+if args_cli.finetune_from_dagger and args_cli.student_pit_dagger:
+    parser.error("Use --finetune_from_dagger with --student_pit_e2e, not --student_pit_dagger.")
+if args_cli.finetune_from_dagger and not args_cli.resume:
+    parser.error("--finetune_from_dagger requires --resume <dagger_bc_checkpoint>.")
+if args_cli.finetune_from_dagger:
+    args_cli.student_pit_e2e = True
+_nav_modes = (
+    not args_cli.pit_marg_locomotion
+    and not args_cli.pit_marg_play
+    and not args_cli.student_pit_e2e
+    and not args_cli.student_pit_dagger
+)
+if _nav_modes and not args_cli.ll_policy:
+    parser.error("--ll_policy is required for Task D nav student training.")
+# Student / pit-e2e use cameras; pit MARG train uses height_scanner only.
+if _nav_modes or args_cli.student_pit_e2e or args_cli.student_pit_dagger or (args_cli.pit_marg_play and args_cli.video):
     args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
@@ -242,9 +331,28 @@ from atec_rl_lab.tasks.task_d.env_cfg import (
     refresh_task_d_terrain_cfg,
 )
 from atec_rl_lab.train.nav.taskd_student_env import TaskDStudentEnv
-from atec_rl_lab.train.nav.nav_cfg import TaskDStudentPPORunnerCfg
+from atec_rl_lab.train.nav.nav_cfg import (
+    TaskDStudentPPORunnerCfg,
+    TaskDMargDepthPitE2EPPORunnerCfg,
+    TaskDMargDepthPitDaggerPPORunnerCfg,
+)
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
 from atec_rl_lab.train.nav.taskd_student_actor_critic import TaskDStudentActorCritic
+from atec_rl_lab.train.nav.taskd_marg_depth_pit_e2e_env import configure_pit_e2e_cameras
+from atec_rl_lab.train.nav.taskd_student_pit_e2e_env import (
+    attach_dagger_depth_obs,
+    configure_pit_e2e_dagger_env_cfg,
+    configure_pit_e2e_env_cfg,
+)
+from atec_rl_lab.train.pit_marg.taskd_pit_marg_runner import register_marg_modules
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+from atec_rl_lab.train.nav.marg_depth_pit_actor_critic import MargDepthPitActorCritic
+from atec_rl_lab.train.locomotion.marg.marg_ppo import MargPPO
+from atec_rl_lab.train.pit_marg.marg_pit_dagger_ppo import MargPitDaggerPPO
+from atec_rl_lab.train.pit_marg.marg_teacher_loader import (
+    load_marg_teacher_checkpoint,
+    warmstart_depth_student_from_teacher,
+)
 
 import rsl_rl.runners.on_policy_runner as _runner_mod
 
@@ -299,7 +407,7 @@ def _sync_ppo_learning_rate(runner) -> float:
     return lr
 
 
-def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True) -> None:
+def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True) -> dict:
     loaded = torch.load(ckpt_path, map_location=runner.device, weights_only=False)
     ckpt_sd = loaded["model_state_dict"]
     policy = _get_policy_module(runner.alg)
@@ -344,6 +452,122 @@ def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True)
         print(f"[INFO] Partially loaded keys: {partial_keys}", flush=True)
     if skipped_keys:
         print(f"[INFO] Skipped keys (shape mismatch): {skipped_keys[:8]}", flush=True)
+    return loaded
+
+
+def _pit_marg_depth_ckpt_kind(ckpt_path: str) -> str | None:
+    """Infer 'dagger' | 'e2e' from checkpoint log folder name."""
+    ckpt_dir = os.path.abspath(os.path.dirname(os.path.abspath(ckpt_path)))
+    exp_name = os.path.basename(os.path.dirname(ckpt_dir))
+    if "dagger" in exp_name:
+        return "dagger"
+    if "e2e" in exp_name:
+        return "e2e"
+    return None
+
+
+def _is_finetune_from_dagger(args_cli) -> bool:
+    """Load DAgger BC ckpt into single-stage PPO (not continue DAgger)."""
+    if bool(getattr(args_cli, "finetune_from_dagger", False)):
+        return True
+    if not getattr(args_cli, "resume", None) or getattr(args_cli, "student_pit_dagger", False):
+        return False
+    if not getattr(args_cli, "student_pit_e2e", False):
+        return False
+    return _pit_marg_depth_ckpt_kind(args_cli.resume) == "dagger"
+
+
+def _validate_pit_marg_depth_resume(ckpt_path: str, *, dagger: bool, finetune_from_dagger: bool = False) -> None:
+    """Reject resume when checkpoint training mode does not match CLI flags."""
+    ckpt = os.path.abspath(ckpt_path)
+    if not os.path.isfile(ckpt):
+        raise FileNotFoundError(f"Resume checkpoint not found: {ckpt}")
+    kind = _pit_marg_depth_ckpt_kind(ckpt)
+    if finetune_from_dagger:
+        if kind != "dagger":
+            raise ValueError(
+                f"--finetune_from_dagger expects a DAgger BC checkpoint, got path kind={kind!r}: {ckpt}"
+            )
+        print(
+            f"[TaskDMargDepthPitFinetune] DAgger BC ckpt -> single-stage PPO "
+            f"(weights only, iter=0, same obs as play)",
+            flush=True,
+        )
+        return
+    mode = "dagger" if dagger else "e2e"
+    if kind is None:
+        print(
+            f"[WARN] Cannot infer checkpoint mode from path ({ckpt}); "
+            f"ensure --student_pit_{mode} matches how it was trained.",
+            flush=True,
+        )
+        return
+    if kind != mode:
+        if kind == "dagger" and not dagger:
+            raise ValueError(
+                f"Checkpoint {ckpt} is from DAgger BC training. "
+                "To fine-tune with single-stage PPO use --student_pit_e2e --resume <ckpt> "
+                "(or --finetune_from_dagger). To continue DAgger use --student_pit_dagger --resume <ckpt>."
+            )
+        other_flag = "--student_pit_dagger" if kind == "dagger" else "--student_pit_e2e"
+        this_flag = "--student_pit_dagger" if dagger else "--student_pit_e2e"
+        raise ValueError(
+            f"Checkpoint {ckpt} is from a {kind} run but you passed {this_flag}. "
+            f"Use {other_flag} (same obs manager + Marg env as play)."
+        )
+
+
+def _restore_dagger_schedule(runner) -> None:
+    """Sync dagger_beta decay with resumed learning iteration."""
+    alg = runner.alg
+    if not hasattr(alg, "set_dagger_iteration"):
+        return
+    iter_idx = int(runner.current_learning_iteration)
+    alg._dagger_updates = iter_idx
+    alg.set_dagger_iteration(iter_idx)
+    print(
+        f"[TaskDMargDepthPitDAgger] restored schedule at iter={iter_idx}, "
+        f"dagger_beta={alg.dagger_beta:.4f}",
+        flush=True,
+    )
+
+
+def _load_pit_finetune_from_dagger(runner, ckpt_path: str) -> None:
+    """Load DAgger BC policy weights; fresh PPO optimizer; restart iteration counter."""
+    loaded = torch.load(ckpt_path, map_location=runner.device, weights_only=False)
+    ckpt_sd = loaded["model_state_dict"]
+    policy = _get_policy_module(runner.alg)
+    model_sd = policy.state_dict()
+    merged, loaded_keys, partial_keys, skipped_keys = _merge_state_dict_partial(model_sd, ckpt_sd)
+    policy.load_state_dict(merged, strict=False)
+    runner.current_learning_iteration = 0
+    src_iter = loaded.get("iter")
+    print(
+        f"[TaskDMargDepthPitFinetune] loaded BC weights from iter={src_iter} "
+        f"(exact={len(loaded_keys)}, partial={len(partial_keys)}, skipped={len(skipped_keys)}); "
+        "optimizer=fresh MargPPO, learning starts at iter=0",
+        flush=True,
+    )
+    if skipped_keys:
+        print(f"[WARN] Finetune skipped tensors: {skipped_keys[:8]}", flush=True)
+    print(
+        "[INFO] Finetune obs: MargEnvCfg + obs_manager "
+        "(proprio, proprio_history, depth); 100% student rollouts.",
+        flush=True,
+    )
+
+
+def _load_pit_marg_depth_resume(runner, ckpt_path: str, *, dagger: bool, load_optimizer: bool) -> None:
+    loaded = _load_ppo_checkpoint(runner, ckpt_path, load_optimizer=load_optimizer)
+    if dagger:
+        _restore_dagger_schedule(runner)
+    resume_iter = loaded.get("iter")
+    if resume_iter is not None:
+        print(
+            "[INFO] Resume obs path: MargEnvCfg + obs_manager "
+            "(proprio, proprio_history, depth, critic_priv); play uses the same stack.",
+            flush=True,
+        )
 
 
 def _write_depth_video(frames: list, path: str, fps: float) -> None:
@@ -494,6 +718,232 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool
     )
     if skipped:
         print(f"[INFO] Example skipped keys: {skipped[:5]}", flush=True)
+
+
+_ENCODER_PREFIXES = (
+    "head_encoder.",
+    "ee_encoder.",
+    "proprio_mlp.",
+    "fuse.",
+    "memory_a.",
+    "actor_obs_normalizer.",
+)
+
+
+def _load_student_encoders_for_pit(actor_critic, ckpt_path: str) -> None:
+    """Warm-start pit e2e shared trunk from nav student / BC checkpoint."""
+    loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt_sd = loaded["model_state_dict"] if isinstance(loaded, dict) and "model_state_dict" in loaded else loaded
+    model_sd = actor_critic.state_dict()
+    loaded_n = 0
+    for key, val in ckpt_sd.items():
+        mapped = key
+        if key.startswith("actor.") and not key.startswith("actor_obs_normalizer."):
+            continue
+        if mapped not in model_sd:
+            continue
+        if not any(mapped.startswith(p) for p in _ENCODER_PREFIXES):
+            continue
+        if tuple(model_sd[mapped].shape) != tuple(val.shape):
+            continue
+        model_sd[mapped] = val
+        loaded_n += 1
+    actor_critic.load_state_dict(model_sd, strict=False)
+    print(
+        f"[INFO] Pit e2e encoder warm-start: loaded {loaded_n} tensors from {ckpt_path} "
+        "(pit_actor head remains randomly initialized).",
+        flush=True,
+    )
+
+
+def _run_student_pit_e2e_train(args_cli, device: str, *, dagger: bool = False) -> None:
+    import rsl_rl.runners.on_policy_runner as _runner_mod
+
+    finetune = _is_finetune_from_dagger(args_cli)
+    if args_cli.resume:
+        _validate_pit_marg_depth_resume(
+            args_cli.resume, dagger=dagger, finetune_from_dagger=finetune
+        )
+
+    _runner_mod.MargDepthPitActorCritic = MargDepthPitActorCritic
+    _runner_mod.MargPPO = MargPPO
+    if dagger:
+        _runner_mod.MargPitDaggerPPO = MargPitDaggerPPO
+
+    cam_h, cam_w, policy_h, policy_w, depth_mode = _resolve_depth_pipeline(args_cli)
+    camera_far_clip = _resolve_camera_far_clip(args_cli.camera_far_clip)
+    if dagger or finetune:
+        # Finetune from DAgger BC: keep same cmd/env as BC (fixed vx≈0.6 unless CLI overrides).
+        env_cfg = configure_pit_e2e_dagger_env_cfg(args_cli)
+    else:
+        env_cfg = configure_pit_e2e_env_cfg(args_cli)
+    decimation = int(getattr(env_cfg, "decimation", 4))
+    sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
+    phys_dt = decimation * sim_dt
+    configure_pit_e2e_cameras(
+        env_cfg,
+        camera_height=cam_h,
+        camera_width=cam_w,
+        depth_only=args_cli.depth_only,
+        tiled=args_cli.tiled_cameras,
+        camera_far_clip=camera_far_clip,
+        update_period=phys_dt,
+    )
+    attach_dagger_depth_obs(
+        env_cfg,
+        policy_h=policy_h,
+        policy_w=policy_w,
+        depth_max=float(args_cli.depth_max),
+        depth_only=bool(args_cli.depth_only),
+        depth_render_h=cam_h if depth_mode == "platform" else None,
+        depth_render_w=cam_w if depth_mode == "platform" else None,
+    )
+    mode_tag = "DAgger" if dagger else ("Finetune-PPO" if finetune else "PPO")
+    box_tag = "with Task D box" if not bool(getattr(args_cli, "no_pit_box", False)) else "no box"
+    print(
+        f"[TaskDMargDepthPit] mode={mode_tag}, vec_env=RslRlVecEnvWrapper, "
+        f"obs=proprio+proprio_history+depth(+height_map teacher-only), "
+        f"env={box_tag}, "
+        f"depth pipeline={depth_mode}, sim={cam_h}x{cam_w}, "
+        f"policy={policy_h}x{policy_w}, depth_only={args_cli.depth_only}, "
+        f"pit_width={env_cfg.pit_width_range}, success_post={env_cfg.pit_success_post_cross_distance}m, "
+        f"vx=[{env_cfg.command_lin_vel_x_min}, {env_cfg.command_lin_vel_x_max}] m/s, "
+        f"network=MARG(estimator+depthCNN)+12leg",
+        flush=True,
+    )
+
+    if dagger:
+        agent_cfg = TaskDMargDepthPitDaggerPPORunnerCfg()
+        agent_cfg.algorithm.dagger_coef = float(args_cli.dagger_coef)
+        agent_cfg.algorithm.dagger_beta = float(args_cli.dagger_beta)
+        agent_cfg.algorithm.dagger_beta_end = float(args_cli.dagger_beta_end)
+        agent_cfg.algorithm.dagger_beta_decay_iters = int(args_cli.dagger_beta_decay_iters)
+        register_marg_modules()
+    else:
+        agent_cfg = TaskDMargDepthPitE2EPPORunnerCfg()
+    agent_cfg.max_iterations = int(args_cli.max_iter)
+    agent_cfg.num_steps_per_env = int(args_cli.steps_per_env)
+    agent_cfg.policy.img_h = policy_h
+    agent_cfg.policy.img_w = policy_w
+    agent_cfg.policy.depth_channels = 1 if args_cli.depth_only else 4
+
+    log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+    log_dir = os.path.join(log_root, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
+
+    env = gym.make("ATEC-TaskD-PitLocomotion-B2Piper-v0", cfg=env_cfg)
+    clip_actions = getattr(agent_cfg, "clip_actions", None)
+    vec_env = RslRlVecEnvWrapper(env, clip_actions=clip_actions)
+    runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
+
+    if dagger:
+        obs_sample = {k: v for k, v in vec_env.get_observations().items()}
+        teacher_ckpt = os.path.abspath(args_cli.pit_teacher_ckpt)
+        teacher = load_marg_teacher_checkpoint(teacher_ckpt, obs_sample, device)
+        runner.alg.teacher = teacher
+        if not args_cli.no_teacher_warmstart and not args_cli.resume:
+            warmstart_depth_student_from_teacher(runner.alg.policy, teacher_ckpt)
+        elif args_cli.resume:
+            print("[INFO] Resume: skip teacher estimator warm-start (using checkpoint weights).", flush=True)
+        with torch.no_grad():
+            obs0 = {k: v for k, v in vec_env.get_observations().items()}
+            t_act = teacher.act_inference(
+                {
+                    "proprio": obs0["proprio"],
+                    "proprio_history": obs0["proprio_history"],
+                    "height_map": obs0["height_map"],
+                }
+            )
+            s_act = runner.alg.policy.act_inference(obs0)
+            act_mse = torch.mean((t_act - s_act) ** 2).item()
+        print(
+            f"[TaskDMargDepthPitDAgger] teacher={teacher_ckpt}, "
+            f"dagger_coef={args_cli.dagger_coef}, beta={args_cli.dagger_beta}->{args_cli.dagger_beta_end} "
+            f"over {args_cli.dagger_beta_decay_iters} iters, init student-vs-teacher action MSE={act_mse:.4f}",
+            flush=True,
+        )
+        # Quick teacher-only rollout: verify MARG history + height_map obs before PPO loop.
+        obs_roll = {k: v.clone() for k, v in vec_env.get_observations().items()}
+        teacher_obs_keys = ("proprio", "proprio_history", "height_map")
+        warmup = 6
+        for _ in range(warmup):
+            with torch.inference_mode():
+                t_act = teacher.act_inference({k: obs_roll[k] for k in teacher_obs_keys})
+            obs_roll, _, _, _ = vec_env.step(t_act)
+            obs_roll = {k: v for k, v in obs_roll.items()}
+        robot = vec_env.unwrapped.scene["robot"]
+        x0 = robot.data.root_pos_w[:, 0].clone()
+        for _ in range(24):
+            with torch.inference_mode():
+                t_act = teacher.act_inference({k: obs_roll[k] for k in teacher_obs_keys})
+            obs_roll, _, _, _ = vec_env.step(t_act)
+            obs_roll = {k: v for k, v in obs_roll.items()}
+        dx = float((robot.data.root_pos_w[:, 0] - x0).mean().item())
+        vx = float(robot.data.root_lin_vel_w[:, 0].mean().item())
+        act_norm = float(t_act.norm(dim=-1).mean().item())
+        print(
+            f"[TaskDMargDepthPitDAgger] teacher-only sanity (warmup={warmup}, then 24 steps): "
+            f"mean_dx={dx:.3f}m, mean_vx={vx:.3f}m/s, |action|={act_norm:.3f}",
+            flush=True,
+        )
+        if dx < 0.05:
+            print(
+                "[TaskDMargDepthPitDAgger] WARNING: teacher barely moved — check command_vx, "
+                "history reset, and teacher ckpt.",
+                flush=True,
+            )
+        vec_env.reset()
+
+    if args_cli.student_encoder_ckpt or args_cli.bc_ckpt:
+        print(
+            "[WARN] --student_encoder_ckpt/--bc_ckpt ignored for MARG-depth pit e2e "
+            "(different architecture from nav student GRU).",
+            flush=True,
+        )
+    if args_cli.resume:
+        if finetune:
+            print(f"[INFO] Finetune from DAgger BC: {args_cli.resume}", flush=True)
+            _load_pit_finetune_from_dagger(runner, args_cli.resume)
+        else:
+            mode_label = "DAgger" if dagger else "e2e"
+            print(f"[INFO] Resuming pit MARG-depth {mode_label} from {args_cli.resume}", flush=True)
+            _load_pit_marg_depth_resume(
+                runner,
+                args_cli.resume,
+                dagger=dagger,
+                load_optimizer=not args_cli.resume_no_optimizer,
+            )
+
+    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    if finetune:
+        mode_name = "marg_depth_pit_finetune_from_dagger"
+    else:
+        mode_name = "marg_depth_pit_dagger" if dagger else "marg_depth_pit_e2e"
+    deploy_notes = {
+        "mode": mode_name,
+        "init_ckpt": os.path.abspath(args_cli.resume) if finetune and args_cli.resume else None,
+        "teacher_ckpt": os.path.abspath(args_cli.pit_teacher_ckpt) if dagger else None,
+        "obs_groups": {
+            "proprio": "43D MARG leg proprio + cmd",
+            "proprio_history": "258D",
+            "depth": f"head+ee depth flat 2x{policy_h}x{policy_w}",
+            "critic_priv": "42D privileged (train only)",
+        },
+        "network": (
+            "MargDepthPitActorCritic: estimator(history)->7, depthCNN(head+ee)->16, "
+            "actor MLP 512-256-128 -> 12 legs (same layout as MargActorCritic w/ depth replacing elevation)"
+        ),
+        "deploy": "demo/server.py depth + MARG proprio; need solution pit_marg_depth mode (not nav GRU)",
+        "nav_student": "unchanged (TaskDStudentActorCritic separate)",
+    }
+    dump_yaml(os.path.join(log_dir, "params", "deploy_pit_e2e.yaml"), deploy_notes)
+
+    phase = "DAgger" if dagger else ("Finetune" if finetune else "e2e")
+    print(f"[INFO] Pit MARG-depth {phase} logging to {log_dir}", flush=True)
+    # MARG proprio history must align with episode resets; random ep len breaks estimator input.
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+    vec_env.close()
 
 
 def _print_env_origins_debug(base_env, *, env_spacing: float, show: int = 16) -> None:
@@ -647,6 +1097,14 @@ def main():
         return
 
     device = args_cli.device if args_cli.device else "cuda"
+
+    if args_cli.student_pit_dagger:
+        _run_student_pit_e2e_train(args_cli, device, dagger=True)
+        return
+
+    if args_cli.student_pit_e2e:
+        _run_student_pit_e2e_train(args_cli, device, dagger=False)
+        return
 
     env_cfg = TaskDEnvB2Cfg()
     env_cfg.scene.num_envs = args_cli.num_envs

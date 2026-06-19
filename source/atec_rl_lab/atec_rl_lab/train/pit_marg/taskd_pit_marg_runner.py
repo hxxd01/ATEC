@@ -190,6 +190,16 @@ def configure_play_terrain(env_cfg, *, pit_level: int, use_pit_curriculum: bool)
     env_cfg.scene.terrain.max_init_terrain_level = 0
 
 
+def _robot_spawn_reset_params(env_cfg):
+    """Pit locomotion uses reset_robot_task_d; full Task D uses reset_robot_root."""
+    events = env_cfg.events
+    if getattr(events, "reset_robot_task_d", None) is not None:
+        return events.reset_robot_task_d.params
+    if getattr(events, "reset_robot_root", None) is not None:
+        return events.reset_robot_root.params
+    raise AttributeError("env_cfg.events has neither reset_robot_task_d nor reset_robot_root")
+
+
 def apply_play_spawn(
     env_cfg,
     *,
@@ -202,7 +212,7 @@ def apply_play_spawn(
         local_pos = (float(spawn_local_x), base[1], base[2])
     else:
         local_pos = (base[0] + float(spawn_x_offset), base[1], base[2])
-    env_cfg.events.reset_robot_task_d.params["local_pos"] = local_pos
+    _robot_spawn_reset_params(env_cfg)["local_pos"] = local_pos
     print(
         f"[TaskDPitPlay] spawn local_pos={local_pos} "
         f"(default={base}, offset_x={float(spawn_x_offset):+.3f})",

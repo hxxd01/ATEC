@@ -1,0 +1,16 @@
+policy:
+  img_h: 24
+  img_w: 32
+  depth_channels: 1
+  depth_max: 5.0
+  enc_dim: 128
+  elevation_out_dim: 16
+  estimator_hidden_dims: [128]
+  depth_hidden_dims: [128, 64]
+  actor_obs_normalization: true
+  critic_obs_normalization: false
+  actor_hidden_dims: [512, 256, 128]
+  critic_hidden_dims: [512, 256, 128]
+  init_noise_std: 0.6
+  max_noise_std: 2.0
+  noise_std_type: scalar

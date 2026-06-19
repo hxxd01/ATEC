@@ -112,6 +112,9 @@ class TaskDStudentActorCriticCfg(RslRlPpoActorCriticCfg):
     rnn_hidden_dim: int = 256
     rnn_num_layers: int = 1
 
+    leg_action_dim: int = 12
+    nav_action_dim: int = 3
+
 
 @configclass
 class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
@@ -132,3 +135,101 @@ class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
     )
     algorithm = _PPO_ALG
+
+
+@configclass
+class TaskDStudentPitE2EPPORunnerCfg(TaskDStudentPPORunnerCfg):
+    """Legacy student GRU pit head (deprecated; use TaskDMargDepthPitE2EPPORunnerCfg)."""
+
+    num_steps_per_env = 24
+    max_iterations = 15000
+    experiment_name = "taskd_student_pit_e2e_b2piper"
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+
+    policy = TaskDStudentActorCriticCfg(
+        init_noise_std=0.6,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256],
+        critic_hidden_dims=[256, 128],
+        activation="elu",
+        leg_action_dim=12,
+        nav_action_dim=3,
+    )
+
+
+@configclass
+class MargDepthPitActorCriticCfg(RslRlPpoActorCriticCfg):
+    class_name: str = "MargDepthPitActorCritic"
+    img_h: int = 24
+    img_w: int = 32
+    depth_channels: int = 1
+    enc_dim: int = 128
+    elevation_out_dim: int = 16
+    estimator_hidden_dims: list = [128]
+    depth_hidden_dims: list = [128, 64]
+    init_noise_std: float = 0.6
+    max_noise_std: float = 2.0
+
+
+@configclass
+class MargDepthPitPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    class_name: str = "MargPPO"
+    reg_loss_coef: float = 5.0
+    value_loss_coef: float = 1.0
+    use_clipped_value_loss: bool = True
+    clip_param: float = 0.2
+    entropy_coef: float = 0.005
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    learning_rate: float = 1.0e-3
+    schedule: str = "adaptive"
+    gamma: float = 0.99
+    lam: float = 0.95
+    desired_kl: float = 0.01
+    max_grad_norm: float = 1.0
+
+
+@configclass
+class MargPitDaggerPpoAlgorithmCfg(MargDepthPitPpoAlgorithmCfg):
+    class_name: str = "MargPitDaggerPPO"
+    dagger_coef: float = 1.0
+    dagger_beta: float = 1.0
+    dagger_beta_end: float = 0.0
+    dagger_beta_decay_iters: int = 4000
+
+
+@configclass
+class TaskDMargDepthPitE2EPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """MARG layout + depth CNN (replaces height map); pit env rewards/terminations."""
+
+    num_steps_per_env = 24
+    max_iterations = 15000
+    save_interval = 100
+    experiment_name = "taskd_marg_depth_pit_e2e_b2piper"
+    obs_groups = {
+        "policy": ["proprio", "proprio_history", "depth"],
+        "critic": ["proprio", "depth", "critic_priv"],
+    }
+
+    policy = MargDepthPitActorCriticCfg(
+        actor_obs_normalization=True,
+        critic_obs_normalization=False,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="relu",
+    )
+    algorithm = MargDepthPitPpoAlgorithmCfg()
+
+
+@configclass
+class TaskDMargDepthPitDaggerPPORunnerCfg(TaskDMargDepthPitE2EPPORunnerCfg):
+    """Depth student + frozen MARG height-map teacher (DAgger)."""
+
+    experiment_name = "taskd_marg_depth_pit_dagger_b2piper"
+    algorithm = MargPitDaggerPpoAlgorithmCfg(
+        num_learning_epochs=3,
+        num_mini_batches=4,
+        learning_rate=5.0e-4,
+        entropy_coef=0.001,
+    )

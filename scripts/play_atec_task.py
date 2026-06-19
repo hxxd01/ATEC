@@ -106,11 +106,57 @@ parser.add_argument(
     default=False,
     help="Task D: keep 480x640 obs cameras, depth-only; solution prep_depth downsamples to policy size.",
 )
+parser.add_argument(
+    "--no_platform_depth",
+    action="store_true",
+    help="Teleop→pit: use --pit_cam_h/w sim cameras instead of platform 480x640.",
+)
+parser.add_argument(
+    "--teleop_traj",
+    type=str,
+    default=None,
+    help="Task D: teleop JSON replay before pit student (uses demo/solution_marg_depth_pit.py).",
+)
+parser.add_argument(
+    "--pit_ckpt",
+    type=str,
+    default=None,
+    help="Pit MARG depth student checkpoint (.pt). Implies --enable_cameras for depth obs.",
+)
+parser.add_argument(
+    "--pit_command_vx",
+    type=float,
+    default=None,
+    help="Forward command (m/s) for pit student phase (default 0.6).",
+)
+parser.add_argument("--pit_level", type=int, default=10, help="Fixed pit-width row for teleop→pit play.")
+parser.add_argument("--pit_width_min", type=float, default=1.4)
+parser.add_argument("--pit_width_max", type=float, default=1.4)
+parser.add_argument("--pit_cam_h", type=int, default=24, help="Obs camera height for pit depth student.")
+parser.add_argument("--pit_cam_w", type=int, default=32, help="Obs camera width for pit depth student.")
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
+
+if args_cli.teleop_traj:
+    os.environ["TELEOP_TRAJ_JSON"] = os.path.abspath(args_cli.teleop_traj)
+    if args_cli.task is None:
+        args_cli.task = "ATEC-TaskD-B2Piper"
+if args_cli.pit_ckpt:
+    os.environ["PIT_STUDENT_CKPT"] = os.path.abspath(args_cli.pit_ckpt)
+if args_cli.pit_command_vx is not None:
+    os.environ["PIT_COMMAND_VX"] = str(float(args_cli.pit_command_vx))
+
+_use_pit_solution = bool(
+    args_cli.teleop_traj or args_cli.pit_ckpt or os.environ.get("PIT_STUDENT_CKPT", "").strip()
+)
+if _use_pit_solution:
+    args_cli.fast = False
+    args_cli.enable_cameras = True
+    if not args_cli.no_platform_depth:
+        args_cli.platform_depth = True
 
 if args_cli.student_ckpt:
     os.environ["STUDENT_CKPT_PATH"] = os.path.abspath(args_cli.student_ckpt)
@@ -138,7 +184,10 @@ if args_cli.video:
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-from demo.solution import AlgSolution
+if _use_pit_solution:
+    from demo.solution_marg_depth_pit import AlgSolution
+else:
+    from demo.solution import AlgSolution
 
 print("[play] loading AlgSolution...", flush=True)
 solution = AlgSolution()
@@ -198,6 +247,73 @@ def _disable_lidar_keep_cameras(env_cfg) -> None:
     if hasattr(env_cfg, "observations"):
         env_cfg.observations.extero = None
     print("[play] Task D: lidar off, observation cameras kept.", flush=True)
+
+
+def _estimate_teleop_video_steps(traj_path: str, *, step_dt: float = 0.02) -> int:
+    with open(traj_path, encoding="utf-8") as f:
+        data = json.load(f)
+    delay = float(data.get("replay_delay_s", 2.0))
+    samples = data.get("samples") or []
+    if not samples:
+        return int(delay / step_dt) + 10
+    duration = float(samples[-1].get("t", 0.0)) - float(samples[0].get("t", 0.0))
+    return int((delay + max(0.0, duration)) / step_dt) + 10
+
+
+def _configure_taskd_pit_teleop_play(env_cfg, args) -> None:
+    """Minimal Task D play env: 1x1 terrain + platform or small depth cameras."""
+    import atec_rl_lab.tasks  # noqa: F401
+    from atec_rl_lab.train.nav.taskd_student_pit_e2e_env import (
+        align_taskd_image_obs_for_cameras,
+        configure_pit_e2e_cameras,
+    )
+    from atec_rl_lab.train.pit_marg.taskd_pit_marg_runner import apply_play_spawn, configure_play_terrain
+
+    num_envs = max(1, int(args.num_envs))
+    env_cfg.scene.num_envs = num_envs
+    env_cfg.pit_width_range = (float(args.pit_width_min), float(args.pit_width_max))
+    env_cfg.pit_curriculum_levels = 11
+    configure_play_terrain(env_cfg, pit_level=int(args.pit_level), use_pit_curriculum=False)
+    apply_play_spawn(env_cfg, spawn_x_offset=0.0, spawn_local_x=None)
+
+    if hasattr(env_cfg, "curriculum") and env_cfg.curriculum is not None:
+        env_cfg.curriculum.command_levels_lin_vel = None
+        env_cfg.curriculum.pit_width_levels = None
+
+    decimation = int(getattr(env_cfg, "decimation", 4))
+    sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
+    phys_dt = decimation * sim_dt
+    if bool(getattr(args, "platform_depth", False)):
+        cam_h, cam_w = 480, 640
+        cam_tag = "platform 480x640 depth-only (policy prep_depth→24x32)"
+    else:
+        cam_h = int(args.pit_cam_h)
+        cam_w = int(args.pit_cam_w)
+        cam_tag = f"{cam_h}x{cam_w} depth-only"
+    configure_pit_e2e_cameras(
+        env_cfg,
+        camera_height=cam_h,
+        camera_width=cam_w,
+        depth_only=True,
+        tiled=False,
+        camera_far_clip=5.0,
+        update_period=phys_dt,
+    )
+    align_taskd_image_obs_for_cameras(env_cfg)
+
+    if hasattr(env_cfg.scene, "ee_dual_camera"):
+        env_cfg.scene.ee_dual_camera = None
+    if hasattr(env_cfg, "observations") and env_cfg.observations.image is not None:
+        img = env_cfg.observations.image
+        for term in ("ee_dual_rgb", "ee_dual_depth"):
+            if hasattr(img, term):
+                setattr(img, term, None)
+
+    print(
+        f"[play] Task D teleop→pit: num_envs={num_envs}, minimal terrain, "
+        f"cameras={cam_tag}, pit_level={int(args.pit_level)}",
+        flush=True,
+    )
 
 
 # Task D box cuboid size in env_cfg.scene.box spawn (0.8, 1.0, 0.6) m.
@@ -591,7 +707,10 @@ def play() -> tuple[float, float]:
         use_fabric=not args_cli.disable_fabric
     )
 
-    if args_cli.fast:
+    if _use_pit_solution and _is_task_d:
+        _configure_taskd_pit_teleop_play(env_cfg, args_cli)
+        _disable_lidar_keep_cameras(env_cfg)
+    elif args_cli.fast:
         _disable_heavy_sensors(env_cfg)
     elif _is_task_d and not args_cli.full_obs:
         # Task D default previously kept LiDAR only for scripted navigation.
@@ -611,6 +730,14 @@ def play() -> tuple[float, float]:
 
     overlay_wrapper = None
     use_video_overlay = args_cli.video and not args_cli.no_video_overlay
+    video_length = int(args_cli.video_length)
+    if args_cli.video and args_cli.teleop_traj:
+        teleop_steps = _estimate_teleop_video_steps(os.path.abspath(args_cli.teleop_traj))
+        video_length = teleop_steps + int(args_cli.video_length)
+        print(
+            f"[play] full-session video: teleop~{teleop_steps} + pit {args_cli.video_length} = {video_length} frames",
+            flush=True,
+        )
 
     # -------------------------------------------------------------------------
     # Optional: video wrapper
@@ -625,7 +752,7 @@ def play() -> tuple[float, float]:
         video_kwargs = {
             "video_folder": os.path.abspath(os.path.join("logs", "videos", args_cli.task, "play")),
             "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
+            "video_length": video_length,
             "disable_logger": True,
         }
         print("[INFO] Recording videos during play.")
@@ -753,7 +880,7 @@ def play() -> tuple[float, float]:
                 break
 
             # If recording one video, exit after video_length steps
-            if args_cli.video and timestep >= args_cli.video_length:
+            if args_cli.video and timestep >= video_length:
                 break
 
             # Real-time pacing

@@ -19,13 +19,19 @@ def reset_robot_at_task_d_spawn(
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     local_pos: tuple[float, float, float] | None = None,
+    local_pos_x_jitter: float = 0.0,
 ):
-    """Reset robot to Task D default spawn: ``env_origin + TASK_D_ROBOT_SPAWN_LOCAL``."""
+    """Reset robot to Task D spawn: ``env_origin + local_pos`` (+ optional uniform x jitter)."""
     asset = env.scene[asset_cfg.name]
     n = len(env_ids)
     root_states = asset.data.default_root_state[env_ids].clone()
     spawn = local_pos if local_pos is not None else TASK_D_ROBOT_SPAWN_LOCAL
-    local = torch.tensor(spawn, device=asset.device, dtype=root_states.dtype).view(1, 3).expand(n, 3)
+    local = torch.tensor(spawn, device=asset.device, dtype=root_states.dtype).view(1, 3).expand(n, 3).clone()
+    jitter = float(local_pos_x_jitter)
+    if jitter > 0.0:
+        local[:, 0] += torch.empty(n, device=asset.device, dtype=root_states.dtype).uniform_(
+            -jitter, jitter
+        )
     positions = env.scene.env_origins[env_ids] + local
     orientations = root_states[:, 3:7]
     velocities = torch.zeros(n, 6, device=asset.device, dtype=root_states.dtype)
