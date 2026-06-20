@@ -417,7 +417,9 @@ class TaskDHierarchicalNavDeploy:
                 "nav student needs obs['image'] head/ee depth or obs_manager obs['depth'] "
                 "(480x640 platform → prep_depth → policy size)."
             )
-        head_depth = image_obs.get("head_depth") or image_obs.get("video_depth")
+        head_depth = image_obs.get("head_depth")
+        if head_depth is None:
+            head_depth = image_obs.get("video_depth")
         ee_depth = image_obs.get("ee_depth")
         if head_depth is None or ee_depth is None:
             raise RuntimeError("depth_only nav student requires head_depth and ee_depth in obs['image'].")

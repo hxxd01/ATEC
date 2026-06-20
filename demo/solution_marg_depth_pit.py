@@ -394,6 +394,7 @@ class AlgSolution:
         self.pit_warmup_steps = 0
         self._play_configured = False
         self._last_obs_mgr = False
+        self._platform_deploy = False
         self._use_platform_cam = True
         self._deploy_cfg = deploy_cfg
         self._nav_max_steps = int(deploy_cfg.get("nav_max_steps", self.DEFAULT_NAV_MAX_STEPS))
@@ -425,11 +426,13 @@ class AlgSolution:
             else "none(nav_only)"
         )
         handoff_tag = "off(nav_only)" if not self._phase_handoff_enabled else "on"
+        nav_tag = os.path.basename(self._nav_ckpt_path) if self._nav_ckpt_path else "none"
         print(
             f"[AlgSolution-Pit] MARG depth pit student ckpt={pit_tag}, "
+            f"nav_ckpt={nav_tag}, phase={self._phase}, handoff={handoff_tag}, "
             f"depth={'head' if self.head_depth_only else 'head+ee'} "
             f"platform={self.platform_cam_h}x{self.platform_cam_w}->policy={self.image_h}x{self.image_w}, "
-            f"cmd_vx={self.command_vx}, phase={self._phase}, handoff={handoff_tag}",
+            f"cmd_vx={self.command_vx}, device={self.device}",
             flush=True,
         )
 
@@ -542,9 +545,10 @@ class AlgSolution:
         """Optional sim handle for MARG-aligned proprio (teleop→pit handoff)."""
         self._env = env
 
-    @staticmethod
-    def _obs_from_manager(obs: dict) -> bool:
-        """Sim play uses obs_manager marg_proprio + depth when attached in configure_env_cfg."""
+    def _uses_obs_manager(self, obs: dict) -> bool:
+        """True when play attached marg_proprio (not server.py deploy path)."""
+        if self._platform_deploy:
+            return False
         return "marg_proprio" in obs
 
     @staticmethod
@@ -584,6 +588,7 @@ class AlgSolution:
         )
         if bool(getattr(args, "ee_depth", False)):
             self.head_depth_only = False
+        self._platform_deploy = bool(getattr(args, "platform_deploy", False))
         nav_ckpt = getattr(args, "nav_ckpt", None)
         if nav_ckpt:
             self._setup_nav(
@@ -616,10 +621,12 @@ class AlgSolution:
         else:
             mode = "pit-only"
         handoff_tag = "disabled" if not self._phase_handoff_enabled else "enabled"
+        deploy_tag = ", platform_deploy=on" if self._platform_deploy else ""
         print(
             f"[AlgSolution-Pit] play args: mode={mode}, cmd_vx={self.command_vx:.2f}, "
             f"phase_handoff={handoff_tag}, handoff_warmup={self._pit_handoff_warmup_total}, "
-            f"pit_warmup={self.pit_warmup_steps}, depth={'head' if self.head_depth_only else 'head+ee'}",
+            f"pit_warmup={self.pit_warmup_steps}, depth={'head' if self.head_depth_only else 'head+ee'}"
+            f"{deploy_tag}",
             flush=True,
         )
 
@@ -705,16 +712,24 @@ class AlgSolution:
             update_period=phys_dt,
             head_depth_only=head_depth_only,
         )
-        attach_taskd_platform_marg_student_obs(
-            env_cfg,
-            args,
-            policy_h=policy_h,
-            policy_w=policy_w,
-            depth_max=float(self.depth_max),
-            depth_render_h=cam_h if use_platform_cam else None,
-            depth_render_w=cam_w if use_platform_cam else None,
-            head_depth_only=head_depth_only,
-        )
+        platform_deploy = bool(getattr(args, "platform_deploy", False))
+        if platform_deploy:
+            print(
+                "[AlgSolution-Pit] platform_deploy play: obs['proprio'] + obs['image'] depth "
+                "(solution _marg_proprio_from_platform + prep_depth; no obs_manager marg_proprio).",
+                flush=True,
+            )
+        else:
+            attach_taskd_platform_marg_student_obs(
+                env_cfg,
+                args,
+                policy_h=policy_h,
+                policy_w=policy_w,
+                depth_max=float(self.depth_max),
+                depth_render_h=cam_h if use_platform_cam else None,
+                depth_render_w=cam_w if use_platform_cam else None,
+                head_depth_only=head_depth_only,
+            )
         env_cfg.depth_render_h = cam_h
         env_cfg.depth_render_w = cam_w
         apply_taskd_pit_student_command(env_cfg, command_vx=float(self.command_vx))
@@ -851,7 +866,7 @@ class AlgSolution:
         return t
 
     def _reset_env_marg_history(self, obs: dict, *, zero_last_action: bool = True) -> None:
-        if not self._obs_from_manager(obs) or self._env is None:
+        if not self._uses_obs_manager(obs) or self._env is None:
             return
         u = self._env.unwrapped if hasattr(self._env, "unwrapped") else self._env
         hist = getattr(u, "_marg_proprio_history", None)
@@ -899,7 +914,7 @@ class AlgSolution:
         self._last_leg_action.zero_()
         self._step_count = 0
         self._pit_warmup_remaining = max(0, int(warmup_steps))
-        if self._obs_from_manager(obs):
+        if self._uses_obs_manager(obs):
             current = self._fix_marg_proprio_last_action(
                 self._tensor_obs(obs["marg_proprio"]),
                 zero=True,
@@ -1013,17 +1028,36 @@ class AlgSolution:
     def _nav_elapsed_s(self) -> float:
         return float(self._nav_phase_steps) * self._env_step_dt()
 
-    def _update_nav_handoff_progress(self) -> None:
-        if self._env is None:
+    def _robot_speed_xy_from_proprio(self, obs: dict) -> float | None:
+        """Platform has no sim env handle; use base lin vel from proprio (0:3)."""
+        try:
+            proprio = obs.get("proprio")
+            if proprio is None:
+                return None
+            if not isinstance(proprio, torch.Tensor):
+                proprio = torch.as_tensor(proprio, dtype=torch.float32)
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            vxy = proprio[0, :2].to(dtype=torch.float32)
+            return float(torch.linalg.vector_norm(vxy).item())
+        except Exception:
+            return None
+
+    def _update_nav_handoff_progress(self, obs: dict | None = None) -> None:
+        if self._env is not None:
+            try:
+                self._last_robot_speed_xy = robot_horizontal_speed_from_env(self._env, env_idx=0)
+            except Exception:
+                self._last_robot_speed_xy = float("inf")
+            try:
+                self._last_box_nominal_x = box_nominal_x_from_env(self._env, env_idx=0)
+            except Exception:
+                pass
             return
-        try:
-            self._last_robot_speed_xy = robot_horizontal_speed_from_env(self._env, env_idx=0)
-        except Exception:
-            self._last_robot_speed_xy = float("inf")
-        try:
-            self._last_box_nominal_x = box_nominal_x_from_env(self._env, env_idx=0)
-        except Exception:
-            pass
+        if obs is not None:
+            speed = self._robot_speed_xy_from_proprio(obs)
+            if speed is not None:
+                self._last_robot_speed_xy = speed
 
     def _nav_handoff_ready(self) -> bool:
         if not self._phase_handoff_enabled:
@@ -1036,7 +1070,7 @@ class AlgSolution:
 
     def _predict_nav(self, obs, current_score):
         assert self._nav is not None
-        self._update_nav_handoff_progress()
+        self._update_nav_handoff_progress(obs)
         if self._nav_handoff_ready():
             self._nav_done = True
             self._capture_handoff_baselines()
@@ -1048,9 +1082,17 @@ class AlgSolution:
                     f"{self._nav_handoff_min_runtime_s:.1f}s "
                     f"and speed_xy={self._last_robot_speed_xy:.3f}<={self._nav_handoff_speed:.2f}m/s"
                 )
+            speed_src = "env_w" if self._env is not None else "proprio_xy"
+            box_note = ""
+            if self._last_box_nominal_x is not None and not math.isnan(self._last_box_nominal_x):
+                box_note = f", box_nominal_x={self._last_box_nominal_x:+.3f}"
             self._on_teleop_to_pit_handoff(obs)
             self._phase = "pit"
-            print(f"[AlgSolution-Pit] nav finished ({reason}) → pit student", flush=True)
+            print(
+                f"[AlgSolution-Pit] nav finished ({reason}, src={speed_src}{box_note}) "
+                f"@ sim_step={self._sim_step} → pit student",
+                flush=True,
+            )
             return self._predict_pit(obs, current_score)
         resp = self._nav.predicts(obs, current_score)
         self._sync_proprio_history_from_obs(obs)
@@ -1062,7 +1104,7 @@ class AlgSolution:
         del current_score
         if self.policy is None:
             raise RuntimeError("pit student not loaded; omit --nav_only or pass --pit_ckpt")
-        self._last_obs_mgr = self._obs_from_manager(obs)
+        self._last_obs_mgr = self._uses_obs_manager(obs)
         policy_obs = self._build_policy_obs(obs)
         with torch.inference_mode():
             leg_action = self.policy.act_inference(policy_obs)
@@ -1094,7 +1136,7 @@ class AlgSolution:
                 pshape = len(proprio[0]) if proprio else 72
             action_dim = (int(pshape) - 12) // 3
 
-        action_env = self._to_env_action(leg_action, action_dim, mgr_proprio=self._obs_from_manager(obs))
+        action_env = self._to_env_action(leg_action, action_dim, mgr_proprio=self._uses_obs_manager(obs))
         return {"action": action_env.detach().cpu().numpy().tolist(), "giveup": False}
 
     def _prep_depth(self, x: torch.Tensor) -> torch.Tensor:
@@ -1109,7 +1151,7 @@ class AlgSolution:
     def _build_depth_flat(self, obs: dict, batch: int) -> torch.Tensor:
         expected = self.img_channels * self.image_h * self.image_w
         # Sim + obs_manager: marg_depth_flat matches pit DAgger train (camera buffer → prep_depth).
-        if "depth" in obs:
+        if "depth" in obs and not self._platform_deploy:
             depth = self._tensor_obs(obs["depth"])
             if self.head_depth_only and depth.shape[-1] == expected:
                 return depth
@@ -1168,7 +1210,7 @@ class AlgSolution:
         return self._proprio_history.reshape(current.shape[0], MARG_HISTORY_DIM)
 
     def _build_policy_obs(self, obs: dict) -> dict[str, torch.Tensor]:
-        if self._obs_from_manager(obs):
+        if self._uses_obs_manager(obs):
             return self._build_policy_obs_from_obs_manager(obs)
 
         if "proprio_history" in obs and "depth" in obs and "marg_proprio" not in obs:
@@ -1218,11 +1260,17 @@ class AlgSolution:
         return action_env
 
     def predicts(self, obs, current_score):
-        if self._nav is not None and not self._nav_done:
-            return self._predict_nav(obs, current_score)
-        if self._replayer is not None and not self._teleop_done:
-            return self._predict_teleop(obs, current_score)
-        return self._predict_pit(obs, current_score)
+        try:
+            if self._nav is not None and not self._nav_done:
+                return self._predict_nav(obs, current_score)
+            if self._replayer is not None and not self._teleop_done:
+                return self._predict_teleop(obs, current_score)
+            return self._predict_pit(obs, current_score)
+        except Exception:
+            import traceback
+
+            print("[AlgSolution-Pit] predicts FAILED:\n" + traceback.format_exc(), flush=True)
+            raise
 
     def get_video_overlay_lines(self) -> list[str]:
         if self._phase == "nav" and not self._nav_done and self._nav is not None:

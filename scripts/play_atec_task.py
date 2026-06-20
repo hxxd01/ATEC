@@ -170,6 +170,16 @@ parser.add_argument(
     action="store_true",
     help="Disable nav/teleop→pit handoff; run nav student until episode ends (requires --nav_ckpt).",
 )
+parser.add_argument(
+    "--no_bind_env",
+    action="store_true",
+    help="Task D pit solution: skip bind_env (platform-like nav→pit handoff from obs proprio only).",
+)
+parser.add_argument(
+    "--platform_deploy",
+    action="store_true",
+    help="Task D: mimic server.py deploy (no bind_env, obs proprio+image depth, _marg_proprio_from_platform).",
+)
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
@@ -900,9 +910,22 @@ def play() -> tuple[float, float]:
         camera_follow(env)
     if hasattr(solution, "reset"):
         solution.reset(task=args_cli.task)
-    if isinstance(args_cli.task, str) and "TaskD" in args_cli.task and hasattr(solution, "bind_env"):
+    if (
+        isinstance(args_cli.task, str)
+        and "TaskD" in args_cli.task
+        and hasattr(solution, "bind_env")
+        and not bool(getattr(args_cli, "no_bind_env", False))
+        and not bool(getattr(args_cli, "platform_deploy", False))
+    ):
         solution.bind_env(env)
-        print("[play] Task D: bind_env() — nav uses sim robot/box pose.", flush=True)
+        print("[play] Task D: bind_env() — nav handoff uses sim root_lin_vel_w.", flush=True)
+    elif bool(getattr(args_cli, "platform_deploy", False)):
+        print(
+            "[play] Task D: platform_deploy — no bind_env, pit uses _marg_proprio_from_platform + image depth.",
+            flush=True,
+        )
+    elif bool(getattr(args_cli, "no_bind_env", False)):
+        print("[play] Task D: no bind_env — nav handoff uses obs proprio (platform deploy).", flush=True)
     if getattr(args_cli, "pit_edge_only", False) and hasattr(solution, "on_play_reset"):
         solution.on_play_reset(obs)
         print("[play] pit-edge ablation: student starts at pit lip (no teleop).", flush=True)
