@@ -192,12 +192,13 @@ python scripts/train_nav_taskd_student.py \
   --sim_camera_w 32 \
   --tiled_cameras \
   --depth_only \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-06-20_13-57-02/model_1400.pt
   --push-box-drop-com-z 0.295
 
 # Platform / server 对齐: demo/server.py 480x640 depth
 python scripts/train_nav_taskd_student.py \
   --ll_policy demo/policy.pt \
-  --num_envs 128 \
+  --num_envs 1 \
   --inner_steps 5 \
   --device cuda:0 \
   --headless \
@@ -206,10 +207,9 @@ python scripts/train_nav_taskd_student.py \
   --camera_hw 24 \
   --tiled_cameras \
   --depth_only \
-  --platform_depth_train \
   --video \
-  --video_length 100 \
-  --no_train_ckpt /path/to/model_XXX.pt
+  --video_length 400 \
+  --no_train_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-06-20_18-01-18/model_1900.pt
 
 python scripts/train_nav_taska_student.py \
   --ll_policy demo/taska.pt \
@@ -282,7 +282,7 @@ dagger评估
 python scripts/play_taskd_marg_depth_pit_dagger.py \
   --headless --video --video_length 100 \
   --num_envs 1 \
-  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_00-28-28/model_200.pt \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_01-53-23/model_500.pt \
   --command_vx 0.6 \
   --pit_level 10 \
   --pit_width_min 1.4 --pit_width_max 1.4 \
@@ -290,6 +290,20 @@ python scripts/play_taskd_marg_depth_pit_dagger.py \
   --depth_only --tiled_cameras \
   --policy_img_h 24 --policy_img_w 32 \
   --sim_camera_h 24 --sim_camera_w 32
+
+480下采样评估
+python scripts/play_taskd_marg_depth_pit_dagger.py \
+  --headless --video --video_length 100 \
+  --num_envs 1 \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_01-53-23/model_500.pt \
+  --command_vx 0.6 \
+  --pit_level 10 \
+  --pit_width_min 1.4 --pit_width_max 1.4 \
+  --warmup_steps 0 \
+  --depth_only --tiled_cameras \
+  --pit_platform_depth \
+  --platform_depth_h 480 --platform_depth_w 640 \
+  --policy_img_h 24 --policy_img_w 32
 python scripts/play_taskd_marg_depth_pit_solution.py   --headless --video   --traj scripts/ATEC-TaskD-B2Piper_20260619_153715.json   --checkpoint logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-19_04-34-32/model_800.pt   --command_vx 0.6   --pit_level 10   --pit_width_min 1.4 --pit_width_max 1.4   --video_length 600   --depth_only --tiled_cameras   --policy_img_h 24 --policy_img_w 32   --sim_camera_h 24 --sim_camera_w 32
 
 source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && cd /home/ubuntu/ATEC && python scripts/play_taskd_marg_depth_pit_dagger.py \
@@ -308,6 +322,16 @@ source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaa
   --sim_camera_h 24 \
   --sim_camera_w 32 2>&1
 
+python scripts/play_taskd_teleop_pit.py \
+  --headless --video --video_length 600 \
+  --nav_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-06-20_16-12-47/model_1600.pt \
+  --pit_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-06-20_18-01-18/model_2200.pt \
+  --pit_command_vx 0.6
+python scripts/play_taskd_teleop_pit.py \
+  --headless --video --video_length 600 \
+  --nav_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-06-20_23-09-40/model_2300.pt \
+  --pit_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_01-53-23/model_500.pt \
+  --pit_command_vx 0.6
 一整套结合
 python scripts/play_taskd_teleop_pit.py \
   --headless --video --video_length 600 \

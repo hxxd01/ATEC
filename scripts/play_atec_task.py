@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -115,7 +116,13 @@ parser.add_argument(
     "--teleop_traj",
     type=str,
     default=None,
-    help="Task D: teleop JSON replay before pit student (uses demo/solution_marg_depth_pit.py).",
+    help="Task D: teleop JSON replay before pit student (legacy; prefer --nav_ckpt).",
+)
+parser.add_argument(
+    "--nav_ckpt",
+    type=str,
+    default=None,
+    help="Task D: hierarchical nav student (.pt) for phase 1 before pit (solution copy 2 stack).",
 )
 parser.add_argument(
     "--pit_ckpt",
@@ -150,29 +157,41 @@ parser.add_argument(
 parser.add_argument(
     "--pit_handoff_warmup",
     type=int,
-    default=40,
-    help="After teleop→pit: ramp pit student actions over N steps (history/last_action alignment).",
+    default=0,
+    help="After teleop→pit: ramp pit student actions over N steps (0 = full pit policy immediately).",
 )
 parser.add_argument(
     "--pit_edge_only",
     action="store_true",
     help="Ablation: skip teleop, spawn at pit lip on Task D B2Piper and run pit student directly.",
 )
+parser.add_argument(
+    "--nav_only",
+    action="store_true",
+    help="Disable nav/teleop→pit handoff; run nav student until episode ends (requires --nav_ckpt).",
+)
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
+
+if args_cli.nav_only:
+    if not args_cli.nav_ckpt:
+        raise ValueError("--nav_only requires --nav_ckpt")
+    if args_cli.pit_edge_only:
+        raise ValueError("--nav_only and --pit_edge_only are mutually exclusive")
 
 if args_cli.pit_edge_only:
     if not args_cli.pit_ckpt:
         raise ValueError("--pit_edge_only requires --pit_ckpt")
     if args_cli.task is None:
         args_cli.task = "ATEC-TaskD-B2Piper"
-elif args_cli.teleop_traj:
+elif args_cli.teleop_traj or args_cli.nav_ckpt:
     if args_cli.task is None:
         args_cli.task = "ATEC-TaskD-B2Piper"
 
 _use_pit_solution = bool(
     args_cli.teleop_traj
+    or args_cli.nav_ckpt
     or args_cli.pit_ckpt
     or args_cli.pit_edge_only
 )
@@ -216,8 +235,10 @@ if _use_pit_solution:
     solution = AlgSolution(
         student_ckpt=os.path.abspath(args_cli.pit_ckpt) if args_cli.pit_ckpt else None,
         teleop_traj=os.path.abspath(args_cli.teleop_traj) if args_cli.teleop_traj else None,
+        nav_ckpt=os.path.abspath(args_cli.nav_ckpt) if args_cli.nav_ckpt else None,
         command_vx=float(args_cli.pit_command_vx) if args_cli.pit_command_vx is not None else None,
         handoff_warmup=0 if args_cli.pit_edge_only else getattr(args_cli, "pit_handoff_warmup", None),
+        nav_only=bool(args_cli.nav_only),
     )
 else:
     solution = AlgSolution()
@@ -379,6 +400,77 @@ def _format_xyz(label: str, xyz: list[float]) -> str:
     return f"{label}=({xyz[0]:+.3f},{xyz[1]:+.3f},{xyz[2]:+.3f})"
 
 
+def _taskd_box_nominal_x(env) -> float:
+    try:
+        from demo.taskd_hierarchical_nav import box_nominal_x_from_env
+
+        return float(box_nominal_x_from_env(env, env_idx=0))
+    except Exception:
+        return float("nan")
+
+
+def _taskd_box_score_zone_gap(nominal_x: float) -> str:
+    if math.isnan(nominal_x):
+        return "unknown"
+    zones = ((-0.7, 0.7), (-1.4, -0.7))
+    for lo, hi in zones:
+        if lo <= nominal_x <= hi:
+            return "in score zone"
+    forward_gaps = [lo - nominal_x for lo, _ in zones if nominal_x < lo]
+    if forward_gaps:
+        return f"{min(forward_gaps):+.3f}m in +x to nearest zone"
+    return "past all score zones"
+
+
+def _print_taskd_episode_end_box_pose(
+    env,
+    *,
+    snap: dict | None = None,
+    box_nominal_x: float | None = None,
+    peak_box_nominal_x: float | None = None,
+) -> None:
+    """Print box pose at episode end (must be captured before env.step auto-reset)."""
+    if snap is None:
+        snap = _taskd_scene_pose_snapshot(env)
+    if snap is None:
+        print("[play] episode_end: box pose unavailable (no box in scene)", flush=True)
+        return
+
+    if box_nominal_x is None:
+        box_nominal_x = _taskd_box_nominal_x(env, snap)
+
+    box_link = snap["box_link"]
+    box_com = snap["box_com"]
+    local = list(box_link)
+    try:
+        unwrapped = env.unwrapped
+        if hasattr(unwrapped.scene, "env_origins"):
+            origin = unwrapped.scene.env_origins[0].detach().cpu().tolist()
+            local = [
+                box_link[0] - origin[0],
+                box_link[1] - origin[1],
+                box_link[2] - origin[2],
+            ]
+    except Exception:
+        pass
+
+    gap = _taskd_box_score_zone_gap(box_nominal_x)
+    peak_note = ""
+    if peak_box_nominal_x is not None and not math.isnan(peak_box_nominal_x):
+        peak_note = f" peak_nominal_x={peak_box_nominal_x:+.3f}"
+
+    print(
+        f"[play] episode_end box (pre-reset snapshot) "
+        f"world_link={box_link[0]:+.3f},{box_link[1]:+.3f},{box_link[2]:+.3f} "
+        f"world_com={box_com[0]:+.3f},{box_com[1]:+.3f},{box_com[2]:+.3f} "
+        f"env_local={local[0]:+.3f},{local[1]:+.3f},{local[2]:+.3f} "
+        f"box_nominal_x={box_nominal_x:+.3f}{peak_note} "
+        f"score_gap={gap} "
+        f"lowest_z={snap['box_lowest_z']:+.3f} speed={snap['box_speed']:.4f}",
+        flush=True,
+    )
+
+
 def _print_taskd_box_pose(env, timestep: int, *, on_done: bool = False) -> None:
     global _play_box_lowest_z0
     snap = _taskd_scene_pose_snapshot(env)
@@ -423,7 +515,7 @@ def _build_video_overlay_lines(
     env,
     solution,
     timestep: int,
-    total_episode_reward: float,
+    display_score: float,
     total_elapsed_time: float,
     *,
     show_box_pose: bool = False,
@@ -431,7 +523,7 @@ def _build_video_overlay_lines(
     """Build HUD lines matching --debug terminal output."""
     lines = [
         f"step={timestep}",
-        f"score={total_episode_reward:.2f}",
+        f"score={display_score:.2f}",
         f"time={total_elapsed_time:.2f}s",
     ]
 
@@ -464,15 +556,18 @@ def _build_video_overlay_lines(
 def _debug_print_motion(
     obs,
     env,
-    total_episode_reward: float,
+    display_score: float,
     total_elapsed_time: float,
     solution=None,
     *,
     timestep: int = 0,
     print_box_pose: bool = False,
+    env_reward: float | None = None,
 ) -> None:
-    """Print reward/time and measured velocities (after env.step)."""
-    print(f"total_episode_reward:{total_episode_reward: .2f}")
+    """Print score/time and measured velocities (after env.step)."""
+    print(f"platform_score:{display_score: .2f}")
+    if env_reward is not None:
+        print(f"env_reward_sum:{env_reward: .2f}")
     print(f"total_elapsed_time:{total_elapsed_time: .2f}")
     if print_box_pose:
         _print_taskd_box_pose(env, timestep)
@@ -705,10 +800,39 @@ def play() -> tuple[float, float]:
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
+    platform_score_tracker = None
+    task_d_with_box = True
+    if _is_task_d:
+        from atec_rl_lab.tasks.task_d.mdp.platform_score import (
+            TaskDPlatformScoreTracker,
+            scene_has_task_d_box,
+        )
+
+        platform_score_tracker = TaskDPlatformScoreTracker()
+        task_d_with_box = scene_has_task_d_box(env.unwrapped)
+        print(
+            f"[play] Task D platform score: RewardCrossX + box ranges "
+            f"(with_box={int(task_d_with_box)})",
+            flush=True,
+        )
+
     overlay_wrapper = None
     use_video_overlay = args_cli.video and not args_cli.no_video_overlay
     video_length = int(args_cli.video_length)
-    if args_cli.video and args_cli.teleop_traj:
+    if args_cli.video and args_cli.nav_ckpt and not args_cli.nav_only:
+        est = getattr(solution, "estimate_nav_video_steps", None)
+        nav_steps = int(est()) if est is not None else 8000
+        video_length = nav_steps + int(args_cli.video_length)
+        print(
+            f"[play] full-session video: nav~{nav_steps} + pit {args_cli.video_length} = {video_length} frames",
+            flush=True,
+        )
+    elif args_cli.video and args_cli.nav_ckpt and args_cli.nav_only:
+        print(
+            f"[play] nav_only video: {video_length} frames (no pit phase appended)",
+            flush=True,
+        )
+    elif args_cli.video and args_cli.teleop_traj:
         est = getattr(solution, "estimate_teleop_video_steps", _estimate_teleop_video_steps)
         teleop_steps = est(os.path.abspath(args_cli.teleop_traj))
         video_length = teleop_steps + int(args_cli.video_length)
@@ -804,6 +928,9 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     total_episode_reward = 0.0
     total_elapsed_time = 0.0
+    last_pre_step_box_snap: dict | None = None
+    last_pre_step_box_nominal_x = float("nan")
+    peak_box_nominal_x = float("-inf")
     while simulation_app.is_running():
         with torch.inference_mode():
             start_time = time.time()
@@ -819,6 +946,20 @@ def play() -> tuple[float, float]:
             actions = resp["action"]
             actions = torch.tensor(actions, dtype=torch.float32, device=args_cli.device).view(1, -1)
 
+            # Isaac Lab auto-resets inside env.step(); snapshot/score before step.
+            if _is_task_d:
+                last_pre_step_box_snap = _taskd_scene_pose_snapshot(env)
+                if last_pre_step_box_snap is not None:
+                    nx = _taskd_box_nominal_x(env)
+                    if not math.isnan(nx):
+                        last_pre_step_box_nominal_x = nx
+                        peak_box_nominal_x = max(peak_box_nominal_x, nx)
+            if platform_score_tracker is not None:
+                platform_score_tracker.update(env.unwrapped, with_box=task_d_with_box)
+                display_score = platform_score_tracker.score
+            else:
+                display_score = total_episode_reward
+
             if overlay_wrapper is not None:
                 overlay_wrapper.set_overlay_lines(
                     _build_video_overlay_lines(
@@ -826,7 +967,7 @@ def play() -> tuple[float, float]:
                         env,
                         solution,
                         timestep,
-                        total_episode_reward,
+                        display_score,
                         total_elapsed_time,
                         show_box_pose=show_box_pose,
                     )
@@ -856,11 +997,12 @@ def play() -> tuple[float, float]:
                 _debug_print_motion(
                     obs,
                     env,
-                    total_episode_reward,
+                    display_score,
                     total_elapsed_time,
                     solution=solution,
                     timestep=timestep,
                     print_box_pose=show_box_pose,
+                    env_reward=total_episode_reward if platform_score_tracker is not None else None,
                 )
             elif show_box_pose:
                 _print_taskd_box_pose(env, timestep)
@@ -868,6 +1010,20 @@ def play() -> tuple[float, float]:
             done = (terminated.item() or truncated.item())
             if done:
                 _print_done_reason(terminated, truncated, info, env=env)
+                if _is_task_d:
+                    peak_x = peak_box_nominal_x if peak_box_nominal_x > float("-inf") else None
+                    _print_taskd_episode_end_box_pose(
+                        env,
+                        snap=last_pre_step_box_snap,
+                        box_nominal_x=last_pre_step_box_nominal_x,
+                        peak_box_nominal_x=peak_x,
+                    )
+                if platform_score_tracker is not None:
+                    print(
+                        f"[play] platform_score: {platform_score_tracker.score:.1f} "
+                        f"({platform_score_tracker.breakdown_str()})",
+                        flush=True,
+                    )
                 break
 
             # If recording one video, exit after video_length steps
@@ -887,7 +1043,10 @@ def play() -> tuple[float, float]:
         camera_recorder.close()
     env.close()
 
-    return total_episode_reward, total_elapsed_time
+    final_score = (
+        platform_score_tracker.score if platform_score_tracker is not None else total_episode_reward
+    )
+    return final_score, total_elapsed_time
 
 
 if __name__ == "__main__":

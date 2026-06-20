@@ -59,8 +59,8 @@ parser.add_argument("--debug", action="store_true", help="Print action/cmd/veloc
 parser.add_argument(
     "--warmup_steps",
     type=int,
-    default=40,
-    help="Steps before recording (fills MARG proprio history).",
+    default=0,
+    help="Steps before recording (fills MARG proprio history; 0 = record from spawn).",
 )
 parser.add_argument("--policy_img_h", type=int, default=24)
 parser.add_argument("--policy_img_w", type=int, default=32)

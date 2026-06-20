@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from typing import Any
@@ -16,6 +17,11 @@ if _demo_dir not in sys.path:
 from depth_preprocess import prep_depth  # noqa: E402
 from teleop_controller import TaskDTeleopController  # noqa: E402
 from teleop_traj import TrajectoryReplayer, load_teleop_trajectory  # noqa: E402
+from taskd_hierarchical_nav import (  # noqa: E402
+    TaskDHierarchicalNavDeploy,
+    box_nominal_x_from_env,
+    robot_horizontal_speed_from_env,
+)
 
 MARG_PROPRIO_DIM = 43
 MARG_HISTORY_LEN = 6
@@ -167,8 +173,8 @@ class MargDepthPitActorCritic(nn.Module):
 
     def _reshape_head_depth(self, depth_flat: torch.Tensor) -> torch.Tensor:
         batch = depth_flat.shape[0]
-        flat = depth_flat if self.head_depth_only else depth_flat[:, : self.depth_flat_per_cam]
-        return flat.reshape(batch, self.depth_channels, self.img_h, self.img_w)
+        head = depth_flat[:, : self.depth_flat_per_cam]
+        return head.reshape(batch, self.depth_channels, self.img_h, self.img_w)
 
     def _reshape_ee_depth(self, depth_flat: torch.Tensor) -> torch.Tensor:
         batch = depth_flat.shape[0]
@@ -250,19 +256,22 @@ def _find_student_ckpt(demo_dir: str, deploy: dict, override: str | None = None)
 
 
 class AlgSolution:
-    """Task D: optional teleop traj replay (policy.pt) → MARG depth pit student."""
+    """Task D: hierarchical nav student or teleop traj → MARG depth pit student."""
 
     LEG_ACTION_DIM = 12
     ARM_ACTION_DIM = 8
     SIM_DT = 0.02
+    DEFAULT_NAV_MAX_STEPS = 12000
 
     def __init__(
         self,
         *,
         student_ckpt: str | None = None,
         teleop_traj: str | None = None,
+        nav_ckpt: str | None = None,
         command_vx: float | None = None,
         handoff_warmup: int | None = None,
+        nav_only: bool = False,
     ):
         demo_dir = os.path.dirname(os.path.abspath(__file__))
         self._demo_dir = demo_dir
@@ -274,14 +283,18 @@ class AlgSolution:
         self._phase = "pit"
         self._sim_step = 0
         self._teleop_done = True
+        self._nav_done = True
         self._replayer: TrajectoryReplayer | None = None
         self._teleop: TaskDTeleopController | None = None
+        self._nav: TaskDHierarchicalNavDeploy | None = None
+        self._nav_ckpt_path: str | None = None
         self._last_teleop_cmd = (0.0, 0.0, 0.0)
+        self._last_box_nominal_x = float("nan")
+        self._last_robot_speed_xy = 0.0
+        self._nav_phase_steps = 0
         self._env = None
-
-        student_ckpt_path = _find_student_ckpt(demo_dir, deploy_cfg, student_ckpt)
-        if not os.path.isfile(student_ckpt_path):
-            raise FileNotFoundError(f"PIT student checkpoint not found: {student_ckpt_path}")
+        self.nav_only = bool(nav_only)
+        self._phase_handoff_enabled = not self.nav_only
 
         self.image_h = int(policy_cfg.get("img_h", 24))
         self.image_w = int(policy_cfg.get("img_w", 32))
@@ -299,49 +312,64 @@ class AlgSolution:
         else:
             self.command_vx = float(deploy_cfg.get("command_vx", 0.6))
 
-        loaded = torch.load(student_ckpt_path, map_location=self.device, weights_only=False)
-        state = loaded["model_state_dict"] if isinstance(loaded, dict) and "model_state_dict" in loaded else loaded
-        if "head_depth_only" in policy_cfg:
-            self.head_depth_only = bool(policy_cfg["head_depth_only"])
-        elif "head_depth_only" in deploy_cfg:
-            self.head_depth_only = bool(deploy_cfg["head_depth_only"])
-        else:
-            self.head_depth_only = not any(k.startswith("ee_depth_encoder.") for k in state)
-
-        num_cams = 1 if self.head_depth_only else 2
-        depth_dim = num_cams * self.img_channels * self.image_h * self.image_w
-        obs = {
-            "proprio": torch.zeros(1, MARG_PROPRIO_DIM),
-            "proprio_history": torch.zeros(1, MARG_HISTORY_DIM),
-            "depth": torch.zeros(1, depth_dim),
-        }
-        obs_groups = {
-            "policy": ["proprio", "proprio_history", "depth"],
-            "critic": ["proprio", "depth", "critic_priv"],
-        }
-        ac_kwargs = {
-            "img_h": self.image_h,
-            "img_w": self.image_w,
-            "depth_channels": self.img_channels,
-            "enc_dim": int(policy_cfg.get("enc_dim", 128)),
-            "elevation_out_dim": int(policy_cfg.get("elevation_out_dim", MARG_ELEVATION_OUT_DIM)),
-            "estimator_hidden_dims": policy_cfg.get("estimator_hidden_dims", [128]),
-            "depth_hidden_dims": policy_cfg.get("depth_hidden_dims", [128, 64]),
-            "actor_obs_normalization": bool(policy_cfg.get("actor_obs_normalization", True)),
-            "critic_obs_normalization": bool(policy_cfg.get("critic_obs_normalization", False)),
-            "actor_hidden_dims": policy_cfg.get("actor_hidden_dims", [512, 256, 128]),
-            "critic_hidden_dims": policy_cfg.get("critic_hidden_dims", [512, 256, 128]),
-            "init_noise_std": float(policy_cfg.get("init_noise_std", 0.6)),
-            "max_noise_std": float(policy_cfg.get("max_noise_std", 2.0)),
-            "noise_std_type": policy_cfg.get("noise_std_type", "scalar"),
-            "head_depth_only": self.head_depth_only,
-        }
-        self.policy = MargDepthPitActorCritic(obs, obs_groups, num_actions=self.LEG_ACTION_DIM, **ac_kwargs).to(
-            self.device
+        self.head_depth_only = bool(
+            policy_cfg.get("head_depth_only", deploy_cfg.get("head_depth_only", True))
         )
-        self.policy.load_state_dict(state, strict=True)
-        self.policy.eval()
-        self._student_ckpt_path = student_ckpt_path
+        self.policy = None
+        self._student_ckpt_path: str | None = None
+        if self.nav_only and not student_ckpt:
+            print("[AlgSolution-Pit] nav_only: skipping pit student load (no --pit_ckpt)", flush=True)
+        else:
+            student_ckpt_path = _find_student_ckpt(demo_dir, deploy_cfg, student_ckpt)
+            if not os.path.isfile(student_ckpt_path):
+                raise FileNotFoundError(f"PIT student checkpoint not found: {student_ckpt_path}")
+            loaded = torch.load(student_ckpt_path, map_location=self.device, weights_only=False)
+            state = (
+                loaded["model_state_dict"]
+                if isinstance(loaded, dict) and "model_state_dict" in loaded
+                else loaded
+            )
+            if "head_depth_only" in policy_cfg:
+                self.head_depth_only = bool(policy_cfg["head_depth_only"])
+            elif "head_depth_only" in deploy_cfg:
+                self.head_depth_only = bool(deploy_cfg["head_depth_only"])
+            else:
+                self.head_depth_only = not any(k.startswith("ee_depth_encoder.") for k in state)
+
+            num_cams = 1 if self.head_depth_only else 2
+            depth_dim = num_cams * self.img_channels * self.image_h * self.image_w
+            obs = {
+                "proprio": torch.zeros(1, MARG_PROPRIO_DIM),
+                "proprio_history": torch.zeros(1, MARG_HISTORY_DIM),
+                "depth": torch.zeros(1, depth_dim),
+            }
+            obs_groups = {
+                "policy": ["proprio", "proprio_history", "depth"],
+                "critic": ["proprio", "depth", "critic_priv"],
+            }
+            ac_kwargs = {
+                "img_h": self.image_h,
+                "img_w": self.image_w,
+                "depth_channels": self.img_channels,
+                "enc_dim": int(policy_cfg.get("enc_dim", 128)),
+                "elevation_out_dim": int(policy_cfg.get("elevation_out_dim", MARG_ELEVATION_OUT_DIM)),
+                "estimator_hidden_dims": policy_cfg.get("estimator_hidden_dims", [128]),
+                "depth_hidden_dims": policy_cfg.get("depth_hidden_dims", [128, 64]),
+                "actor_obs_normalization": bool(policy_cfg.get("actor_obs_normalization", True)),
+                "critic_obs_normalization": bool(policy_cfg.get("critic_obs_normalization", False)),
+                "actor_hidden_dims": policy_cfg.get("actor_hidden_dims", [512, 256, 128]),
+                "critic_hidden_dims": policy_cfg.get("critic_hidden_dims", [512, 256, 128]),
+                "init_noise_std": float(policy_cfg.get("init_noise_std", 0.6)),
+                "max_noise_std": float(policy_cfg.get("max_noise_std", 2.0)),
+                "noise_std_type": policy_cfg.get("noise_std_type", "scalar"),
+                "head_depth_only": self.head_depth_only,
+            }
+            self.policy = MargDepthPitActorCritic(
+                obs, obs_groups, num_actions=self.LEG_ACTION_DIM, **ac_kwargs
+            ).to(self.device)
+            self.policy.load_state_dict(state, strict=True)
+            self.policy.eval()
+            self._student_ckpt_path = student_ckpt_path
 
         self.leg_joint_indices = list(range(12))
         self.arm_joint_indices = list(range(12, 20))
@@ -360,24 +388,82 @@ class AlgSolution:
         if handoff_warmup is not None:
             self._pit_handoff_warmup_total = max(0, int(handoff_warmup))
         else:
-            self._pit_handoff_warmup_total = max(0, int(deploy_cfg.get("handoff_warmup", 40)))
+            self._pit_handoff_warmup_total = max(0, int(deploy_cfg.get("handoff_warmup", 0)))
         self._pit_warmup_remaining = 0
         self.pit_edge_only = False
         self.pit_warmup_steps = 0
         self._play_configured = False
         self._last_obs_mgr = False
+        self._use_platform_cam = True
         self._deploy_cfg = deploy_cfg
-        self._setup_teleop(
-            teleop_traj,
-            ll_policy=deploy_cfg.get("teleop_ll_policy"),
-            enable=bool(deploy_cfg.get("enable_teleop", True)),
-            replay_delay=deploy_cfg.get("teleop_replay_delay"),
+        self._nav_max_steps = int(deploy_cfg.get("nav_max_steps", self.DEFAULT_NAV_MAX_STEPS))
+        self._nav_handoff_speed = float(deploy_cfg.get("nav_handoff_speed", 0.12))
+        self._nav_handoff_min_runtime_s = float(
+            deploy_cfg.get("nav_handoff_min_runtime_s", deploy_cfg.get("nav_handoff_still_s", 3.0))
         )
+        nav_ckpt_path = nav_ckpt or deploy_cfg.get("nav_ckpt")
+        use_teleop = bool(deploy_cfg.get("enable_teleop", False)) and not nav_ckpt_path
+        if nav_ckpt_path:
+            self._setup_nav(nav_ckpt_path, ll_policy=deploy_cfg.get("teleop_ll_policy"))
+        elif use_teleop:
+            self._setup_teleop(
+                teleop_traj,
+                ll_policy=deploy_cfg.get("teleop_ll_policy"),
+                enable=True,
+                replay_delay=deploy_cfg.get("teleop_replay_delay"),
+            )
+        else:
+            self._replayer = None
+            self._teleop = None
+            self._nav = None
+            self._phase = "pit"
+            self._teleop_done = True
+            self._nav_done = True
+        pit_tag = (
+            os.path.basename(self._student_ckpt_path)
+            if self._student_ckpt_path
+            else "none(nav_only)"
+        )
+        handoff_tag = "off(nav_only)" if not self._phase_handoff_enabled else "on"
         print(
-            f"[AlgSolution-Pit] MARG depth pit student ckpt={os.path.basename(student_ckpt_path)}, "
+            f"[AlgSolution-Pit] MARG depth pit student ckpt={pit_tag}, "
             f"depth={'head' if self.head_depth_only else 'head+ee'} "
             f"platform={self.platform_cam_h}x{self.platform_cam_w}->policy={self.image_h}x{self.image_w}, "
-            f"cmd_vx={self.command_vx}, phase={self._phase}",
+            f"cmd_vx={self.command_vx}, phase={self._phase}, handoff={handoff_tag}",
+            flush=True,
+        )
+
+    def _setup_nav(self, nav_ckpt_path: str | None, *, ll_policy: str | None = None) -> None:
+        self._replayer = None
+        self._teleop = None
+        self._nav = None
+        resolved = _resolve_bundle_path(self._demo_dir, nav_ckpt_path)
+        if resolved is None and nav_ckpt_path:
+            resolved = os.path.abspath(nav_ckpt_path) if os.path.isfile(nav_ckpt_path) else None
+        if resolved is None:
+            resolved = _resolve_bundle_path(self._demo_dir, self._deploy_cfg.get("nav_ckpt"))
+        if resolved is None or not os.path.isfile(resolved):
+            self._phase = "pit"
+            self._nav_done = True
+            print("[AlgSolution-Pit] nav ckpt not found; starting in pit-only mode.", flush=True)
+            return
+
+        ll_path = _resolve_bundle_path(self._demo_dir, ll_policy)
+        if ll_path is None:
+            ll_path = os.path.join(self._demo_dir, "policy.pt")
+        self._nav = TaskDHierarchicalNavDeploy(
+            demo_dir=self._demo_dir,
+            student_ckpt_path=resolved,
+            ll_policy_path=ll_path,
+            device=self.device,
+        )
+        self._nav_ckpt_path = resolved
+        self._phase = "nav"
+        self._nav_done = False
+        print(
+            f"[AlgSolution-Pit] hierarchical nav enabled: ckpt={os.path.basename(resolved)}, "
+            f"handoff=speed<={self._nav_handoff_speed:.2f}m/s and nav_time>"
+            f"{self._nav_handoff_min_runtime_s:.1f}s (max {self._nav_max_steps} steps)",
             flush=True,
         )
 
@@ -438,7 +524,8 @@ class AlgSolution:
 
     def set_device(self, device: str) -> None:
         self.device = device
-        self.policy = self.policy.to(device)
+        if self.policy is not None:
+            self.policy = self.policy.to(device)
         self.arm_default_action = self.arm_default_action.to(device)
         self._pit_to_taskd_leg_scale = self._pit_to_taskd_leg_scale.to(device)
         self._proprio_history = self._proprio_history.to(device)
@@ -447,6 +534,8 @@ class AlgSolution:
         self._handoff_arm_action = self._handoff_arm_action.to(device)
         if self._teleop is not None:
             self._teleop.set_device(device)
+        if self._nav is not None:
+            self._nav.set_device(device)
         self.reset()
 
     def bind_env(self, env) -> None:
@@ -469,10 +558,21 @@ class AlgSolution:
         duration = float(samples[-1].get("t", 0.0)) - float(samples[0].get("t", 0.0))
         return int((delay + max(0.0, duration)) / step_dt) + 10
 
+    @staticmethod
+    def estimate_nav_video_steps(*, max_steps: int | None = None, step_dt: float = 0.02) -> int:
+        steps = int(max_steps if max_steps is not None else AlgSolution.DEFAULT_NAV_MAX_STEPS)
+        return steps + 10
+
+    def _uses_nav_phase(self) -> bool:
+        return self._nav is not None
+
     def configure_play_args(self, args) -> None:
         """Apply play_atec_task / play_taskd_teleop_pit CLI (called once after AlgSolution load)."""
         if getattr(args, "pit_command_vx", None) is not None:
             self.command_vx = float(args.pit_command_vx)
+        if bool(getattr(args, "nav_only", False)):
+            self.nav_only = True
+            self._phase_handoff_enabled = False
         self.pit_edge_only = bool(getattr(args, "pit_edge_only", False))
         if self.pit_edge_only:
             self._pit_handoff_warmup_total = 0
@@ -484,10 +584,15 @@ class AlgSolution:
         )
         if bool(getattr(args, "ee_depth", False)):
             self.head_depth_only = False
-        teleop_traj = getattr(args, "teleop_traj", None)
-        if teleop_traj:
+        nav_ckpt = getattr(args, "nav_ckpt", None)
+        if nav_ckpt:
+            self._setup_nav(
+                os.path.abspath(str(nav_ckpt)),
+                ll_policy=getattr(args, "ll_policy", None) or self._deploy_cfg.get("teleop_ll_policy"),
+            )
+        elif getattr(args, "teleop_traj", None):
             self._setup_teleop(
-                os.path.abspath(str(teleop_traj)),
+                os.path.abspath(str(args.teleop_traj)),
                 ll_policy=getattr(args, "ll_policy", None) or self._deploy_cfg.get("teleop_ll_policy"),
                 enable=True,
                 replay_delay=self._deploy_cfg.get("teleop_replay_delay"),
@@ -495,14 +600,26 @@ class AlgSolution:
         elif self.pit_edge_only:
             self._replayer = None
             self._teleop = None
+            self._nav = None
             self._phase = "pit"
             self._teleop_done = True
+            self._nav_done = True
         self._play_configured = True
-        mode = "pit-edge" if self.pit_edge_only else ("teleop→pit" if self._replayer else "pit-only")
+        if self.nav_only and self._uses_nav_phase():
+            mode = "nav-only"
+        elif self._uses_nav_phase():
+            mode = "nav→pit"
+        elif self.pit_edge_only:
+            mode = "pit-edge"
+        elif self._replayer:
+            mode = "teleop→pit"
+        else:
+            mode = "pit-only"
+        handoff_tag = "disabled" if not self._phase_handoff_enabled else "enabled"
         print(
             f"[AlgSolution-Pit] play args: mode={mode}, cmd_vx={self.command_vx:.2f}, "
-            f"handoff_warmup={self._pit_handoff_warmup_total}, pit_warmup={self.pit_warmup_steps}, "
-            f"depth={'head' if self.head_depth_only else 'head+ee'}",
+            f"phase_handoff={handoff_tag}, handoff_warmup={self._pit_handoff_warmup_total}, "
+            f"pit_warmup={self.pit_warmup_steps}, depth={'head' if self.head_depth_only else 'head+ee'}",
             flush=True,
         )
 
@@ -550,11 +667,17 @@ class AlgSolution:
         sim_dt = float(getattr(env_cfg.sim, "dt", 0.005))
         phys_dt = decimation * sim_dt
         head_depth_only = not bool(getattr(args, "ee_depth", False))
+        if self._uses_nav_phase() or getattr(args, "nav_ckpt", None):
+            # Phase 1 nav: head+ee in obs['depth']; phase 2 pit slices head only at inference.
+            head_depth_only = False
         env_cfg.head_depth_only = head_depth_only
+        self._env_head_depth_only = head_depth_only
 
         policy_h = int(getattr(args, "pit_cam_h", self.image_h))
         policy_w = int(getattr(args, "pit_cam_w", self.image_w))
-        use_platform_cam = bool(getattr(args, "platform_depth", False))
+        # Default: sim cameras 480x640, obs_manager prep_depth → policy_h x policy_w (nav + pit).
+        use_platform_cam = not bool(getattr(args, "no_platform_depth", False))
+        self._use_platform_cam = use_platform_cam
         if use_platform_cam:
             cam_h, cam_w = self.platform_cam_h, self.platform_cam_w
             cam_tag = (
@@ -588,6 +711,9 @@ class AlgSolution:
             policy_h=policy_h,
             policy_w=policy_w,
             depth_max=float(self.depth_max),
+            depth_render_h=cam_h if use_platform_cam else None,
+            depth_render_w=cam_w if use_platform_cam else None,
+            head_depth_only=head_depth_only,
         )
         env_cfg.depth_render_h = cam_h
         env_cfg.depth_render_w = cam_w
@@ -600,10 +726,14 @@ class AlgSolution:
         if hasattr(env_cfg.scene, "lidar_sensor"):
             env_cfg.scene.lidar_sensor = None
 
-        mode = "pit-edge-only" if bool(getattr(args, "pit_edge_only", False)) else "teleop→pit"
+        mode = "pit-edge-only" if bool(getattr(args, "pit_edge_only", False)) else (
+            "nav→pit" if self._uses_nav_phase() else ("teleop→pit" if self._replayer else "pit-only")
+        )
         print(
             f"[AlgSolution-Pit] env cfg: Task D {mode}, num_envs={num_envs}, "
             f"cameras={cam_tag}, pit_level={int(args.pit_level)}, "
+            f"obs_depth={'head' if head_depth_only else 'head+ee'}, "
+            f"pit_model={'head' if self.head_depth_only else 'head+ee'}, "
             f"obs_manager=marg_proprio+depth+local_history, "
             f"cmd_vx={self.command_vx:.2f}",
             flush=True,
@@ -759,7 +889,7 @@ class AlgSolution:
         return {
             "proprio": proprio,
             "proprio_history": history,
-            "depth": self._tensor_obs(obs["depth"]),
+            "depth": self._build_depth_flat(obs, batch),
         }
 
     def _prefill_pit_start(self, obs: dict, *, warmup_steps: int, tag: str) -> None:
@@ -822,14 +952,23 @@ class AlgSolution:
         self._handoff_arm_action = self.arm_default_action.clone()
         self._step_count = 0
         self._sim_step = 0
+        self._nav_phase_steps = 0
+        self._last_robot_speed_xy = 0.0
         if self._replayer is not None and self._teleop is not None:
             self._phase = "teleop"
             self._teleop_done = False
+            self._nav_done = True
             self._teleop.reset()
             self._last_teleop_cmd = (0.0, 0.0, 0.0)
+        elif self._nav is not None:
+            self._phase = "nav"
+            self._nav_done = False
+            self._teleop_done = True
+            self._nav.reset()
         else:
             self._phase = "pit"
             self._teleop_done = True
+            self._nav_done = True
 
     def _sim_time(self) -> float:
         return float(self._sim_step) * float(self.dt)
@@ -841,6 +980,17 @@ class AlgSolution:
         self._last_teleop_cmd = (vx, vy, wz)
         if sim_t > self._replayer.total_duration + 0.5:
             self._teleop_done = True
+            if not self._phase_handoff_enabled:
+                print(
+                    f"[AlgSolution-Pit] teleop finished at t={sim_t:.2f}s (phase handoff disabled, holding teleop idle)",
+                    flush=True,
+                )
+                self._last_teleop_cmd = (0.0, 0.0, 0.0)
+                self._teleop.set_velocity_command(0.0, 0.0, 0.0)
+                resp = self._teleop.predicts(obs, current_score)
+                self._sync_proprio_history_from_obs(obs)
+                self._sim_step += 1
+                return resp
             self._capture_handoff_baselines()
             self._on_teleop_to_pit_handoff(obs)
             self._phase = "pit"
@@ -852,8 +1002,66 @@ class AlgSolution:
         self._sim_step += 1
         return resp
 
+    def _env_step_dt(self) -> float:
+        if self._env is not None:
+            try:
+                return float(self._env.unwrapped.step_dt)
+            except Exception:
+                pass
+        return float(self.dt)
+
+    def _nav_elapsed_s(self) -> float:
+        return float(self._nav_phase_steps) * self._env_step_dt()
+
+    def _update_nav_handoff_progress(self) -> None:
+        if self._env is None:
+            return
+        try:
+            self._last_robot_speed_xy = robot_horizontal_speed_from_env(self._env, env_idx=0)
+        except Exception:
+            self._last_robot_speed_xy = float("inf")
+        try:
+            self._last_box_nominal_x = box_nominal_x_from_env(self._env, env_idx=0)
+        except Exception:
+            pass
+
+    def _nav_handoff_ready(self) -> bool:
+        if not self._phase_handoff_enabled:
+            return False
+        if self._sim_step >= self._nav_max_steps:
+            return True
+        nav_t = self._nav_elapsed_s()
+        slow = self._last_robot_speed_xy <= self._nav_handoff_speed
+        return slow and nav_t > self._nav_handoff_min_runtime_s
+
+    def _predict_nav(self, obs, current_score):
+        assert self._nav is not None
+        self._update_nav_handoff_progress()
+        if self._nav_handoff_ready():
+            self._nav_done = True
+            self._capture_handoff_baselines()
+            if self._sim_step >= self._nav_max_steps:
+                reason = f"timeout @ step {self._sim_step}"
+            else:
+                reason = (
+                    f"nav_t={self._nav_elapsed_s():.1f}s>"
+                    f"{self._nav_handoff_min_runtime_s:.1f}s "
+                    f"and speed_xy={self._last_robot_speed_xy:.3f}<={self._nav_handoff_speed:.2f}m/s"
+                )
+            self._on_teleop_to_pit_handoff(obs)
+            self._phase = "pit"
+            print(f"[AlgSolution-Pit] nav finished ({reason}) → pit student", flush=True)
+            return self._predict_pit(obs, current_score)
+        resp = self._nav.predicts(obs, current_score)
+        self._sync_proprio_history_from_obs(obs)
+        self._nav_phase_steps += 1
+        self._sim_step += 1
+        return resp
+
     def _predict_pit(self, obs, current_score):
         del current_score
+        if self.policy is None:
+            raise RuntimeError("pit student not loaded; omit --nav_only or pass --pit_ckpt")
         self._last_obs_mgr = self._obs_from_manager(obs)
         policy_obs = self._build_policy_obs(obs)
         with torch.inference_mode():
@@ -905,6 +1113,8 @@ class AlgSolution:
             depth = self._tensor_obs(obs["depth"])
             if self.head_depth_only and depth.shape[-1] == expected:
                 return depth
+            if self.head_depth_only and depth.shape[-1] == 2 * expected:
+                return depth[:, :expected]
             if not self.head_depth_only and depth.shape[-1] == 2 * expected:
                 return depth
 
@@ -1008,11 +1218,28 @@ class AlgSolution:
         return action_env
 
     def predicts(self, obs, current_score):
+        if self._nav is not None and not self._nav_done:
+            return self._predict_nav(obs, current_score)
         if self._replayer is not None and not self._teleop_done:
             return self._predict_teleop(obs, current_score)
         return self._predict_pit(obs, current_score)
 
     def get_video_overlay_lines(self) -> list[str]:
+        if self._phase == "nav" and not self._nav_done and self._nav is not None:
+            depth_tag = (
+                f"480x640→{self._nav.image_h}x{self._nav.image_w}"
+                if getattr(self, "_use_platform_cam", True)
+                else f"{self._nav.image_h}x{self._nav.image_w}"
+            )
+            lines = [f"phase=nav step={self._sim_step}", f"depth={depth_tag}"]
+            lines.append(
+                f"speed_xy={self._last_robot_speed_xy:.3f} "
+                f"nav_t={self._nav_elapsed_s():.1f}/{self._nav_handoff_min_runtime_s:.1f}s"
+            )
+            if not math.isnan(self._last_box_nominal_x):
+                lines.append(f"box_nominal_x={self._last_box_nominal_x:+.2f}")
+            lines.extend(self._nav.overlay_lines())
+            return lines
         if self._phase == "teleop" and not self._teleop_done:
             vx, vy, wz = self._last_teleop_cmd
             return [
@@ -1023,8 +1250,13 @@ class AlgSolution:
         warm = int(self._pit_warmup_remaining)
         warm_s = f" warmup_left={warm}" if warm > 0 else ""
         obs_tag = "mgr" if self._last_obs_mgr else "manual"
+        depth_tag = (
+            f"480x640→{self.image_h}x{self.image_w}"
+            if getattr(self, "_use_platform_cam", True)
+            else f"{self.image_h}x{self.image_w}"
+        )
         return [
             f"phase=pit ckpt={os.path.basename(self._student_ckpt_path)} obs={obs_tag}",
-            f"cmd_vx={self.command_vx:.2f} pit_step={self._step_count}{warm_s}",
-            f"depth={self.image_h}x{self.image_w} act_norm={act_norm:.3f}",
+            f"depth={depth_tag} cmd_vx={self.command_vx:.2f} pit_step={self._step_count}{warm_s}",
+            f"act_norm={act_norm:.3f}",
         ]

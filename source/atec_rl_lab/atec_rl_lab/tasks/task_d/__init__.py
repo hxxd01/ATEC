@@ -2,6 +2,7 @@ import gymnasium as gym
 
 from .terrain import TASK_D_TERRAIN_CFG
 from .env_cfg import TaskDEnvCfg, TaskDEnvB2Cfg
+from . import e2e  # noqa: F401  — registers ATEC-TaskD-E2E-B2Piper-v0
 
 
 gym.register(

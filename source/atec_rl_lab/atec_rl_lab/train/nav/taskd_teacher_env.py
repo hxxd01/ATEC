@@ -45,6 +45,8 @@ def _build_nominal_waypoints(stage_specs: list[dict]) -> list[tuple[float, float
             y -= float(spec.get("push_right_dist", 2.0))
         elif spec.get("push_forward_only"):
             x += float(spec.get("push_forward_dist", 4.0))
+        elif spec.get("return_spawn"):
+            x, y = float(_ROBOT_SPAWN_XY[0]), float(_ROBOT_SPAWN_XY[1])
         elif spec.get("track_box_offset_x") is not None:
             x = box_x + float(spec["track_box_offset_x"])
             y = box_y
@@ -275,6 +277,9 @@ class TaskDTeacherEnv(gym.Wrapper):
         # approach_box: reward turning to face the box (progress-based on yaw error).
         self._w_face_box = 2.0
         self._face_box_delta_clip = 0.05
+        # Always-on heading tracking bonus: keep robot yaw near 0 (world x-forward).
+        self._w_track_yaw0 = 0.02
+        self._track_yaw0_std = 0.35
         # Push: reward box yaw approaching target (1.0m face along +x after 90 deg turn).
         self._w_push_box_yaw = 4.0
         self._push_box_yaw_delta_clip = 0.08
@@ -355,6 +360,40 @@ class TaskDTeacherEnv(gym.Wrapper):
             f"nav_log_interval={self._nav_log_interval}",
             flush=True,
         )
+
+    def _init_reward_scalars(self, **overrides) -> None:
+        """Initialize reward scalars for ``__new__`` delegates that skip ``__init__``."""
+        self._w_nav_dist = 3.0
+        self._nav_dist_delta_clip = 0.05
+        self._stage_reach_tol = 0.35
+        self._r_stage_complete = 1.0
+        self._r_step_penalty = -0.01
+        self._w_push_box_axis = 2.0
+        self._push_box_axis_delta_clip = 0.05
+        self._w_approach_box = 1.0
+        self._approach_box_delta_clip = 0.05
+        self._contact_force_thresh = 2.0
+        self._w_face_box = 2.0
+        self._face_box_delta_clip = 0.05
+        self._w_track_yaw0 = 0.02
+        self._track_yaw0_std = 0.35
+        self._w_push_box_yaw = 4.0
+        self._push_box_yaw_delta_clip = 0.08
+        self._push_box_yaw_near_thresh = 0.3
+        self._push_box_yaw_near_bonus = 0.5
+        self._w_final_robot_x = 6.0
+        self._final_robot_x_delta_clip = 0.05
+        self._final_cross_box_x_bonus = 5.0
+        self._final_cross_box_x_plus1_bonus = 5.0
+        self._final_cross_box_x_plus1_offset = 1.0
+        self._push_box_drop_z = 0.295
+        self._push_min_box_nominal_x = -0.8
+        self._push_right_reward_dist = 1.0
+        self._push_target_box_yaw = math.pi / 2
+        self._push_target_box_yaw_tol = 0.35
+        self._r_push1_yaw_complete_bonus = 2.0
+        for key, value in overrides.items():
+            setattr(self, key, value)
 
     @property
     def num_envs(self) -> int:
@@ -510,7 +549,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         return s, min_dist
 
     def _ensure_state_buffers(self, batch: int) -> None:
-        if self._stage_idx_buf is not None and int(self._stage_idx_buf.shape[0]) == int(batch):
+        if getattr(self, "_stage_idx_buf", None) is not None and int(self._stage_idx_buf.shape[0]) == int(batch):
             return
         self._stage_idx_buf = torch.zeros(batch, device=self._device, dtype=torch.long)
         self._ep_stage_reward_buf = torch.zeros(
@@ -638,7 +677,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         rx, ry, _ = self._robot_pose()
         bx, by, _, _ = self._box_pose()
         rel_world = torch.cat([bx - rx, by - ry], dim=-1)
-        cf = self.env.unwrapped.scene["contact_sensor"].data.net_forces_w
+        cf = self._contact_net_forces_w()
         contact_on = (cf.norm(dim=-1).max(dim=1).values > 2.0).to(dtype=torch.float32).unsqueeze(-1)
         return torch.cat([actor_obs, r_vel, b_vel, rel_world, contact_on], dim=-1)
 
@@ -887,8 +926,15 @@ class TaskDTeacherEnv(gym.Wrapper):
         raw = self._relative_axis_progress(sign, bx.squeeze(-1), self._box_push_origin_x_buf)
         return torch.where(push, raw, torch.zeros_like(raw))
 
+    def _contact_net_forces_w(self) -> torch.Tensor:
+        scene = self.env.unwrapped.scene
+        try:
+            return scene["contact_forces"].data.net_forces_w
+        except KeyError:
+            return scene["contact_sensor"].data.net_forces_w
+
     def _contact_on(self) -> torch.Tensor:
-        cf = self.env.unwrapped.scene["contact_sensor"].data.net_forces_w
+        cf = self._contact_net_forces_w()
         return cf.norm(dim=-1).max(dim=1).values > self._contact_force_thresh
 
     def _ensure_box_push_origin(
@@ -1401,8 +1447,8 @@ class TaskDTeacherEnv(gym.Wrapper):
             torch.full_like(self._prev_push_forward_progress, float("nan")),
             forward_progress,
         )
-        dense = torch.where(right_active, self._w_push_box_axis * delta_r, torch.zeros_like(delta_r))
-        dense = dense + torch.where(forward_active_push_adj, self._w_push_box_axis * delta_f, torch.zeros_like(delta_f))
+        # Push dense reward: forward progress only (no lateral/rightward reward).
+        dense = torch.where(forward_active_push_adj, self._w_push_box_axis * delta_f, torch.zeros_like(delta_f))
         dense = dense + torch.where(forward_active_push2, self._w_push_box_axis * delta_f, torch.zeros_like(delta_f))
         return dense
 
@@ -1476,6 +1522,7 @@ class TaskDTeacherEnv(gym.Wrapper):
         _, _, _, box_yaw = self._box_pose()
         any_push = self._any_push_stage_mask(stage_idx, valid)
         contact = self._contact_on()
+        push2_mask = self._push2_stage_mask(stage_idx, valid)
 
         prev_init = torch.isnan(self._prev_dist_to_target)
         self._prev_dist_to_target = torch.where(prev_init, dist_to_target, self._prev_dist_to_target)
@@ -1496,6 +1543,11 @@ class TaskDTeacherEnv(gym.Wrapper):
         )
         dense = dense + self._compute_push_box_yaw_reward(stage_idx, valid, box_yaw, done_now, reached)
         dense = dense + self._compute_face_box_reward(stage_idx, valid, rx, ry, bx, by, robot_yaw, done_now, reached)
+        yaw_err0 = torch.atan2(torch.sin(robot_yaw.squeeze(-1)), torch.cos(robot_yaw.squeeze(-1)))
+        yaw0_bonus = self._w_track_yaw0 * torch.exp(
+            -(yaw_err0.square()) / (2.0 * (self._track_yaw0_std**2))
+        )
+        dense = dense + torch.where(valid, yaw0_bonus, torch.zeros_like(yaw0_bonus))
         dense = dense + self._compute_final_robot_x_progress_reward(
             stage_idx, valid, rx, done_now, reached
         )
@@ -1721,6 +1773,10 @@ class TaskDTeacherEnv(gym.Wrapper):
             if self._done_stage_counts[self._num_stages] > 0:
                 stage_ratio_parts.append(f"finished={self._done_stage_counts[self._num_stages] / denom:.2f}")
             stage_at_done = " ".join(stage_ratio_parts)
+            ox0 = float(self._env_origin_x[0].item())
+            oy0 = float(self._env_origin_y[0].item())
+            loc_pos = f"loc=({dbg_rx0 - ox0:+.2f},{dbg_ry0 - oy0:+.2f})"
+            loc_tgt = f"loc_tgt=({dbg_tx0 - ox0:+.2f},{dbg_ty0 - oy0:+.2f})"
             print(
                 f"[{self._nav_log_tag}] nav={nav0:5d} curriculum={level0} "
                 f"stage={idx0 + 1}/{self._num_stages}({stage_name}) active={active0} "
@@ -1729,6 +1785,7 @@ class TaskDTeacherEnv(gym.Wrapper):
                 f"{total_sparse.mean().item():+.3f}/{total_time_pen.mean().item():+.3f} "
                 f"push_complete={self._push_complete_count} "
                 f"pos=({dbg_rx0:+.2f},{dbg_ry0:+.2f}) tgt=({dbg_tx0:+.2f},{dbg_ty0:+.2f}) "
+                f"{loc_pos} {loc_tgt} "
                 f"seg=({dbg_sx0:+.2f},{dbg_sy0:+.2f})->({dbg_ex0:+.2f},{dbg_ey0:+.2f}) dseg={dbg_dseg0:.2f} "
                 f"why0={dbg_done_reason0} "
                 f"done[f/t/x/stg/nm/np/pp]={self._done_fall}/{self._done_timeout}/{self._done_x_reached}/"

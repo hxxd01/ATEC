@@ -129,6 +129,7 @@ from isaaclab.utils.dict import print_dict
 import atec_rl_lab.tasks  # noqa: F401
 import atec_rl_lab.train  # noqa: F401
 from atec_rl_lab.tasks.task_d.env_cfg import TASK_D_BOX_SPAWN_LOCAL
+from atec_rl_lab.tasks.task_d.mdp.platform_score import TaskDPlatformScoreTracker
 from atec_rl_lab.train.nav.taskd_student_pit_e2e_env import (
     attach_dagger_depth_obs,
     configure_pit_e2e_cameras,
@@ -139,64 +140,6 @@ from atec_rl_lab.train.pit_marg.taskd_pit_marg_runner import apply_play_spawn, c
 from demo.solution_marg_depth_pit import AlgSolution
 from demo.teleop_controller import TaskDTeleopController
 from teleop_extras import TrajectoryReplayer, load_teleop_trajectory, run_teleop_replay
-
-
-class _TaskDPlatformScoreTracker:
-    """Mirror Task D platform scoring: RewardCrossX (-1.4->+2, 2.0->+20) + box ranges (+14 each)."""
-
-    _CROSS_THRESHOLDS = (-1.4, 2.0)
-    _CROSS_VALUES = (2.0, 20.0)
-    _BOX_X_RANGES = ((-0.7, 0.7), (-1.4, -0.7))
-    _BOX_VALUE = 14.0
-
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self.score = 0.0
-        self._cross_given = [False, False]
-        self._box_given = [False, False]
-
-    def update(self, unwrapped, *, with_box: bool) -> float:
-        from atec_rl_lab.tasks.task_d.mdp.env_origin import task_d_env_origin_xy, task_d_nominal_x_to_world
-
-        robot = unwrapped.scene["robot"]
-        root_x = robot.data.root_pos_w[0, 0]
-        env_origin_x, _ = task_d_env_origin_xy(unwrapped)
-        ox = env_origin_x[0]
-
-        for i, (nominal_th, value) in enumerate(zip(self._CROSS_THRESHOLDS, self._CROSS_VALUES)):
-            th_world = task_d_nominal_x_to_world(
-                torch.tensor(float(nominal_th), device=root_x.device),
-                ox.unsqueeze(0),
-            )[0]
-            if root_x > th_world and not self._cross_given[i]:
-                self._cross_given[i] = True
-                self.score += float(value)
-
-        if with_box:
-            try:
-                box = unwrapped.scene["box"]
-            except KeyError:
-                box = None
-            if box is not None:
-                box_x = box.data.root_pos_w[0, 0]
-                for i, (x_min, x_max) in enumerate(self._BOX_X_RANGES):
-                    mn_w = task_d_nominal_x_to_world(
-                        torch.tensor(float(x_min), device=box_x.device),
-                        ox.unsqueeze(0),
-                    )[0]
-                    mx_w = task_d_nominal_x_to_world(
-                        torch.tensor(float(x_max), device=box_x.device),
-                        ox.unsqueeze(0),
-                    )[0]
-                    lo = torch.minimum(mn_w, mx_w)
-                    hi = torch.maximum(mn_w, mx_w)
-                    if box_x >= lo and box_x <= hi and not self._box_given[i]:
-                        self._box_given[i] = True
-                        self.score += self._BOX_VALUE
-
-        return self.score
 
 
 def _robot_local_x(unwrapped) -> float:
@@ -498,7 +441,7 @@ def main():
         (video_warmup + int(args_cli.video_length)) if record_video else None
     )
     total_env_reward = 0.0
-    platform_score_tracker = _TaskDPlatformScoreTracker()
+    platform_score_tracker = TaskDPlatformScoreTracker()
     score_interval = max(1, int(args_cli.score_interval))
 
     if record_video and video_warmup > 0 and not use_traj:
@@ -570,7 +513,7 @@ def main():
             print(
                 f"[PitSolutionPlay] episode end step={steps} terms={term_names or ['unknown']} "
                 f"env_reward={total_env_reward:.2f} platform_score={platform_score:.1f} "
-                f"cross={platform_score_tracker._cross_given} box={platform_score_tracker._box_given}",
+                f"cross={platform_score_tracker.cross_given} box={platform_score_tracker.box_given}",
                 flush=True,
             )
             if record_video:

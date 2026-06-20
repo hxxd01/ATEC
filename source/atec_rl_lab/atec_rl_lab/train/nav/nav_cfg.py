@@ -234,3 +234,33 @@ class TaskDMargDepthPitDaggerPPORunnerCfg(TaskDMargDepthPitE2EPPORunnerCfg):
         learning_rate=5.0e-4,
         entropy_coef=0.001,
     )
+
+
+@configclass
+class MargProprioActorCriticCfg(RslRlPpoActorCriticCfg):
+    class_name: str = "MargProprioActorCritic"
+    actor_obs_normalization: bool = True
+    critic_obs_normalization: bool = False
+    actor_hidden_dims: list = [512, 256, 128]
+    critic_hidden_dims: list = [512, 256, 128]
+    activation: str = "relu"
+    init_noise_std: float = 0.6
+    max_noise_std: float = 2.0
+    estimator_hidden_dims: list = [128]
+    critic_task_dim: int = 21  # 17 + 4 stages (TaskDStudent-style priv)
+
+
+@configclass
+class TaskDE2EPlatformMargPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Task D platform e2e: MARG proprio (no elevation) + 4-stage wrapper rewards."""
+
+    num_steps_per_env = 24
+    max_iterations = 8000
+    save_interval = 100
+    experiment_name = "taskd_e2e_platform_b2piper"
+    obs_groups = {
+        "policy": ["proprio", "proprio_history"],
+        "critic": ["proprio", "critic_priv", "critic_task"],
+    }
+    policy = MargProprioActorCriticCfg()
+    algorithm = MargDepthPitPpoAlgorithmCfg()

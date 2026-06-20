@@ -1,11 +1,12 @@
 # Platform / server.py bundle config (paths relative to solution.py directory).
 # Copy checkpoint + teleop JSON + policy.pt next to solution.py before submit.
-
-pit_student_ckpt: model_200.pt
-teleop_traj: teleop_traj.json
+nav_ckpt: model_nav.pt
+pit_student_ckpt: model_pit.pt
 teleop_ll_policy: policy.pt
-enable_teleop: true
+enable_teleop: false
 command_vx: 0.6
-handoff_warmup: 40
+handoff_warmup: 0
+nav_handoff_speed: 0.12
+nav_handoff_min_runtime_s: 3.0
 depth_max: 5.0
 head_depth_only: true

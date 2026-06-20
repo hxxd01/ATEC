@@ -144,6 +144,65 @@ def apply_pit_dr_light(env_cfg, args) -> None:
     )
 
 
+def apply_task_d_fixed_box(env_cfg) -> None:
+    """Reset box to Task D default spawn (``TASK_D_BOX_SPAWN_LOCAL``), no jitter."""
+    if getattr(env_cfg.scene, "box", None) is None:
+        return
+    from isaaclab.managers import EventTermCfg as EventTerm
+    from isaaclab.managers import SceneEntityCfg
+
+    local_pos = tuple(float(v) for v in TASK_D_BOX_SPAWN_LOCAL)
+    env_cfg.events.reset_box_root = EventTerm(
+        func=reset_root_state_at_env_origin,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("box"),
+            "local_pos": local_pos,
+        },
+    )
+    env_cfg.scene.box.init_state.pos = local_pos
+    print(
+        f"[TaskDPitBox] Task D box at local_pos={local_pos} (fixed, no jitter)",
+        flush=True,
+    )
+
+
+def apply_e2e_reset_overrides(env_cfg, args) -> None:
+    """E2E pit: optional joint-only DR; Task D robot/box spawn (no pose DR)."""
+    robot_local = tuple(float(v) for v in TASK_D_ROBOT_SPAWN_LOCAL)
+    params = env_cfg.events.reset_robot_task_d.params
+    params["local_pos"] = robot_local
+    params["local_pos_x_jitter"] = 0.0
+    params["local_pos_y_jitter"] = 0.0
+    params["local_pos_y_jitter_right"] = 0.0
+    params["local_pos_z_jitter"] = 0.0
+    params["yaw_range"] = (0.0, 0.0)
+    params["lin_vel_x_range"] = (0.0, 0.0)
+    params["lin_vel_y_range"] = (0.0, 0.0)
+    params["ang_vel_z_range"] = (0.0, 0.0)
+
+    sim_easy = bool(getattr(args, "pit_sim_easy", False) or getattr(args, "sim_easy", False))
+    if bool(getattr(args, "pit_dr_light", False)) and not sim_easy:
+        joint_scale = _pit_dr_arg(args, "pit_dr_joint_scale", PIT_DR_LIGHT_JOINT_SCALE)
+        env_cfg.events.reset_joints_default.params["position_range"] = tuple(float(v) for v in joint_scale)
+        env_cfg.events.reset_joints_default.params["velocity_range"] = (0.0, 0.0)
+        dr_msg = f"joint position scale {joint_scale} only"
+    else:
+        env_cfg.events.reset_joints_default.params["position_range"] = (1.0, 1.0)
+        env_cfg.events.reset_joints_default.params["velocity_range"] = (0.0, 0.0)
+        dr_msg = "off (fixed default joints)"
+
+    apply_task_d_fixed_box(env_cfg)
+    if getattr(env_cfg.scene, "robot", None) is not None:
+        env_cfg.scene.robot.init_state.pos = robot_local
+    box_local = tuple(float(v) for v in TASK_D_BOX_SPAWN_LOCAL)
+    print(
+        f"[TaskDE2E] reset overrides: robot Task D spawn {robot_local}, "
+        f"box Task D spawn {box_local}, DR={dr_msg}",
+        flush=True,
+    )
+
+
 def pit_head_depth_only(args) -> bool:
     """Pit depth student: head camera only unless --ee_depth."""
     return not bool(getattr(args, "ee_depth", False))
@@ -505,11 +564,17 @@ def attach_taskd_platform_marg_student_obs(
     policy_h: int | None = None,
     policy_w: int | None = None,
     depth_max: float = 5.0,
+    head_depth_only: bool | None = None,
+    depth_render_h: int | None = None,
+    depth_render_w: int | None = None,
 ) -> None:
     """Task D B2 play: MARG proprio/history + depth via obs_manager (platform proprio kept for teleop)."""
-    head_depth_only = not bool(getattr(args, "ee_depth", False))
+    if head_depth_only is None:
+        head_depth_only = bool(getattr(env_cfg, "head_depth_only", not bool(getattr(args, "ee_depth", False))))
     ph = int(policy_h if policy_h is not None else getattr(args, "pit_cam_h", 24))
     pw = int(policy_w if policy_w is not None else getattr(args, "pit_cam_w", 32))
+    rh = depth_render_h if depth_render_h is not None else getattr(env_cfg, "depth_render_h", None)
+    rw = depth_render_w if depth_render_w is not None else getattr(env_cfg, "depth_render_w", None)
     marg = TaskDPitMargObservationsCfg()
     env_cfg.observations.marg_proprio = copy.deepcopy(marg.proprio)
     env_cfg.observations.marg_proprio_history = copy.deepcopy(marg.proprio_history)
@@ -520,6 +585,8 @@ def attach_taskd_platform_marg_student_obs(
         depth_max=float(depth_max),
         depth_only=True,
         head_depth_only=head_depth_only,
+        depth_render_h=rh,
+        depth_render_w=rw,
     )
     # Depth comes from marg_depth_flat; drop platform image obs group (teleop uses proprio only).
     env_cfg.observations.image = None

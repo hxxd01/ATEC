@@ -1,6 +1,7 @@
 """Train Task-D student nav policy and optionally warm-start from BC checkpoint."""
 
 import argparse
+import math
 import os
 import sys
 from datetime import datetime
@@ -36,8 +37,10 @@ parser.add_argument(
     help="Load model weights only; reset Adam (safer if resume destabilizes).",
 )
 parser.add_argument("--steps_per_env", type=int, default=24)
-parser.add_argument("--vx_min", type=float, default=-2.0)
-parser.add_argument("--vx_max", type=float, default=2.0)
+parser.add_argument("--vx_min", type=float, default=-4.0)
+parser.add_argument("--vx_max", type=float, default=4.0)
+parser.add_argument("--vy_max", type=float, default=2.0)
+parser.add_argument("--wz_max", type=float, default=1.0)
 parser.add_argument(
     "--policy_img_h",
     type=int,
@@ -166,13 +169,14 @@ parser.add_argument(
 parser.add_argument(
     "--push-min-box-nominal-x",
     type=float,
-    default=-0.8,
-    help="Push completes on box drop only if box nominal x (env-relative) exceeds this value.",
+    default=-1.4,
+    help="Push completes on box drop only if box nominal x exceeds this value "
+    "(4-stage student overrides to score line -1.4).",
 )
 parser.add_argument(
     "--push-right-reward-dist",
     type=float,
-    default=1.0,
+    default=0.6,
     help="Cap lateral push progress/reward at this many meters.",
 )
 
@@ -388,17 +392,20 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import torch
 from rsl_rl.runners import OnPolicyRunner
+from types import MethodType
 
 from isaaclab.utils.io import dump_yaml
 
 import atec_rl_lab.tasks  # noqa: F401
 from atec_rl_lab.tasks.task_d.env_cfg import (
     TASK_D_PLATFORM_CAMERA_FAR,
+    TASK_D_ROBOT_SPAWN_LOCAL,
     TaskDEnvB2Cfg,
     apply_task_d_camera_depth_clip,
     refresh_task_d_terrain_cfg,
 )
 from atec_rl_lab.train.nav.taskd_student_env import TaskDStudentEnv
+from atec_rl_lab.train.nav.taskd_teacher_env import TaskDTeacherEnv, _ROBOT_SPAWN_XY, _build_nominal_waypoints
 from atec_rl_lab.train.nav.nav_cfg import (
     TaskDStudentPPORunnerCfg,
     TaskDMargDepthPitE2EPPORunnerCfg,
@@ -421,10 +428,324 @@ from atec_rl_lab.train.pit_marg.marg_teacher_loader import (
     load_marg_teacher_checkpoint,
     warmstart_depth_student_from_teacher,
 )
+from atec_rl_lab.tasks.task_d.mdp.env_origin import (
+    TASK_D_PIT_TERRAIN_ORIGIN_XY,
+    task_d_robot_spawn_world_xy,
+)
 
 import rsl_rl.runners.on_policy_runner as _runner_mod
 
 _runner_mod.TaskDStudentActorCritic = TaskDStudentActorCritic
+
+
+_RETURN_HOME_YAW_TOL_RAD = math.radians(15.0)
+_RETURN_HOME_XY_TOL = 0.2
+_RETURN_HOME_Y_OFFSET = -0.3  # Task D +y is left; negative y shifts target to the right.
+# Reward shaping uses a wide speed scale; completion uses relaxed hold (not instant 0.03 m/s).
+_RETURN_HOME_STILL_REWARD_SPEED = 0.20
+_RETURN_HOME_HOLD_SPEED = 0.12
+_RETURN_HOME_HOLD_S = 0.5
+_W_RETURN_HOME_STILL = 0.10
+_ALIGN_BOX_Y_TOL = 0.1
+# Platform near-pit score line x=-1.4; train to finish 10cm past it.
+_PUSH_BOX_SCORE_LINE_NOMINAL_X = -1.4
+_PUSH_BOX_TARGET_NOMINAL_X = -1.3
+# Narrow push stage / dense reward band (was 4.0m open-ended forward shaping).
+_PUSH_BOX_FORWARD_DIST = 1.9
+_PUSH_BOX_RIGHT_REWARD_DIST = 0.6
+
+
+def _apply_student_four_stage_logic(student_env: TaskDStudentEnv) -> None:
+    """Switch nav student to e2e-style 4 stages (no CLI toggle)."""
+    student_env.stage_specs = [
+        dict(name="retreat", axis="x", sign=-0.7, dist=1.0, push=False, sparse_bonus=2.0),
+        dict(
+            name="align_box_y",
+            axis="y",
+            sign=0.0,
+            dist=0.0,
+            push=False,
+            sparse_bonus=2.0,
+            match_box_y_target=True,
+        ),
+        dict(
+            name="push_box",
+            axis="x",
+            sign=1.0,
+            dist=_PUSH_BOX_FORWARD_DIST,
+            push=True,
+            push_forward_only=True,
+            push_forward_dist=_PUSH_BOX_FORWARD_DIST,
+            sparse_bonus=2.0,
+            box_score_complete=True,
+        ),
+        dict(
+            name="return_home",
+            axis="xy",
+            sign=1.0,
+            dist=0.0,
+            push=False,
+            sparse_bonus=5.0,
+            return_spawn=True,
+        ),
+    ]
+    student_env._num_stages = len(student_env.stage_specs)
+    student_env._stage_names = [spec["name"] for spec in student_env.stage_specs]
+    dev = student_env._device
+    specs = student_env.stage_specs
+    student_env._stage_axis_is_x = torch.tensor([spec["axis"] == "x" for spec in specs], device=dev, dtype=torch.bool)
+    student_env._stage_push = torch.tensor([bool(spec["push"]) for spec in specs], device=dev, dtype=torch.bool)
+    student_env._stage_relative_target = torch.tensor(
+        [bool(spec.get("relative_robot_target", False)) for spec in specs], device=dev, dtype=torch.bool
+    )
+    student_env._stage_match_box_y_target = torch.tensor(
+        [bool(spec.get("match_box_y_target", False)) for spec in specs], device=dev, dtype=torch.bool
+    )
+    student_env._stage_match_box_x_tol = torch.full((len(specs),), float("nan"), device=dev, dtype=torch.float32)
+    student_env._stage_match_box_y_tol = torch.full((len(specs),), float("nan"), device=dev, dtype=torch.float32)
+    student_env._stage_approach_y = torch.full((len(specs),), float("nan"), device=dev, dtype=torch.float32)
+    student_env._stage_face_box_tol = torch.full((len(specs),), float("nan"), device=dev, dtype=torch.float32)
+    student_env._stage_track_box_offset_x = torch.full((len(specs),), float("nan"), device=dev, dtype=torch.float32)
+    student_env._stage_sign = torch.tensor([float(spec["sign"]) for spec in specs], device=dev, dtype=torch.float32)
+    student_env._stage_dist = torch.tensor([float(spec["dist"]) for spec in specs], device=dev, dtype=torch.float32)
+    student_env._stage_push_right_dist = torch.full((len(specs),), float("nan"), device=dev, dtype=torch.float32)
+    student_env._stage_sparse_rewards = torch.tensor(
+        [float(spec.get("sparse_bonus", 1.0)) for spec in specs], device=dev, dtype=torch.float32
+    )
+    student_env._stage_return_spawn = torch.tensor(
+        [bool(spec.get("return_spawn", False)) for spec in specs], device=dev, dtype=torch.bool
+    )
+    student_env._stage_box_score_complete = torch.tensor(
+        [bool(spec.get("box_score_complete", False)) for spec in specs], device=dev, dtype=torch.bool
+    )
+    student_env._idx_retreat = 0
+    student_env._idx_sidestep_left = 1
+    student_env._idx_push_adjust = 2
+    student_env._idx_push2 = 2
+    student_env._push_min_box_nominal_x = _PUSH_BOX_SCORE_LINE_NOMINAL_X
+    student_env._push_right_reward_dist = _PUSH_BOX_RIGHT_REWARD_DIST
+    student_env._traj_waypoints = _build_nominal_waypoints(student_env.stage_specs)
+    stage_targets = student_env._traj_waypoints[1 : student_env._num_stages + 1]
+    stage_starts = student_env._traj_waypoints[: student_env._num_stages]
+    student_env._stage_start_x = torch.tensor([p[0] for p in stage_starts], device=dev, dtype=torch.float32)
+    student_env._stage_start_y = torch.tensor([p[1] for p in stage_starts], device=dev, dtype=torch.float32)
+    student_env._stage_target_x = torch.tensor([p[0] for p in stage_targets], device=dev, dtype=torch.float32)
+    student_env._stage_target_y = torch.tensor([p[1] for p in stage_targets], device=dev, dtype=torch.float32)
+    student_env._build_traj_segments()
+    student_env._bind_env_origins()
+    student_env._pit_ref_ox, student_env._pit_ref_oy = TASK_D_PIT_TERRAIN_ORIGIN_XY
+    student_env._return_home_entry_dist = torch.full(
+        (student_env.num_envs,), float("nan"), device=dev, dtype=torch.float32
+    )
+    student_env._return_home_hold_counter = torch.zeros(student_env.num_envs, device=dev, dtype=torch.long)
+    student_env._return_home_hold_armed = torch.zeros(student_env.num_envs, device=dev, dtype=torch.bool)
+    _idx_push_box = 2
+    _idx_return_home = 3
+
+    def _spawn_world_xy(self):
+        return task_d_robot_spawn_world_xy(self._env_origin_x, self._env_origin_y)
+
+    def _return_home_target_xy(self):
+        """Absolute world target: robot spawn shifted 0.3m to the right (-y)."""
+        spawn_x, spawn_y = self._spawn_world_xy()
+        return spawn_x, spawn_y + _RETURN_HOME_Y_OFFSET
+
+    def _compute_stage_target_student(self, stage_idx, valid, rx, ry, bx, by):
+        tx, ty = TaskDTeacherEnv._compute_stage_target(self, stage_idx, valid, rx, ry, bx, by)
+        return_mask = valid & self._stage_return_spawn[stage_idx]
+        if bool(return_mask.any()):
+            spawn_x, spawn_y = self._return_home_target_xy()
+            tx = torch.where(return_mask, spawn_x, tx)
+            ty = torch.where(return_mask, spawn_y, ty)
+        return tx, ty
+
+    def _compute_stage_segment_endpoints_student(self, stage_idx, valid, rx, ry, bx, by):
+        sx, sy, ex, ey = TaskDTeacherEnv._compute_stage_segment_endpoints(
+            self, stage_idx, valid, rx, ry, bx, by
+        )
+        return_mask = valid & self._stage_return_spawn[stage_idx]
+        if bool(return_mask.any()):
+            spawn_x, spawn_y = self._return_home_target_xy()
+            rx1 = rx.squeeze(-1)
+            ry1 = ry.squeeze(-1)
+            sx = torch.where(return_mask, rx1, sx)
+            sy = torch.where(return_mask, ry1, sy)
+            ex = torch.where(return_mask, spawn_x, ex)
+            ey = torch.where(return_mask, spawn_y, ey)
+        return sx, sy, ex, ey
+
+    def _reset_return_home_nav_on_enter(self, entered: torch.Tensor) -> None:
+        """When push_box completes, seed return_home nav-reward baseline from spawn distance."""
+        if not bool(entered.any()):
+            return
+        spawn_x, spawn_y = self._return_home_target_xy()
+        rx, ry, _ = self._robot_pose()
+        dist = torch.hypot(rx.squeeze(-1) - spawn_x, ry.squeeze(-1) - spawn_y)
+        self._prev_dist_to_target = torch.where(entered, dist, self._prev_dist_to_target)
+        self._return_home_entry_dist = torch.where(entered, dist, self._return_home_entry_dist)
+        self._return_home_hold_counter[entered] = 0
+        self._return_home_hold_armed[entered] = False
+
+    def _return_home_nav_dt(self) -> float:
+        env_dt = float(getattr(self.env.unwrapped, "step_dt", 0.02))
+        return self.inner_steps * env_dt
+
+    def _compute_return_home_hold_reached(
+        self,
+        ret_mask: torch.Tensor,
+        at_target: torch.Tensor,
+        yaw_ok: torch.Tensor,
+        speed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Complete after holding at target with relaxed speed (easier than instant 0.03 m/s)."""
+        slow_enough = speed <= _RETURN_HOME_HOLD_SPEED
+        active = ret_mask & at_target & yaw_ok & slow_enough
+        newly_armed = active & (~self._return_home_hold_armed)
+        self._return_home_hold_armed[newly_armed] = True
+        self._return_home_hold_counter[newly_armed] = 0
+        not_ready = ret_mask & (~active)
+        self._return_home_hold_counter[not_ready] = 0
+        self._return_home_hold_armed[not_ready] = False
+
+        armed = ret_mask & self._return_home_hold_armed
+        reached = torch.zeros(ret_mask.shape[0], device=self._device, dtype=torch.bool)
+        if bool(armed.any()):
+            hold_steps = max(1, int(round(_RETURN_HOME_HOLD_S / self._return_home_nav_dt())))
+            self._return_home_hold_counter[armed] += 1
+            reached = armed & (self._return_home_hold_counter >= hold_steps)
+        return reached
+
+    def _compute_stage_reached_student(self, rx, ry, bx, by, bz):
+        stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+        valid = self._stage_idx_buf < self._active_stage_count_buf
+        tx, ty = self._compute_stage_target(stage_idx, valid, rx, ry, bx, by)
+        rx1 = rx.squeeze(-1)
+        ry1 = ry.squeeze(-1)
+        dist_to_target = torch.hypot(rx1 - tx, ry1 - ty)
+        x_ok = (rx1 - tx).abs() <= self._stage_reach_tol
+        y_ok = (ry1 - ty).abs() <= self._stage_reach_tol
+        align_y_mask = valid & self._stage_match_box_y_target[stage_idx]
+        y_ok = torch.where(align_y_mask, (ry1 - ty).abs() <= _ALIGN_BOX_Y_TOL, y_ok)
+        xy_ok = x_ok & y_ok
+
+        reached = torch.zeros(valid.shape[0], device=self._device, dtype=torch.bool)
+        nav_mask = valid & (~self._stage_push[stage_idx]) & (~self._stage_return_spawn[stage_idx])
+        reached = torch.where(nav_mask, xy_ok, reached)
+
+        push_mask = valid & self._stage_box_score_complete[stage_idx]
+        if bool(push_mask.any()):
+            nx = self._box_nominal_x(bx)
+            in_score = nx >= _PUSH_BOX_TARGET_NOMINAL_X
+            reached = torch.where(push_mask, in_score, reached)
+
+        ret_mask = valid & self._stage_return_spawn[stage_idx]
+        if bool(ret_mask.any()):
+            target_x, target_y = self._return_home_target_xy()
+            _, _, robot_yaw = self._robot_pose()
+            yaw_err = torch.atan2(
+                torch.sin(robot_yaw.squeeze(-1)),
+                torch.cos(robot_yaw.squeeze(-1)),
+            ).abs()
+            at_target = torch.hypot(rx1 - target_x, ry1 - target_y) <= _RETURN_HOME_XY_TOL
+            yaw_ok = yaw_err <= _RETURN_HOME_YAW_TOL_RAD
+            robot = self.env.unwrapped.scene["robot"]
+            speed = torch.linalg.norm(robot.data.root_lin_vel_w[:, :2], dim=1)
+            ret_ok = self._compute_return_home_hold_reached(ret_mask, at_target, yaw_ok, speed)
+            reached = torch.where(ret_mask, ret_ok, reached)
+
+        progress = torch.clamp(self._stage_dist[stage_idx] - dist_to_target, min=0.0)
+        ret_stage = valid & self._stage_return_spawn[stage_idx]
+        if bool(ret_stage.any()):
+            spawn_x, spawn_y = self._return_home_target_xy()
+            ret_dist = torch.hypot(rx1 - spawn_x, ry1 - spawn_y)
+            entry = self._return_home_entry_dist
+            entry_scale = torch.where(torch.isnan(entry), torch.full_like(ret_dist, 4.0), entry)
+            entry_scale = torch.clamp(entry_scale, min=1.0)
+            ret_prog = torch.clamp(1.0 - ret_dist / entry_scale, 0.0, 1.0)
+            progress = torch.where(ret_stage, ret_prog, progress)
+        self._stage_progress_buf = progress
+        return reached, dist_to_target
+
+    def _compute_reward_student(
+        self,
+        dist_to_target: torch.Tensor,
+        done_now: torch.Tensor,
+        reached: torch.Tensor,
+        rx: torch.Tensor,
+        ry: torch.Tensor,
+        bx: torch.Tensor,
+        by: torch.Tensor,
+        bz: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        reward, dense, time_pen = TaskDTeacherEnv._compute_reward(
+            self, dist_to_target, done_now, reached, rx, ry, bx, by, bz
+        )
+        stage_idx = torch.clamp(self._stage_idx_buf, min=0, max=self._num_stages - 1)
+        valid = self._stage_idx_buf < self._active_stage_count_buf
+        ret_mask = valid & self._stage_return_spawn[stage_idx]
+        if bool(ret_mask.any()):
+            target_x, target_y = self._return_home_target_xy()
+            rx1 = rx.squeeze(-1)
+            ry1 = ry.squeeze(-1)
+            dist = torch.hypot(rx1 - target_x, ry1 - target_y)
+            near_radius = _RETURN_HOME_XY_TOL * 2.0
+            # 1 at target, linear falloff to 0 at near_radius.
+            near_weight = torch.clamp(1.0 - dist / near_radius, 0.0, 1.0)
+            robot = self.env.unwrapped.scene["robot"]
+            speed = torch.linalg.norm(robot.data.root_lin_vel_w[:, :2], dim=1)
+            # Continuous brake shaping: full bonus at 0 m/s, 0 at still threshold.
+            speed_factor = torch.clamp(
+                1.0 - speed / _RETURN_HOME_STILL_REWARD_SPEED,
+                0.0,
+                1.0,
+            )
+            still_bonus = _W_RETURN_HOME_STILL * near_weight * speed_factor
+            bonus = torch.where(ret_mask, still_bonus, torch.zeros_like(still_bonus))
+            dense = dense + bonus
+            reward = reward + bonus
+        return reward, dense, time_pen
+
+    def _reset_env_state_student(self, reset_mask, rx, ry, bx, by):
+        TaskDTeacherEnv._reset_env_state(self, reset_mask, rx, ry, bx, by)
+        if bool(reset_mask.any()):
+            self._return_home_entry_dist[reset_mask] = float("nan")
+            self._return_home_hold_counter[reset_mask] = 0
+            self._return_home_hold_armed[reset_mask] = False
+
+    def _step_student(self, nav_action):
+        stage_before = self._stage_idx_buf.clone()
+        out = TaskDTeacherEnv.step(self, nav_action)
+        entered = (stage_before == _idx_push_box) & (self._stage_idx_buf == _idx_return_home)
+        self._reset_return_home_nav_on_enter(entered)
+        return out
+
+    student_env._spawn_world_xy = MethodType(_spawn_world_xy, student_env)
+    student_env._return_home_target_xy = MethodType(_return_home_target_xy, student_env)
+    student_env._reset_return_home_nav_on_enter = MethodType(_reset_return_home_nav_on_enter, student_env)
+    student_env._return_home_nav_dt = MethodType(_return_home_nav_dt, student_env)
+    student_env._compute_return_home_hold_reached = MethodType(_compute_return_home_hold_reached, student_env)
+    student_env._compute_stage_target = MethodType(_compute_stage_target_student, student_env)
+    student_env._compute_stage_segment_endpoints = MethodType(
+        _compute_stage_segment_endpoints_student, student_env
+    )
+    student_env._compute_stage_reached = MethodType(_compute_stage_reached_student, student_env)
+    student_env._compute_reward = MethodType(_compute_reward_student, student_env)
+    student_env._reset_env_state = MethodType(_reset_env_state_student, student_env)
+    student_env.step = MethodType(_step_student, student_env)
+    print(
+        "[INFO] TaskDStudentEnv switched to 4-stage logic: "
+        "retreat/align_box_y/push_box/return_home "
+        f"(return_home: spawn+({_RETURN_HOME_Y_OFFSET:+.1f}m y), tol={_RETURN_HOME_XY_TOL:.1f}m, "
+        f"|yaw|<{math.degrees(_RETURN_HOME_YAW_TOL_RAD):.0f}deg, "
+        f"hold {_RETURN_HOME_HOLD_S:.1f}s @ speed<={_RETURN_HOME_HOLD_SPEED:.2f}m/s; "
+        f"still reward scale={_RETURN_HOME_STILL_REWARD_SPEED:.2f}m/s; "
+        f"align_box_y |dy|<={_ALIGN_BOX_Y_TOL:.1f}m; other nav tol=0.35m; "
+        f"push_box target nominal_x>={_PUSH_BOX_TARGET_NOMINAL_X:.1f} "
+        f"(+{(_PUSH_BOX_TARGET_NOMINAL_X - _PUSH_BOX_SCORE_LINE_NOMINAL_X) * 100:.0f}cm past score line), "
+        f"forward_dist={_PUSH_BOX_FORWARD_DIST:.1f}m, "
+        f"right_cap={_PUSH_BOX_RIGHT_REWARD_DIST:.1f}m)",
+        flush=True,
+    )
 
 
 def _get_policy_module(alg):
@@ -475,7 +796,22 @@ def _sync_ppo_learning_rate(runner) -> float:
     return lr
 
 
+def _resolve_checkpoint_path(ckpt_path: str, *, label: str = "checkpoint") -> str:
+    raw = str(ckpt_path).strip()
+    path = os.path.abspath(os.path.expanduser(raw))
+    if os.path.isfile(path):
+        return path
+    hint = ""
+    if len(raw) <= 2 or raw.startswith("-"):
+        hint = (
+            " Did you pass a CLI flag as the path? "
+            f"Use --resume /path/to/model_*.pt (example: --resume logs/rsl_rl/.../model_1600.pt)."
+        )
+    raise FileNotFoundError(f"{label} not found: {raw!r}.{hint}")
+
+
 def _load_ppo_checkpoint(runner, ckpt_path: str, *, load_optimizer: bool = True) -> dict:
+    ckpt_path = _resolve_checkpoint_path(ckpt_path, label="PPO resume checkpoint")
     loaded = torch.load(ckpt_path, map_location=runner.device, weights_only=False)
     ckpt_sd = loaded["model_state_dict"]
     policy = _get_policy_module(runner.alg)
@@ -1157,6 +1493,8 @@ def _dump_deploy_agent_yaml(
             "platform_depth_h": int(platform_h),
             "platform_depth_w": int(platform_w),
             "depth_max": float(depth_max),
+            "vx_min": -4.0,
+            "vx_max": 4.0,
             "proprio_dim": 9,
             "enc_dim": 128,
             "fuse_dim": 256,
@@ -1330,6 +1668,13 @@ def main():
     os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
 
     record_combined_video = bool(args_cli.ppo_no_train and args_cli.video)
+    if record_combined_video:
+        # Fixed top-down view above Task D robot spawn (env-local coords on env0).
+        spawn_x, spawn_y, spawn_z = TASK_D_ROBOT_SPAWN_LOCAL
+        env_cfg.viewer.origin_type = "env"
+        env_cfg.viewer.env_index = 0
+        env_cfg.viewer.eye = (spawn_x, spawn_y, spawn_z + 6.0)
+        env_cfg.viewer.lookat = (spawn_x, spawn_y, spawn_z)
     inner_steps = int(args_cli.inner_steps)
     max_phys_frames = int(args_cli.video_length)
     no_train_video_nav_steps = min(
@@ -1340,7 +1685,7 @@ def main():
     env = gym.make("ATEC-TaskD-B2Piper", cfg=env_cfg, render_mode=render_mode)
     if record_combined_video:
         print(
-            "[INFO] ppo_no_train + --video: global|head|ee stitched MP4 at physics step rate.",
+            "[INFO] ppo_no_train + --video: fixed top-down spawn view | head | ee stitched MP4.",
             flush=True,
         )
     nav_env = TaskDStudentEnv(
@@ -1350,6 +1695,8 @@ def main():
         inner_steps=args_cli.inner_steps,
         vx_min=args_cli.vx_min,
         vx_max=args_cli.vx_max,
+        vy_max=args_cli.vy_max,
+        wz_max=args_cli.wz_max,
         image_h=policy_h,
         image_w=policy_w,
         depth_max=args_cli.depth_max,
@@ -1359,6 +1706,7 @@ def main():
         push_min_box_nominal_x=args_cli.push_min_box_nominal_x,
         push_right_reward_dist=args_cli.push_right_reward_dist,
     )
+    _apply_student_four_stage_logic(nav_env)
     vec_env = NavRslRlVecEnvWrapper(nav_env)
     if args_cli.debug_env_origins:
         _print_env_origins_debug(env, env_spacing=scene_env_spacing, show=16)

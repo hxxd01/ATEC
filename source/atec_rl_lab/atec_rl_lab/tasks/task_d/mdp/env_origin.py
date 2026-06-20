@@ -15,6 +15,21 @@ TASK_D_ROBOT_SPAWN_NOMINAL_X = -3.0
 TASK_D_REWARD_NOMINAL_X = 2.0
 TASK_D_MISSION_DONE_NOMINAL_X = 3.5
 
+# Env-local offset from terrain origin (matches env_cfg.TASK_D_ROBOT_SPAWN_LOCAL xy; NOT nominal coords).
+TASK_D_ROBOT_SPAWN_LOCAL_XY = (
+    TASK_D_ROBOT_SPAWN_NOMINAL_X - TASK_D_PIT_TERRAIN_ORIGIN_XY[0],
+    0.0 - TASK_D_PIT_TERRAIN_ORIGIN_XY[1],
+)
+
+
+def task_d_robot_spawn_world_xy(
+    env_origin_x: torch.Tensor,
+    env_origin_y: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Absolute world-frame robot spawn xy (``env_origin + local``, same as reset)."""
+    lx, ly = TASK_D_ROBOT_SPAWN_LOCAL_XY
+    return env_origin_x + lx, env_origin_y + ly
+
 
 def task_d_nominal_x_to_local_x(nominal_x: float) -> float:
     """Convert Task D nominal world x to env-local +x (same on every pit tile).
