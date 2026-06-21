@@ -248,7 +248,7 @@ dagger训练，resume
 python scripts/train_nav_taskd_student.py \
   --student_pit_dagger \
   --pit_teacher_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-19_21-17-26/model_3400.pt \
-  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-19_21-36-25/model_800.pt \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_01-53-23/model_500.pt \
   --depth_only \
   --headless \
   --num_envs 512 \
@@ -338,6 +338,8 @@ python scripts/play_taskd_teleop_pit.py \
   --traj scripts/ATEC-TaskD-B2Piper_20260619_153715.json \
   --pit_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_00-28-28/model_200.pt \
   --pit_command_vx 0.6
+平台一整套结合
+python scripts/play_taskd_teleop_pit.py   --headless --video --video_length 400   --nav_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_student_b2piper_depth/2026-06-20_18-01-18/model_2400.pt   --pit_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-21_04-58-57/model_8000.pt   --pit_command_vx 0.6 --platform_deploy
 
 python scripts/play_taskd_marg_depth_pit_dagger.py \
   --headless --video --video_length 400 \
@@ -353,7 +355,7 @@ python scripts/play_taskd_marg_depth_pit_dagger.py \
 python scripts/train_nav_taskd_student.py \
   --student_pit_dagger \
   --pit_teacher_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_pit_locomotion_b2piper_marg/2026-06-19_21-17-26/model_3400.pt \
-  --resume logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-19_04-34-32/model_800.pt \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-21_04-58-57/model_2400.pt \
   --pit_platform_depth \
   --policy_img_h 24 \
   --policy_img_w 32 \

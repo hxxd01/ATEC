@@ -29,6 +29,7 @@ MARG_HISTORY_DIM = MARG_PROPRIO_DIM * MARG_HISTORY_LEN
 MARG_ELEVATION_OUT_DIM = 16
 MARG_ESTIMATOR_OUT_DIM = 7
 MARG_CRITIC_PRIV_DIM = 42
+DEPLOY_REV = "2026-06-21-proprio-lastaction"
 
 # Platform Task D camera resolution (server.py / play); policy sees prep_depth → 24x32.
 PLATFORM_CAM_H = 480
@@ -432,7 +433,7 @@ class AlgSolution:
             f"nav_ckpt={nav_tag}, phase={self._phase}, handoff={handoff_tag}, "
             f"depth={'head' if self.head_depth_only else 'head+ee'} "
             f"platform={self.platform_cam_h}x{self.platform_cam_w}->policy={self.image_h}x{self.image_w}, "
-            f"cmd_vx={self.command_vx}, device={self.device}",
+            f"cmd_vx={self.command_vx}, device={self.device}, deploy_rev={DEPLOY_REV}",
             flush=True,
         )
 
@@ -699,7 +700,17 @@ class AlgSolution:
             )
         env_cfg.depth_render_h = cam_h
         env_cfg.depth_render_w = cam_w
-        from atec_rl_lab.tasks.task_d.env_cfg import TASK_D_NAV_DEPTH_MAX
+        from atec_rl_lab.tasks.task_d.env_cfg import TASK_D_NAV_DEPTH_MAX, TASK_D_PLATFORM_CAMERA_FAR
+
+        platform_deploy = bool(getattr(args, "platform_deploy", False))
+        cli_far = getattr(args, "camera_far_clip", None)
+        if cli_far is not None:
+            camera_far_clip = float(cli_far)
+        elif platform_deploy:
+            # Match platform Task D default head/ee cameras (envs_base_cfg clipping_range far=50m).
+            camera_far_clip = float(TASK_D_PLATFORM_CAMERA_FAR)
+        else:
+            camera_far_clip = float(TASK_D_NAV_DEPTH_MAX)
 
         configure_pit_e2e_cameras(
             env_cfg,
@@ -707,21 +718,27 @@ class AlgSolution:
             camera_width=cam_w,
             depth_only=True,
             tiled=False,
-            # Match play_taskd_marg_depth_pit_dagger.py (5m), not platform 50m server path.
-            camera_far_clip=float(TASK_D_NAV_DEPTH_MAX),
+            camera_far_clip=camera_far_clip,
             update_period=phys_dt,
             head_depth_only=head_depth_only,
         )
-        attach_taskd_platform_marg_student_obs(
-            env_cfg,
-            args,
-            policy_h=policy_h,
-            policy_w=policy_w,
-            depth_max=float(self.depth_max),
-            depth_render_h=cam_h if use_platform_cam else None,
-            depth_render_w=cam_w if use_platform_cam else None,
-            head_depth_only=head_depth_only,
-        )
+        if platform_deploy:
+            print(
+                "[AlgSolution-Pit] platform_deploy play: obs['proprio'] + obs['image'] depth "
+                "(solution _marg_proprio_from_platform + prep_depth; no obs_manager marg_proprio).",
+                flush=True,
+            )
+        else:
+            attach_taskd_platform_marg_student_obs(
+                env_cfg,
+                args,
+                policy_h=policy_h,
+                policy_w=policy_w,
+                depth_max=float(self.depth_max),
+                depth_render_h=cam_h if use_platform_cam else None,
+                depth_render_w=cam_w if use_platform_cam else None,
+                head_depth_only=head_depth_only,
+            )
         env_cfg.depth_render_h = cam_h
         env_cfg.depth_render_w = cam_w
         apply_taskd_pit_student_command(env_cfg, command_vx=float(self.command_vx))
@@ -736,12 +753,14 @@ class AlgSolution:
         mode = "pit-edge-only" if bool(getattr(args, "pit_edge_only", False)) else (
             "nav→pit" if self._uses_nav_phase() else ("teleop→pit" if self._replayer else "pit-only")
         )
+        obs_mgr_tag = "off(platform_deploy)" if platform_deploy else "marg_proprio+depth+local_history"
         print(
             f"[AlgSolution-Pit] env cfg: Task D {mode}, num_envs={num_envs}, "
-            f"cameras={cam_tag}, pit_level={int(args.pit_level)}, "
+            f"cameras={cam_tag}, camera_far_clip={camera_far_clip:.1f}m, "
+            f"pit_level={int(args.pit_level)}, "
             f"obs_depth={'head' if head_depth_only else 'head+ee'}, "
             f"pit_model={'head' if self.head_depth_only else 'head+ee'}, "
-            f"obs_manager=marg_proprio+depth+local_history, "
+            f"obs_manager={obs_mgr_tag}, "
             f"cmd_vx={self.command_vx:.2f}",
             flush=True,
         )
@@ -1173,21 +1192,44 @@ class AlgSolution:
         )
 
     def _marg_proprio_from_platform(self, proprio: torch.Tensor, action_dim: int) -> torch.Tensor:
+        """Build 43D MARG proprio from server.py long proprio (align with obs_manager + play fixups)."""
         ang_vel = proprio[:, 3:6]
-        cmd = proprio[:, 6:7]
-        if float(cmd.abs().max().item()) < 1e-6:
-            cmd = torch.full_like(cmd, self.command_vx)
         gravity = proprio[:, 9:12]
         idx = 12
         joint_pos_all = proprio[:, idx : idx + action_dim]
         idx += action_dim
         joint_vel_all = proprio[:, idx : idx + action_dim]
-        idx += action_dim
-        actions_all = proprio[:, idx : idx + action_dim]
-
         joint_pos = joint_pos_all[:, : self.LEG_ACTION_DIM]
         joint_vel = joint_vel_all[:, : self.LEG_ACTION_DIM]
-        last_action = actions_all[:, : self.LEG_ACTION_DIM]
+
+        if self._phase == "pit":
+            cmd = torch.full(
+                (proprio.shape[0], 1),
+                float(self.command_vx),
+                device=proprio.device,
+                dtype=proprio.dtype,
+            )
+            # Match obs_manager play: _fix_marg_proprio_last_action uses pit-raw _last_leg_action,
+            # not Task D env-scaled actions in proprio[:, actions].
+            if self._step_count == 0:
+                last_action = torch.zeros(
+                    (proprio.shape[0], self.LEG_ACTION_DIM),
+                    device=proprio.device,
+                    dtype=proprio.dtype,
+                )
+            else:
+                last_action = self._last_leg_action.to(
+                    device=proprio.device, dtype=proprio.dtype
+                )
+        else:
+            cmd = proprio[:, 6:7]
+            if float(cmd.abs().max().item()) < 1e-6:
+                cmd = torch.full_like(cmd, self.command_vx)
+            idx += action_dim
+            actions_all = proprio[:, idx : idx + action_dim]
+            env_leg = actions_all[:, : self.LEG_ACTION_DIM]
+            last_action = self._env_leg_to_pit_raw(env_leg)
+
         return torch.cat([ang_vel, gravity, cmd, joint_pos, joint_vel, last_action], dim=-1)
 
     def _marg_proprio_direct(self, obs: dict) -> torch.Tensor:

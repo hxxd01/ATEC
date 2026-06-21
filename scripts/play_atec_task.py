@@ -180,6 +180,12 @@ parser.add_argument(
     action="store_true",
     help="Task D: mimic server.py deploy (no bind_env, obs proprio+image depth, _marg_proprio_from_platform).",
 )
+parser.add_argument(
+    "--camera_far_clip",
+    type=float,
+    default=None,
+    help="Sim camera far clip (m). Default: 50 with --platform_deploy, else 5 (nav depth_max).",
+)
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()

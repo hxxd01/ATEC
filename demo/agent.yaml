@@ -8,6 +8,8 @@ policy:
   depth_max: 5.0
   vx_min: -4.0
   vx_max: 4.0
+  vy_max: 2.0
+  wz_max: 1.0
   camera_render_scale: 1.0
   proprio_dim: 9
   enc_dim: 128
