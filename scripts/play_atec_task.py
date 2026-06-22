@@ -60,6 +60,18 @@ parser.add_argument(
     help="Keep all sensors (4 cameras + lidar); reset/step will be very slow.",
 )
 parser.add_argument(
+    "--cameras-only",
+    action="store_true",
+    default=False,
+    help="Keep head/ee cameras (depth/rgb obs) but disable LiDAR extero (faster reset; enough for depth-based solutions).",
+)
+parser.add_argument(
+    "--depth-lidar",
+    action="store_true",
+    default=False,
+    help="Task B search: head/ee depth + LiDAR extero (no dual cam / rgb; slower reset than cameras-only).",
+)
+parser.add_argument(
     "--save-camera-views",
     action="store_true",
     default=False,
@@ -226,10 +238,19 @@ if args_cli.policy_img_w is not None:
 
 _is_task_b = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
 _is_task_d = isinstance(args_cli.task, str) and "TaskD" in args_cli.task
+if args_cli.cameras_only or args_cli.depth_lidar or args_cli.full_obs:
+    args_cli.enable_cameras = True
+    args_cli.fast = False
 if args_cli.fast is None:
-    # Task B: fast by default (proprio-only). Use --full-obs to keep 4 cameras + lidar.
+    # Task B: fast by default (proprio-only). Use --full-obs / --cameras-only for depth obs.
     # Task D: need extero (LiDAR) for box approach — do not strip sensors unless --fast.
-    args_cli.fast = _is_task_b and not args_cli.full_obs and not _is_task_d
+    args_cli.fast = (
+        _is_task_b
+        and not args_cli.full_obs
+        and not args_cli.cameras_only
+        and not args_cli.depth_lidar
+        and not _is_task_d
+    )
 
 # RecordVideo needs Kit rendering; does NOT need 4× observation cameras (those slow reset).
 if args_cli.video:
@@ -316,6 +337,19 @@ def _disable_lidar_keep_cameras(env_cfg) -> None:
     if hasattr(env_cfg, "observations"):
         env_cfg.observations.extero = None
     print("[play] Task D: lidar off, observation cameras kept.", flush=True)
+
+
+def _enable_depth_lidar_search(env_cfg) -> None:
+    """Task B: head/ee depth + LiDAR; drop rgb and dual cameras for faster reset."""
+    if hasattr(env_cfg, "scene"):
+        env_cfg.scene.ee_dual_camera = None
+    if hasattr(env_cfg, "observations") and getattr(env_cfg.observations, "image", None) is not None:
+        img = env_cfg.observations.image
+        img.head_rgb = None
+        img.ee_rgb = None
+        img.ee_dual_rgb = None
+        img.ee_dual_depth = None
+    print("[play] depth-lidar: head/ee depth + LiDAR extero (rgb/dual cam off).", flush=True)
 
 
 def _estimate_teleop_video_steps(traj_path: str, *, step_dt: float = 0.02) -> int:
@@ -600,6 +634,11 @@ def _debug_print_motion(
         )
     try:
         robot = env.unwrapped.scene.articulations["robot"]
+        pos = robot.data.root_pos_w[0].detach().cpu().tolist()
+        print(
+            "root_pos_world (x,y,z m): "
+            f"{pos[0]: .3f}, {pos[1]: .3f}, {pos[2]: .3f}"
+        )
         wv = robot.data.root_lin_vel_w[0].detach().cpu().tolist()
         print(
             "root_lin_vel_world (vx,vy,vz m/s): "
@@ -609,6 +648,8 @@ def _debug_print_motion(
         print(f"horizontal_speed_xy (world): {speed_xy: .3f}")
     except (AttributeError, KeyError):
         pass
+    if solution is not None and hasattr(solution, "status"):
+        print(f"[TaskB] status={solution.status.name}", flush=True)
     if solution is not None and hasattr(solution, "get_video_overlay_lines"):
         try:
             for line in solution.get_video_overlay_lines():
@@ -617,7 +658,33 @@ def _debug_print_motion(
             pass
 
 
-def _print_done_reason(terminated, truncated, info, env=None) -> None:
+def _disable_taskd_terminations(env_cfg) -> None:
+    """Remove Task-D-only termination terms; keep Task-B terms (e.g. objects_in_circle_done)."""
+    term = getattr(env_cfg, "terminations", None)
+    if term is None:
+        return
+    task_d_names = (
+        "x_reached",
+        "no_motion_timeout",
+        "stage_target_deviation",
+        "no_target_progress_timeout",
+        "no_push_progress_timeout",
+        "pit_cross_success",
+        "fall_in_pit",
+        "stuck_no_progress",
+        "terrain_out_of_bounds",
+        "bad_orientation",
+    )
+    cleared: list[str] = []
+    for name in task_d_names:
+        if hasattr(term, name) and getattr(term, name) is not None:
+            setattr(term, name, None)
+            cleared.append(name)
+    if cleared:
+        print(f"[play] Task B: disabled Task-D terminations: {', '.join(cleared)}", flush=True)
+
+
+def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool = False) -> None:
     """Print done flags and best-effort termination cause."""
     term_val = bool(terminated.item() if hasattr(terminated, "item") else terminated)
     trunc_val = bool(truncated.item() if hasattr(truncated, "item") else truncated)
@@ -655,7 +722,7 @@ def _print_done_reason(terminated, truncated, info, env=None) -> None:
         for line in true_flags:
             print(f"  - {line}", flush=True)
 
-    # Final fallback: infer common Task D termination terms directly from env state.
+    # Final fallback: infer termination from env state.
     try:
         if env is None:
             return
@@ -664,45 +731,56 @@ def _print_done_reason(terminated, truncated, info, env=None) -> None:
         root_x = float(root_pos[0, 0].item())
         root_z = float(root_pos[0, 2].item())
 
-        fall_thresh = 0.25
-        x_thresh = 3.5
+        fall_thresh = 0.0 if is_task_b else 0.25
         try:
             cfg = env.unwrapped.cfg
             if getattr(cfg, "terminations", None) is not None:
                 fall_cfg = getattr(cfg.terminations, "fall", None)
-                x_cfg = getattr(cfg.terminations, "x_reached", None)
                 if fall_cfg is not None and isinstance(getattr(fall_cfg, "params", None), dict):
                     fall_thresh = float(fall_cfg.params.get("minimum_height", fall_thresh))
-                if x_cfg is not None and isinstance(getattr(x_cfg, "params", None), dict):
-                    x_thresh = float(x_cfg.params.get("x_threshold", x_thresh))
         except Exception:
             pass
 
         fall_flag = root_z < fall_thresh
-        x_reached_flag = root_x > x_thresh
         time_out_flag = False
         try:
-            # episode_length_buf is per-env step counter in Isaac Lab envs.
             step_count = int(env.unwrapped.episode_length_buf[0].item())
             max_steps = int(env.unwrapped.max_episode_length)
             time_out_flag = step_count >= max_steps
             print(
                 f"[play] infer: step={step_count}/{max_steps} "
-                f"root_x={root_x:+.3f} (x_thresh={x_thresh:+.3f}) "
-                f"root_z={root_z:+.3f} (fall_thresh={fall_thresh:+.3f})",
+                f"root_x={root_x:+.3f} root_z={root_z:+.3f} (fall_thresh={fall_thresh:+.3f})",
                 flush=True,
             )
         except Exception:
             print(
-                f"[play] infer: root_x={root_x:+.3f} (x_thresh={x_thresh:+.3f}) "
-                f"root_z={root_z:+.3f} (fall_thresh={fall_thresh:+.3f})",
+                f"[play] infer: root_x={root_x:+.3f} root_z={root_z:+.3f} "
+                f"(fall_thresh={fall_thresh:+.3f})",
                 flush=True,
             )
 
-        print(
-            f"[play] infer terms: fall={int(fall_flag)} x_reached={int(x_reached_flag)} time_out={int(time_out_flag)}",
-            flush=True,
-        )
+        if is_task_b:
+            print(
+                f"[play] infer TaskB terms: fall={int(fall_flag)} "
+                f"time_out={int(time_out_flag)} "
+                f"(objects_in_circle_done / illegal_contact — see flags above)",
+                flush=True,
+            )
+        else:
+            x_thresh = 3.5
+            try:
+                cfg = env.unwrapped.cfg
+                x_cfg = getattr(getattr(cfg, "terminations", None), "x_reached", None)
+                if x_cfg is not None and isinstance(getattr(x_cfg, "params", None), dict):
+                    x_thresh = float(x_cfg.params.get("x_threshold", x_thresh))
+            except Exception:
+                pass
+            x_reached_flag = root_x > x_thresh
+            print(
+                f"[play] infer TaskD terms: fall={int(fall_flag)} "
+                f"x_reached={int(x_reached_flag)} time_out={int(time_out_flag)}",
+                flush=True,
+            )
     except Exception:
         pass
 
@@ -798,8 +876,15 @@ def play() -> tuple[float, float]:
         solution.configure_env_cfg(env_cfg, args_cli)
     elif _use_pit_solution and _is_task_d:
         raise RuntimeError("Pit play requires solution.configure_env_cfg() (use solution_marg_depth_pit.py).")
+    elif args_cli.depth_lidar:
+        _enable_depth_lidar_search(env_cfg)
+    elif args_cli.cameras_only:
+        _disable_lidar_keep_cameras(env_cfg)
+        print("[play] cameras-only: head/ee cameras on, LiDAR off (faster reset).", flush=True)
     elif args_cli.fast:
         _disable_heavy_sensors(env_cfg)
+    elif _is_task_b:
+        _disable_taskd_terminations(env_cfg)
     elif _is_task_d and not args_cli.full_obs:
         # Task D default previously kept LiDAR only for scripted navigation.
         # For vision policies, if cameras are enabled, prefer camera obs and disable LiDAR.
@@ -890,6 +975,10 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     if args_cli.fast:
         fast_hint = "fast/proprio-only"
+    elif args_cli.depth_lidar:
+        fast_hint = "depth-lidar (head/ee depth + LiDAR)"
+    elif args_cli.cameras_only:
+        fast_hint = "cameras-only (head/ee depth, no lidar)"
     elif _is_task_d and not args_cli.full_obs:
         if args_cli.enable_cameras:
             fast_hint = "Task D camera-only (obs cameras, no lidar)"
@@ -1038,7 +1127,7 @@ def play() -> tuple[float, float]:
 
             done = (terminated.item() or truncated.item())
             if done:
-                _print_done_reason(terminated, truncated, info, env=env)
+                _print_done_reason(terminated, truncated, info, env=env, is_task_b=_is_task_b)
                 if _is_task_d:
                     peak_x = peak_box_nominal_x if peak_box_nominal_x > float("-inf") else None
                     _print_taskd_episode_end_box_pose(

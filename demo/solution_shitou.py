@@ -5,7 +5,7 @@ import numpy as np
 import open3d as o3d
 import torch
 
-from demo.utils import approach_dustbin
+from demo.utils import approach_dustbin, search_trash_object
 
 
 class Status(Enum):
@@ -13,15 +13,17 @@ class Status(Enum):
     LOCK = 2
     PICK = 3
     STAND = 4
-    GO_BIN = 5
+    CARRY = 5
 
 
 class AlgSolution:
     ACTION_SCALE = 0.5
+    _TASK_B_SPAWN = (-10.0, -10.0)
+    _TASK_B_DROP = (-3.0, -10.0)
     _SQUAT_STEPS = 100
     _PICK_ARM_STEPS = 25
     _STAND_STEPS = 80
-    _BIN_ARRIVE_DIST = 1.0
+    SIM_DT = 0.02
     EE_BODY_NAME_CANDIDATES = ("gripper_base", "piper_gripper_base")
     ARM_JOINT_NAME_CANDIDATES = (
         ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
@@ -50,71 +52,23 @@ class AlgSolution:
         # 仅当目标距离较远时才大幅旋转，近距离时减小旋转以防震荡
         wz = np.clip(k_w * angle_to_target, -max_wz, max_wz)
 
-        # 4. 捡垃圾：仅 SEARCH 阶段触发 LOCK；GO_BIN 不触发
+        # 4. 捡垃圾：足够近则蹲下锁定；去垃圾桶时不触发 LOCK
         if lock_on_arrive and dist < 0.4:
             self.status = Status.LOCK
             self.get_down = True
             self.start_get_down_idx = self.cur_idx
             return 0.0, 0.0, 0.0
-        # 与 SEARCH 相同：写死 cmd，供策略 obs 里的 velocity_commands 使用
-        self.cmd_max_vy = 0
-        self.cmd_max_wz = 0.8 * -target_x
-        self.cmd_max_vx = 1.5 * 1
-        return vx, vy, wz
 
-    def _obs_depth(self, obs, key: str) -> np.ndarray | None:
-        image = obs.get("image")
-        if not image or key not in image:
-            return None
-        return image[key][0].to(self.device).cpu().numpy()
-
-    def _obs_extero(self, obs) -> np.ndarray | None:
-        extero = obs.get("extero")
-        if extero is None:
-            return None
-        return extero.to(self.device).cpu().numpy()[0]
-
-    def _begin_search_cycle(self) -> None:
-        self.status = Status.SEARCH
-        self.get_down = False
-        self.start_get_down_idx = None
-        self.start_pick_idx = None
-        self.start_stand_idx = None
-        self.v_list = [0.0 for _ in range(8)]
-        self.cmd_max_vx = 1.0
         self.cmd_max_vy = 0.0
-        self.cmd_max_wz = 1.0
-        self._last_bin_bearing = None
-        self._last_bin_dist = None
-        print("[TaskB] bin reached -> SEARCH (loop)", flush=True)
-
-    def _update_go_bin_cmd(self, obs) -> None:
-        fused = approach_dustbin(
-            self._obs_extero(obs),
-            self._obs_depth(obs, "head_depth"),
-            self.K,
-        )
-        bearing = fused.get("bearing")
-        dist = fused.get("dist")
-        self._last_bin_bearing = bearing
-        self._last_bin_dist = dist
-
-        if dist is not None and float(dist) < self._BIN_ARRIVE_DIST:
-            self._begin_search_cycle()
-            return
-
-        if bearing is None:
-            self.cmd_max_vx = 1.5
-            self.cmd_max_vy = 0.0
-            self.cmd_max_wz = 0.0
-            return
-
-        target = fused.get("target")
-        if target is None:
-            return
-        self.calculate_velocity(
-            float(target[0]), float(target[1]), 1, 0.5, 1, lock_on_arrive=False
-        )
+        # 先转向再前进，避免侧向目标时仍全速直走
+        align = 0.25
+        if abs(angle_to_target) > align:
+            self.cmd_max_vx = min(0.35, max_vx * 0.4)
+            self.cmd_max_wz = float(np.clip(k_w * angle_to_target, -max_wz, max_wz))
+        else:
+            self.cmd_max_vx = float(np.clip(0.4 + 0.4 * min(dist, 2.0), 0.4, max_vx))
+            self.cmd_max_wz = float(np.clip(0.5 * k_w * angle_to_target, -max_wz * 0.5, max_wz * 0.5))
+        return vx, vy, wz
 
     def __init__(self):
         policy_path = os.path.dirname(os.path.abspath(__file__)) + '/policy.pt'
@@ -142,12 +96,27 @@ class AlgSolution:
 
         self.arm_default_action = torch.zeros((1, self.arm_action_dim), device=self.device, dtype=torch.float32)
 
+        self.dt = self.SIM_DT
         self.cmd_max_vx = 1.0
         self.cmd_max_vy = 0.5
         self.cmd_max_wz = 1.0
-        self.status = Status.SEARCH
+        self.task_b_vx = 0.35
+        self.task_b_k_yaw_turn = 0.6
+        self.task_b_k_yaw_drive = 0.25
+        self.task_b_k_wz = 0.2
+        self.task_b_yaw_align = 0.20
+        self.task_b_wz_lim = 0.30
+        self.task_b_wp_tol = 0.50
+        self._nav_mode = "turn"
+        self.yaw_est = None
+        self.pos_x = None
+        self.pos_y = None
         self.start_stand_idx = None
-        self._last_bin_bearing = None
+        self.status = Status.SEARCH
+        self._last_search_source = "none"
+        self._search_debug = os.environ.get("SEARCH_DEBUG", "0") == "1"
+        self._default_lidar_range = 4.0
+        self._bin_arrive_dist = 1.0
         self._last_bin_dist = None
         # ==========================================
         # 虚拟里程计 (用于在世界坐标系下展示点云移动)
@@ -201,6 +170,7 @@ class AlgSolution:
         if os.environ.get("DISABLE_O3D_VIS", "0") == "1":
             self.inited = True
             return
+        # self.vis = o3d.visualization.Visualizer()
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
         self.vis.create_window(window_name="Isaac Lab LiDAR Viewer", width=1024, height=768)
 
@@ -297,7 +267,8 @@ class AlgSolution:
     def __del__(self):
         """安全销毁窗口，防止退出时崩溃"""
         try:
-            self.vis.destroy_window()
+            if self.vis is not None:
+                self.vis.destroy_window()
         except Exception:
             pass
 
@@ -315,11 +286,14 @@ class AlgSolution:
         self.start_stand_idx = None
         self.v_list = [0.0 for _ in range(8)]
         self.cmd_max_vx = 1.0
-        self.cmd_max_vy = 0.0
+        self.cmd_max_vy = 0.5
         self.cmd_max_wz = 1.0
-        self._last_bin_bearing = None
+        self._nav_mode = "turn"
+        self.yaw_est = None
+        self.pos_x = None
+        self.pos_y = None
+        self._last_search_source = "none"
         self._last_bin_dist = None
-        self.cur_idx = 0
 
     def _resolve_joint_ids(self, candidates: tuple[list[str], ...]) -> list[int]:
         for names in candidates:
@@ -353,8 +327,89 @@ class AlgSolution:
         full_target[:, self.gripper_ids] = self.gripper_open_pos.repeat(full_target.shape[0], 1)
         return (full_target - self.default_joint_pos) / self.ACTION_SCALE
 
+    def _ensure_odom(self, device, dtype, batch_size: int) -> None:
+        if self.yaw_est is not None and self.yaw_est.shape[0] == batch_size:
+            return
+        x0, y0 = self._TASK_B_SPAWN
+        self.yaw_est = torch.zeros((batch_size, 1), device=device, dtype=dtype)
+        self.pos_x = torch.full((batch_size, 1), float(x0), device=device, dtype=dtype)
+        self.pos_y = torch.full((batch_size, 1), float(y0), device=device, dtype=dtype)
+        self._nav_mode = "turn"
+
+    def _integrate_odom(self, vx_body, vy_body, wz) -> None:
+        self.yaw_est = self.yaw_est + wz * self.dt
+        self.yaw_est = torch.atan2(torch.sin(self.yaw_est), torch.cos(self.yaw_est))
+        cos_y = torch.cos(self.yaw_est)
+        sin_y = torch.sin(self.yaw_est)
+        vx_world = cos_y * vx_body - sin_y * vy_body
+        vy_world = sin_y * vx_body + cos_y * vy_body
+        self.pos_x = self.pos_x + vx_world * self.dt
+        self.pos_y = self.pos_y + vy_world * self.dt
+
+    def _nav_cmd_to_drop(self, wz, device, dtype):
+        """Turn toward drop point, then drive forward (Task B style)."""
+        tx, ty = self._TASK_B_DROP
+        dx = torch.tensor([[float(tx)]], device=device, dtype=dtype) - self.pos_x
+        dy = torch.tensor([[float(ty)]], device=device, dtype=dtype) - self.pos_y
+        dist = torch.sqrt(dx * dx + dy * dy)
+        if dist.item() < self.task_b_wp_tol:
+            z = torch.zeros((1, 1), device=device, dtype=dtype)
+            return z, z, z
+
+        desired_yaw = torch.atan2(dy, dx)
+        yaw_err = torch.atan2(
+            torch.sin(desired_yaw - self.yaw_est),
+            torch.cos(desired_yaw - self.yaw_est),
+        )
+        if float(yaw_err.abs().item()) > self.task_b_yaw_align:
+            self._nav_mode = "turn"
+            vx_cmd = torch.zeros((1, 1), device=device, dtype=dtype)
+            vy_cmd = torch.zeros((1, 1), device=device, dtype=dtype)
+            yaw_cmd = (
+                self.task_b_k_yaw_turn * yaw_err - self.task_b_k_wz * wz
+            ).clamp(-self.task_b_wz_lim, self.task_b_wz_lim)
+        else:
+            self._nav_mode = "drive"
+            vx_cmd = torch.full((1, 1), float(self.task_b_vx), device=device, dtype=dtype)
+            vy_cmd = torch.zeros((1, 1), device=device, dtype=dtype)
+            yaw_cmd = (
+                self.task_b_k_yaw_drive * yaw_err - self.task_b_k_wz * wz
+            ).clamp(-self.task_b_wz_lim * 0.5, self.task_b_wz_lim * 0.5)
+        return vx_cmd, vy_cmd, yaw_cmd
+
+    def _drop_reached(self) -> bool:
+        if self._last_bin_dist is None:
+            return False
+        return float(self._last_bin_dist) < self._bin_arrive_dist
+
+    def _begin_search_cycle(self) -> None:
+        self.status = Status.SEARCH
+        self.get_down = False
+        self.start_get_down_idx = None
+        self.start_pick_idx = None
+        self.start_stand_idx = None
+        self._last_bin_dist = None
+        self.cmd_max_vx = 1.0
+        self.cmd_max_vy = 0.0
+        self.cmd_max_wz = 1.0
+        self._nav_mode = "turn"
+        print("[AlgSolution-TaskB] bin reached -> SEARCH (loop)", flush=True)
+
     def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
         b = proprio.shape[0]
+        device = proprio.device
+        dtype = proprio.dtype
+        vx_body = proprio[:, 0:1]
+        vy_body = proprio[:, 1:2]
+        wz = proprio[:, 5:6]
+
+        if self.status == Status.STAND:
+            self._ensure_odom(device, dtype, b)
+            self._integrate_odom(vx_body, vy_body, wz)
+            z = torch.zeros((1, 1), device=device, dtype=dtype)
+            return torch.cat([z, z, z], dim=-1).repeat(b, 1)
+
+        # SEARCH / CARRY: high-level cmd from calculate_velocity (depth or lidar+depth)
         vx_cmd, vy_cmd, yaw_cmd = 0.0, 0.0, 0.0
         if self.auto:
             vx_cmd = self.cmd_max_vx
@@ -374,7 +429,11 @@ class AlgSolution:
             elif self.key == 'e':
                 vy_cmd = -self.cmd_max_vy
 
-        return torch.tensor([[vx_cmd, vy_cmd, yaw_cmd]], device=proprio.device, dtype=proprio.dtype).repeat(b, 1)
+        if self.status in (Status.SEARCH, Status.LOCK) and not self.get_down:
+            self._ensure_odom(device, dtype, b)
+            self._integrate_odom(vx_body, vy_body, wz)
+
+        return torch.tensor([[vx_cmd, vy_cmd, yaw_cmd]], device=device, dtype=dtype).repeat(b, 1)
 
     def _extract_policy_obs(self, obs, action_dim) -> torch.Tensor:
         proprio = obs["proprio"].to(self.device)
@@ -438,19 +497,27 @@ class AlgSolution:
         distance_threshold: 点到平面的距离阈值(米)
         ransac_n: 每次采样点数(平面需要3)
         num_iterations: 迭代次数
-        返回: (ground_mask, plane_model)
+        返回: (ground_mask, plane_model) 或 (None, None)
         """
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < ransac_n:
+            return None, None
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
 
-        # 执行平面分割
-        plane_model, inliers = pcd.segment_plane(distance_threshold, ransac_n, num_iterations)
+        try:
+            plane_model, inliers = pcd.segment_plane(
+                distance_threshold, ransac_n, num_iterations
+            )
+        except RuntimeError:
+            return None, None
 
-        # 提取平面内点
+        if plane_model is None or inliers is None or len(inliers) < ransac_n:
+            return None, None
+
         ground_mask = np.zeros(len(points), dtype=bool)
         ground_mask[inliers] = True
-
-        # 平面模型: [a, b, c, d] 满足 a*x + b*y + c*z + d = 0
         return ground_mask, plane_model
 
     def depth_to_point_cloud(self, depth_map):
@@ -467,7 +534,7 @@ class AlgSolution:
         point_cloud = np.stack((x, y, z), axis=-1).reshape(-1, 3)
 
         # 过滤掉无效深度值 (例如远端截断值)
-        valid_mask = (depth_map > 0.05) & (depth_map < 50.0)
+        valid_mask = np.isfinite(depth_map) & (depth_map > 0.05) & (depth_map < 50.0)
         return point_cloud[valid_mask.reshape(-1)]
 
     def transform_ground_to_zero(self, points, plane_model):
@@ -475,6 +542,8 @@ class AlgSolution:
         points: (N, 3) 原始点云
         plane_model: (a, b, c, d) 平面参数
         """
+        if plane_model is None:
+            return None, None, None
         a, b, c, d = plane_model
         normal = np.array([a, b, c])
 
@@ -520,7 +589,10 @@ class AlgSolution:
             cluster_labels: 每个点的聚类标签
             n_clusters: 聚类数量
         """
-        # 转换为Open3D点云
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < min_points:
+            return np.full(points.shape[0], -1, dtype=int), 0
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         # 欧几里得聚类
@@ -531,13 +603,30 @@ class AlgSolution:
         return cluster_labels, n_clusters
 
     def find_target_by_depth(self, depth):
-        points = self.depth_to_point_cloud(depth.squeeze())
+        if depth is None:
+            return None, None
+        depth = np.squeeze(depth)
+        if depth.ndim != 2:
+            return None, None
+
+        points = self.depth_to_point_cloud(depth)
+        if points.shape[0] < 10:
+            return None, None
+
         ground_mask, plane_model = self.detect_ground_ransac(points, distance_threshold=0.03)
-        points_flat, R, p0 = self.transform_ground_to_zero(points, plane_model)
+        if ground_mask is None or plane_model is None:
+            return None, None
+
+        transformed = self.transform_ground_to_zero(points, plane_model)
+        if transformed[0] is None:
+            return None, None
+        points_flat, R, p0 = transformed
         others = points_flat[~ground_mask]
-        if len(others) == 0:
+        if len(others) < 5:
             return None, None
         labels, n_clusters = self.cluster_euclidean_open3d(others)
+        if n_clusters == 0:
+            return None, None
         min_dist = None
         target = None
         # 1. 筛选并计算每个聚类的中心距离
@@ -554,6 +643,59 @@ class AlgSolution:
                 target = centroid
         return target, min_dist
 
+    def _obs_depth(self, obs, key: str) -> np.ndarray | None:
+        image = obs.get("image")
+        if not image or key not in image:
+            return None
+        return image[key][0].to(self.device).cpu().numpy()
+
+    def _obs_extero(self, obs) -> np.ndarray | None:
+        extero = obs.get("extero")
+        if extero is None:
+            return None
+        return extero[0].to(self.device).cpu().numpy()
+
+    def search_trash_object(self, obs) -> dict:
+        """Phase 1 — find pickable trash: head/ee depth only."""
+        return search_trash_object(
+            self._obs_depth(obs, "head_depth"),
+            self._obs_depth(obs, "ee_depth"),
+            self.find_target_by_depth,
+            debug=self._search_debug,
+        )
+
+    def approach_dustbin(self, obs) -> dict:
+        """Phase 2 — go to trash bin: LiDAR bearing + head depth range."""
+        return approach_dustbin(
+            self._obs_extero(obs),
+            self._obs_depth(obs, "head_depth"),
+            self.K,
+            default_lidar_range=self._default_lidar_range,
+            debug=self._search_debug,
+        )
+
+    def _apply_search_target(self, fused: dict) -> None:
+        target = fused.get("target")
+        if target is None:
+            return
+        self._last_search_source = str(fused.get("source", "none"))
+        tx, ty = float(target[0]), float(target[1])
+        self.calculate_velocity(tx, ty, 1.0, 0.5, 1.0, lock_on_arrive=True)
+
+    def _apply_bin_target(self, fused: dict) -> None:
+        target = fused.get("target")
+        dist = fused.get("dist")
+        if dist is not None:
+            self._last_bin_dist = float(dist)
+        if target is None:
+            return
+        tx, ty = float(target[0]), float(target[1])
+        src = str(fused.get("source", "none"))
+        if src == "lidar_bearing":
+            self.calculate_velocity(tx, ty, 0.5, 0.0, 0.8, k_w=1.2, lock_on_arrive=False)
+        else:
+            self.calculate_velocity(tx, ty, 0.7, 0.0, 0.9, lock_on_arrive=False)
+
     def predicts(self, obs, current_score):
         del current_score
         self.init()
@@ -564,46 +706,49 @@ class AlgSolution:
 
         if self.status == Status.SEARCH:
             if self.cur_idx % 4 == 0:
-                head_depth = self._obs_depth(obs, "head_depth")
-                target, min_dist = (None, None)
-                if head_depth is not None:
-                    target, min_dist = self.find_target_by_depth(head_depth)
-                if target is None:
-                    ee_depth = self._obs_depth(obs, "ee_depth")
-                    if ee_depth is not None:
-                        target, min_dist = self.find_target_by_depth(ee_depth)
-                if target is not None:
-                    self.calculate_velocity(target[0], target[1], 1, 0.5, 1)
-                print(f"[SEARCH] target={target}, min_dist={min_dist}", flush=True)
+                fused = self.search_trash_object(obs)
+                self._apply_search_target(fused)
+                print(
+                    f"[SEARCH_OBJ] src={fused['source']} dist={fused['dist']} target={fused['target']}",
+                    flush=True,
+                )
 
         elif self.status == Status.PICK and self.start_pick_idx is not None:
-            if self.cur_idx < self.start_pick_idx + 10:
-                self.v_list[1] += 0.1
             if self.cur_idx < self.start_pick_idx + self._PICK_ARM_STEPS:
+                if self.cur_idx < self.start_pick_idx + 10:
+                    self.v_list[1] += 0.1
                 self.v_list[1] += 0.1
                 self.v_list[2] -= 0.06
             elif self.cur_idx >= self.start_pick_idx + self._PICK_ARM_STEPS:
                 self.status = Status.STAND
                 self.get_down = False
                 self.start_stand_idx = self.cur_idx
-                self.v_list = [0.0 for _ in range(8)]
                 self.cmd_max_vx = 0.0
                 self.cmd_max_vy = 0.0
                 self.cmd_max_wz = 0.0
-                print("[TaskB] PICK done -> STAND", flush=True)
+                print("[AlgSolution-TaskB] PICK done -> STAND (policy legs)", flush=True)
 
         elif self.status == Status.STAND and self.start_stand_idx is not None:
             if self.cur_idx >= self.start_stand_idx + self._STAND_STEPS:
-                self.status = Status.GO_BIN
-                print("[TaskB] STAND done -> GO_BIN (LiDAR yaw + depth range)", flush=True)
-
-        elif self.status == Status.GO_BIN:
-            if self.cur_idx % 4 == 0:
-                self._update_go_bin_cmd(obs)
+                self.status = Status.CARRY
+                self._nav_mode = "turn"
                 print(
-                    f"[GO_BIN] bearing={self._last_bin_bearing} dist={self._last_bin_dist}",
+                    f"[AlgSolution-TaskB] STAND done -> CARRY (LiDAR+depth to bin)",
                     flush=True,
                 )
+
+        elif self.status == Status.CARRY:
+            if self.cur_idx % 4 == 0:
+                fused = self.approach_dustbin(obs)
+                self._apply_bin_target(fused)
+                print(
+                    f"[GO_BIN] src={fused['source']} dist={fused['dist']} "
+                    f"bearing={None if fused['bearing'] is None else round(float(fused['bearing']), 3)} "
+                    f"target={fused['target']}",
+                    flush=True,
+                )
+            if self._drop_reached():
+                self._begin_search_cycle()
 
         proprio = obs["proprio"].to(self.device)
 
@@ -625,7 +770,7 @@ class AlgSolution:
         proprio = obs['proprio']
         action_dim = (int(proprio.shape[-1]) - 12) // 3
         action = [0 for _ in range(action_dim)]
-        use_policy_legs = self.status in (Status.SEARCH, Status.STAND, Status.GO_BIN) or (
+        use_policy_legs = self.status in (Status.SEARCH, Status.STAND, Status.CARRY) or (
             self.status == Status.LOCK and not self.get_down
         )
         if use_policy_legs:
@@ -644,10 +789,8 @@ class AlgSolution:
             ):
                 self.status = Status.PICK
                 self.start_pick_idx = self.cur_idx
-                print("[TaskB] squat done -> PICK", flush=True)
+                print("[AlgSolution-TaskB] squat done -> PICK arm wiggle", flush=True)
             action[:12] = squat_pose
-        if self.status == Status.PICK:
-            action[12:20] = self.v_list
-        else:
-            action[12:20] = [0.0 for _ in range(8)]
+        action[12:20] = self.v_list
+        # print(self.v_list)
         return {'action': action, 'giveup': False}
