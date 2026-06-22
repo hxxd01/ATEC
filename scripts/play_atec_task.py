@@ -1029,15 +1029,21 @@ def play() -> tuple[float, float]:
         camera_follow(env)
     if hasattr(solution, "reset"):
         solution.reset(task=args_cli.task)
-    if (
-        isinstance(args_cli.task, str)
-        and "TaskD" in args_cli.task
-        and hasattr(solution, "bind_env")
-        and not bool(getattr(args_cli, "no_bind_env", False))
-        and not bool(getattr(args_cli, "platform_deploy", False))
+    _is_task_b_play = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
+    if hasattr(solution, "bind_env") and (
+        (
+            isinstance(args_cli.task, str)
+            and "TaskD" in args_cli.task
+            and not bool(getattr(args_cli, "no_bind_env", False))
+            and not bool(getattr(args_cli, "platform_deploy", False))
+        )
+        or _is_task_b_play
     ):
         solution.bind_env(env)
-        print("[play] Task D: bind_env() — nav handoff uses sim root_lin_vel_w.", flush=True)
+        if _is_task_b_play:
+            print("[play] Task B: bind_env() — squat leg PD override enabled.", flush=True)
+        else:
+            print("[play] Task D: bind_env() — nav handoff uses sim root_lin_vel_w.", flush=True)
     elif bool(getattr(args_cli, "platform_deploy", False)):
         print(
             "[play] Task D: platform_deploy — no bind_env, pit uses _marg_proprio_from_platform + image depth.",

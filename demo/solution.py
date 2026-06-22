@@ -21,10 +21,19 @@ class AlgSolution:
     _SQUAT_STEPS = 100
     _PICK_ARM_STEPS = 25
     _STAND_STEPS = 80
-    _BIN_ARRIVE_DIST = 1.0
-    _GO_BIN_ALIGN_RAD = 0.35
+    _BIN_ARRIVE_DIST = 0.4
+    _GO_BIN_ALIGN_RAD = 0.3
     _GO_BIN_WZ_GAIN = 0.8
     _GO_BIN_VX = 1.5
+    _LEG_JOINT_NAMES = (
+        "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+        "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+        "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+        "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+    )
+    # b2.py default leg PD 160/5; squat position-hold uses stiffer gains.
+    _SQUAT_LEG_STIFFNESS = 640.0
+    _SQUAT_LEG_DAMPING = 20.0
     EE_BODY_NAME_CANDIDATES = ("gripper_base", "piper_gripper_base")
     ARM_JOINT_NAME_CANDIDATES = (
         ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
@@ -129,6 +138,41 @@ class AlgSolution:
         self.cmd_max_vy = 0.0
         self.cmd_max_wz = float(np.clip(0.4 * bearing_f, -0.4, 0.4))
 
+    def bind_env(self, env) -> None:
+        """Attach sim so squat/pick can raise leg PD (play / local only)."""
+        self._env = env
+        self.robot = env.unwrapped.scene["robot"]
+        leg_ids, _ = self.robot.find_joints(list(self._LEG_JOINT_NAMES))
+        self._leg_joint_ids = list(leg_ids)
+        self._default_leg_stiffness = self.robot.data.default_joint_stiffness[
+            :, self._leg_joint_ids
+        ].clone()
+        self._default_leg_damping = self.robot.data.default_joint_damping[
+            :, self._leg_joint_ids
+        ].clone()
+        self._squat_pd_active = False
+
+    def _set_squat_leg_pd(self, enabled: bool) -> None:
+        if self._env is None or not hasattr(self, "_leg_joint_ids"):
+            return
+        if enabled == self._squat_pd_active:
+            return
+        self._squat_pd_active = enabled
+        if enabled:
+            self.robot.write_joint_stiffness_to_sim(
+                self._SQUAT_LEG_STIFFNESS, joint_ids=self._leg_joint_ids
+            )
+            self.robot.write_joint_damping_to_sim(
+                self._SQUAT_LEG_DAMPING, joint_ids=self._leg_joint_ids
+            )
+            return
+        self.robot.write_joint_stiffness_to_sim(
+            self._default_leg_stiffness, joint_ids=self._leg_joint_ids
+        )
+        self.robot.write_joint_damping_to_sim(
+            self._default_leg_damping, joint_ids=self._leg_joint_ids
+        )
+
     def __init__(self):
         policy_path = os.path.dirname(os.path.abspath(__file__)) + '/policy.pt'
         print(policy_path)
@@ -201,7 +245,8 @@ class AlgSolution:
         self.start_pose = None
         self.cur_idx = 0
         self.K = np.array([[458.12, 0, 320], [0, 458.12, 240], [0, 0, 1]])
-
+        self._env = None
+        self._squat_pd_active = False
 
     def init(self):
         # ==========================================
@@ -332,6 +377,7 @@ class AlgSolution:
         self.cmd_max_wz = 1.0
         self._last_bin_bearing = None
         self._last_bin_dist = None
+        self._set_squat_leg_pd(False)
         self.cur_idx = 0
 
     def _resolve_joint_ids(self, candidates: tuple[list[str], ...]) -> list[int]:
@@ -641,6 +687,7 @@ class AlgSolution:
         use_policy_legs = self.status in (Status.SEARCH, Status.STAND, Status.GO_BIN) or (
             self.status == Status.LOCK and not self.get_down
         )
+        self._set_squat_leg_pd(not use_policy_legs)
         if use_policy_legs:
             aa = action_env.cpu().numpy().tolist()
             action[:action_dim] = aa[0]
