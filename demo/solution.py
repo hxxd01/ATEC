@@ -22,6 +22,9 @@ class AlgSolution:
     _PICK_ARM_STEPS = 25
     _STAND_STEPS = 80
     _BIN_ARRIVE_DIST = 1.0
+    _GO_BIN_ALIGN_RAD = 0.35
+    _GO_BIN_WZ_GAIN = 0.8
+    _GO_BIN_VX = 1.5
     EE_BODY_NAME_CANDIDATES = ("gripper_base", "piper_gripper_base")
     ARM_JOINT_NAME_CANDIDATES = (
         ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
@@ -55,6 +58,9 @@ class AlgSolution:
             self.status = Status.LOCK
             self.get_down = True
             self.start_get_down_idx = self.cur_idx
+            self.cmd_max_vx = 0.0
+            self.cmd_max_vy = 0.0
+            self.cmd_max_wz = 0.0
             return 0.0, 0.0, 0.0
         # 与 SEARCH 相同：写死 cmd，供策略 obs 里的 velocity_commands 使用
         self.cmd_max_vy = 0
@@ -104,17 +110,24 @@ class AlgSolution:
             return
 
         if bearing is None:
-            self.cmd_max_vx = 1.5
+            self.cmd_max_vx = 0.0
             self.cmd_max_vy = 0.0
             self.cmd_max_wz = 0.0
             return
 
-        target = fused.get("target")
-        if target is None:
+        bearing_f = float(bearing)
+        if abs(bearing_f) > self._GO_BIN_ALIGN_RAD:
+            # 先原地对准 LiDAR bearing，不要 vx=1.5 硬冲
+            self.cmd_max_vx = 0.0
+            self.cmd_max_vy = 0.0
+            self.cmd_max_wz = float(
+                np.clip(self._GO_BIN_WZ_GAIN * bearing_f, -0.8, 0.8)
+            )
             return
-        self.calculate_velocity(
-            float(target[0]), float(target[1]), 1, 0.5, 1, lock_on_arrive=False
-        )
+
+        self.cmd_max_vx = self._GO_BIN_VX
+        self.cmd_max_vy = 0.0
+        self.cmd_max_wz = float(np.clip(0.4 * bearing_f, -0.4, 0.4))
 
     def __init__(self):
         policy_path = os.path.dirname(os.path.abspath(__file__)) + '/policy.pt'
@@ -632,6 +645,9 @@ class AlgSolution:
             aa = action_env.cpu().numpy().tolist()
             action[:action_dim] = aa[0]
         else:
+            self.cmd_max_vx = 0.0
+            self.cmd_max_vy = 0.0
+            self.cmd_max_wz = 0.0
             squat_pose = [
                 0.0, 0.5, -1,
                 0.0, 0.5, -1,

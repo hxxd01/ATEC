@@ -659,7 +659,7 @@ def _debug_print_motion(
 
 
 def _disable_taskd_terminations(env_cfg) -> None:
-    """Remove Task-D-only termination terms; keep Task-B terms (e.g. objects_in_circle_done)."""
+    """Remove Task-D-only termination terms if present on this env cfg."""
     term = getattr(env_cfg, "terminations", None)
     if term is None:
         return
@@ -682,6 +682,11 @@ def _disable_taskd_terminations(env_cfg) -> None:
             cleared.append(name)
     if cleared:
         print(f"[play] Task B: disabled Task-D terminations: {', '.join(cleared)}", flush=True)
+
+
+def _configure_taskb_play(env_cfg) -> None:
+    """Task B local play: strip Task-D-only terms if this cfg inherits them."""
+    _disable_taskd_terminations(env_cfg)
 
 
 def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool = False) -> None:
@@ -760,10 +765,28 @@ def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool
             )
 
         if is_task_b:
+            illegal_flag = False
+            circle_done_flag = False
+            try:
+                tm = getattr(env.unwrapped, "termination_manager", None)
+                if tm is not None:
+                    for name, flag in (
+                        ("illegal_contact", "illegal_flag"),
+                        ("objects_in_circle_done", "circle_done_flag"),
+                    ):
+                        if name in tm._term_names:
+                            val = bool(tm.get_term(name)[0].item())
+                            if name == "illegal_contact":
+                                illegal_flag = val
+                            else:
+                                circle_done_flag = val
+            except Exception:
+                pass
             print(
                 f"[play] infer TaskB terms: fall={int(fall_flag)} "
                 f"time_out={int(time_out_flag)} "
-                f"(objects_in_circle_done / illegal_contact — see flags above)",
+                f"illegal_contact={int(illegal_flag)} "
+                f"objects_in_circle_done={int(circle_done_flag)}",
                 flush=True,
             )
         else:
@@ -872,6 +895,9 @@ def play() -> tuple[float, float]:
         use_fabric=not args_cli.disable_fabric
     )
 
+    if _is_task_b:
+        _configure_taskb_play(env_cfg)
+
     if _use_pit_solution and _is_task_d and hasattr(solution, "configure_env_cfg"):
         solution.configure_env_cfg(env_cfg, args_cli)
     elif _use_pit_solution and _is_task_d:
@@ -883,8 +909,6 @@ def play() -> tuple[float, float]:
         print("[play] cameras-only: head/ee cameras on, LiDAR off (faster reset).", flush=True)
     elif args_cli.fast:
         _disable_heavy_sensors(env_cfg)
-    elif _is_task_b:
-        _disable_taskd_terminations(env_cfg)
     elif _is_task_d and not args_cli.full_obs:
         # Task D default previously kept LiDAR only for scripted navigation.
         # For vision policies, if cameras are enabled, prefer camera obs and disable LiDAR.
