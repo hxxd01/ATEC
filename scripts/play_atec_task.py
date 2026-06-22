@@ -252,9 +252,10 @@ if args_cli.fast is None:
         and not _is_task_d
     )
 
-# RecordVideo needs Kit rendering; does NOT need 4× observation cameras (those slow reset).
+# RecordVideo needs Kit rendering + head/ee RGB for tri-view stitch.
 if args_cli.video:
     args_cli.enable_cameras = True
+    args_cli.fast = False
 
 # -----------------------------------------------------------------------------
 # Launch Isaac Sim / Kit
@@ -302,7 +303,7 @@ from isaaclab.utils.dict import print_dict  # noqa: E402
 
 import atec_rl_lab.tasks  # noqa: F401, E402 (register your tasks)
 from isaaclab_tasks.utils import parse_env_cfg
-from rl_utils import camera_follow, RenderOverlayWrapper
+from rl_utils import camera_follow, RenderOverlayWrapper, to_uint8_hwc
 
 
 def _disable_heavy_sensors(env_cfg) -> None:
@@ -339,17 +340,24 @@ def _disable_lidar_keep_cameras(env_cfg) -> None:
     print("[play] Task D: lidar off, observation cameras kept.", flush=True)
 
 
-def _enable_depth_lidar_search(env_cfg) -> None:
+def _enable_depth_lidar_search(env_cfg, *, keep_rgb: bool = False) -> None:
     """Task B: head/ee depth + LiDAR; drop rgb and dual cameras for faster reset."""
     if hasattr(env_cfg, "scene"):
         env_cfg.scene.ee_dual_camera = None
     if hasattr(env_cfg, "observations") and getattr(env_cfg.observations, "image", None) is not None:
         img = env_cfg.observations.image
-        img.head_rgb = None
-        img.ee_rgb = None
+        if not keep_rgb:
+            img.head_rgb = None
+            img.ee_rgb = None
         img.ee_dual_rgb = None
         img.ee_dual_depth = None
-    print("[play] depth-lidar: head/ee depth + LiDAR extero (rgb/dual cam off).", flush=True)
+    if keep_rgb:
+        print(
+            "[play] depth-lidar + video: head/ee depth + LiDAR + head/ee RGB (tri-view mp4).",
+            flush=True,
+        )
+    else:
+        print("[play] depth-lidar: head/ee depth + LiDAR extero (rgb/dual cam off).", flush=True)
 
 
 def _estimate_teleop_video_steps(traj_path: str, *, step_dt: float = 0.02) -> int:
@@ -810,39 +818,7 @@ def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool
 
 def _to_uint8_hwc(frame) -> np.ndarray | None:
     """Convert image tensor/array to uint8 HWC for video writing."""
-    if isinstance(frame, torch.Tensor):
-        arr = frame.detach().cpu().numpy()
-    else:
-        arr = np.asarray(frame)
-
-    if arr.ndim == 4:
-        arr = arr[0]
-    if arr.ndim != 3:
-        return None
-
-    # CHW -> HWC if needed
-    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
-        arr = np.transpose(arr, (1, 2, 0))
-
-    if arr.shape[-1] == 1:
-        arr = np.repeat(arr, 3, axis=-1)
-    elif arr.shape[-1] > 3:
-        arr = arr[..., :3]
-
-    if arr.dtype != np.uint8:
-        arr = arr.astype(np.float32)
-        finite = np.isfinite(arr)
-        if not finite.any():
-            return None
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        max_v = float(arr.max())
-        min_v = float(arr.min())
-        if max_v <= 1.5 and min_v >= 0.0:
-            arr = arr * 255.0
-        elif max_v > min_v:
-            arr = (arr - min_v) / (max_v - min_v) * 255.0
-        arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
-    return arr
+    return to_uint8_hwc(frame)
 
 
 class CameraViewRecorder:
@@ -903,7 +879,7 @@ def play() -> tuple[float, float]:
     elif _use_pit_solution and _is_task_d:
         raise RuntimeError("Pit play requires solution.configure_env_cfg() (use solution_marg_depth_pit.py).")
     elif args_cli.depth_lidar:
-        _enable_depth_lidar_search(env_cfg)
+        _enable_depth_lidar_search(env_cfg, keep_rgb=bool(args_cli.video))
     elif args_cli.cameras_only:
         _disable_lidar_keep_cameras(env_cfg)
         print("[play] cameras-only: head/ee cameras on, LiDAR off (faster reset).", flush=True)
@@ -970,10 +946,14 @@ def play() -> tuple[float, float]:
     # Optional: video wrapper
     # -------------------------------------------------------------------------
     if args_cli.video:
+        overlay_wrapper = RenderOverlayWrapper(env, multi_view=True)
+        env = overlay_wrapper
         if use_video_overlay:
-            overlay_wrapper = RenderOverlayWrapper(env)
-            env = overlay_wrapper
             print("[INFO] Video HUD overlay enabled (top-left corner).", flush=True)
+        print(
+            "[INFO] Video layout: global viewport | head_rgb | ee_rgb (same step, left-to-right).",
+            flush=True,
+        )
 
         # Put videos in ./logs/videos/play by default (edit as you like)
         pit_warmup = (

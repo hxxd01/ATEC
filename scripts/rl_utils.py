@@ -3,6 +3,138 @@ import torch
 import gymnasium as gym
 
 
+def to_uint8_hwc(frame) -> np.ndarray | None:
+    """Convert render/obs image tensor or array to uint8 HWC RGB."""
+    if frame is None:
+        return None
+    if isinstance(frame, torch.Tensor):
+        arr = frame.detach().cpu().numpy()
+    else:
+        arr = np.asarray(frame)
+
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim != 3:
+        return None
+
+    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.shape[-1] > 3:
+        arr = arr[..., :3]
+
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return None
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        max_v = float(arr.max())
+        min_v = float(arr.min())
+        if max_v <= 1.5 and min_v >= 0.0:
+            arr = arr * 255.0
+        elif max_v > min_v:
+            arr = (arr - min_v) / (max_v - min_v) * 255.0
+        arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+def _rgb_panel_uint8(frame: np.ndarray | None) -> np.ndarray:
+    """Return a contiguous HWC uint8 panel safe for OpenCV."""
+    if frame is None:
+        return np.zeros((240, 320, 3), dtype=np.uint8)
+    out = to_uint8_hwc(frame)
+    if out is None:
+        return np.zeros((240, 320, 3), dtype=np.uint8)
+    return np.ascontiguousarray(out)
+
+
+def resize_rgb_panel(frame: np.ndarray | None, target_h: int) -> np.ndarray:
+    """Resize an RGB panel to target height (keep aspect ratio)."""
+    if frame is None:
+        target_w = max(1, int(round(target_h * 4 / 3)))
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    frame = _rgb_panel_uint8(frame)
+    h, w = frame.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.zeros((target_h, max(1, target_h), 3), dtype=np.uint8)
+    target_w = max(1, int(round(w * target_h / h)))
+    if h == target_h and w == target_w:
+        return frame.copy()
+    try:
+        import cv2
+
+        return np.ascontiguousarray(
+            cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        )
+    except ImportError:
+        from PIL import Image
+
+        return np.ascontiguousarray(
+            np.asarray(Image.fromarray(frame).resize((target_w, target_h), Image.BILINEAR))
+        )
+
+
+def obs_image_rgb(obs: dict | None, key: str) -> np.ndarray | None:
+    if not isinstance(obs, dict):
+        return None
+    image_obs = obs.get("image")
+    if not isinstance(image_obs, dict) or key not in image_obs:
+        return None
+    return to_uint8_hwc(image_obs[key])
+
+
+def stitch_global_head_ee_frame(
+    global_frame: np.ndarray | None,
+    obs: dict | None,
+    *,
+    panel_labels: tuple[str, str, str] = ("global", "head", "ee"),
+) -> np.ndarray | None:
+    """Horizontally stack viewport | head_rgb | ee_rgb from the same step."""
+    global_rgb = to_uint8_hwc(global_frame)
+    head_rgb = obs_image_rgb(obs, "head_rgb")
+    ee_rgb = obs_image_rgb(obs, "ee_rgb")
+    if global_rgb is None and head_rgb is None and ee_rgb is None:
+        return None
+
+    ref = global_rgb if global_rgb is not None else (head_rgb if head_rgb is not None else ee_rgb)
+    target_h = max(
+        ref.shape[0],
+        head_rgb.shape[0] if head_rgb is not None else 0,
+        ee_rgb.shape[0] if ee_rgb is not None else 0,
+        240,
+    )
+    panels = [
+        resize_rgb_panel(global_rgb, target_h),
+        resize_rgb_panel(head_rgb, target_h),
+        resize_rgb_panel(ee_rgb, target_h),
+    ]
+    try:
+        import cv2
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        labeled: list[np.ndarray] = []
+        for panel, label in zip(panels, panel_labels):
+            canvas = np.ascontiguousarray(panel.copy())
+            cv2.putText(
+                canvas,
+                label,
+                (8, 24),
+                font,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            labeled.append(canvas)
+        panels = labeled
+    except (ImportError, Exception):
+        pass
+    return np.ascontiguousarray(np.concatenate(panels, axis=1))
+
+
 def draw_text_overlay(frame: np.ndarray, lines: list[str]) -> np.ndarray:
     """Draw semi-transparent HUD text on the top-left of an RGB frame."""
     if frame is None or len(lines) == 0:
@@ -67,18 +199,41 @@ def draw_text_overlay(frame: np.ndarray, lines: list[str]) -> np.ndarray:
 class RenderOverlayWrapper(gym.Wrapper):
     """Inject HUD lines into env.render() frames (use inside RecordVideo)."""
 
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, *, multi_view: bool = False):
         super().__init__(env)
         self._overlay_lines: list[str] = []
+        self._multi_view = bool(multi_view)
+        self._last_obs: dict | None = None
 
     def set_overlay_lines(self, lines: list[str]) -> None:
         self._overlay_lines = list(lines)
 
+    def set_latest_obs(self, obs: dict | None) -> None:
+        self._last_obs = obs if isinstance(obs, dict) else None
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.set_latest_obs(obs)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.set_latest_obs(obs)
+        return obs, reward, terminated, truncated, info
+
     def render(self):
-        frame = self.env.render()
-        if frame is None or not self._overlay_lines:
-            return frame
-        return draw_text_overlay(frame, self._overlay_lines)
+        global_frame = self.env.render()
+        if self._multi_view:
+            frame = stitch_global_head_ee_frame(global_frame, self._last_obs)
+            if frame is None:
+                frame = to_uint8_hwc(global_frame)
+        else:
+            frame = global_frame
+        if frame is None:
+            return global_frame
+        if self._overlay_lines:
+            return draw_text_overlay(frame, self._overlay_lines)
+        return frame
 
 
 def camera_follow(env, robot_name: str = "robot", env_index: int = 0, alpha: float = 0.15):
