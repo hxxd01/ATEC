@@ -596,6 +596,8 @@ class AlgSolution:
         others = points_flat[~ground_mask]
         if len(others) == 0:
             return None, None
+        others *= 30
+        others = np.unique(np.round(others), axis=0) / 30.0
         labels, n_clusters = self.cluster_euclidean_open3d(others)
         min_dist = None
         target = None
