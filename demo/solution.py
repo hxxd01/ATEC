@@ -6,6 +6,10 @@ import open3d as o3d
 import torch
 
 from demo.utils import approach_dustbin
+try:
+    from ultralytics import YOLO
+except Exception:  # pragma: no cover
+    YOLO = None
 
 
 class Status(Enum):
@@ -34,6 +38,16 @@ class AlgSolution:
     # b2.py default leg PD 160/5; squat position-hold uses stiffer gains.
     _SQUAT_LEG_STIFFNESS = 640.0
     _SQUAT_LEG_DAMPING = 20.0
+    _ENABLE_YOLO = True
+    _YOLO_MODEL_PATH = os.environ.get("ATEC_YOLO_MODEL_PATH", "yolo11n.pt")
+    _YOLO_TARGET_CLASS = os.environ.get("ATEC_YOLO_TARGET_CLASS", "banana")
+    _YOLO_CONF = 0.35
+    _YOLO_IOU = 0.45
+    _YOLO_MAX_DET = 12
+    _YOLO_MIN_BOX = 8
+    # Geometry-only object selection (no model).
+    # Set via env: ATEC_TARGET_OBJECT_CLASS=banana|mustard|sugar|any
+    _TARGET_OBJECT_CLASS = os.environ.get("ATEC_TARGET_OBJECT_CLASS", "any")
     EE_BODY_NAME_CANDIDATES = ("gripper_base", "piper_gripper_base")
     ARM_JOINT_NAME_CANDIDATES = (
         ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
@@ -82,6 +96,15 @@ class AlgSolution:
         if not image or key not in image:
             return None
         return image[key][0].to(self.device).cpu().numpy()
+
+    def _obs_rgb(self, obs, key: str) -> np.ndarray | None:
+        image = obs.get("image")
+        if not image or key not in image:
+            return None
+        arr = image[key][0].to(self.device).cpu().numpy()
+        if arr.ndim == 3 and arr.shape[-1] >= 3:
+            return arr[..., :3]
+        return None
 
     def _obs_extero(self, obs) -> np.ndarray | None:
         extero = obs.get("extero")
@@ -247,6 +270,210 @@ class AlgSolution:
         self.K = np.array([[458.12, 0, 320], [0, 458.12, 240], [0, 0, 1]])
         self._env = None
         self._squat_pd_active = False
+        self._target_object_class = self._normalize_target_class(self._TARGET_OBJECT_CLASS)
+        self._last_target_class = None
+        self._last_target_score = None
+        self._yolo = None
+        self._yolo_names = {}
+        self._yolo_target_class = self._normalize_target_class(self._YOLO_TARGET_CLASS)
+        self._init_yolo()
+
+    @staticmethod
+    def _normalize_target_class(name: str) -> str:
+        s = str(name).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+        alias = {
+            "banana": "banana",
+            "mustard": "mustard",
+            "mustardbottle": "mustard",
+            "sugar": "sugar",
+            "sugarbox": "sugar",
+            "box": "sugar",
+            "any": "any",
+            "all": "any",
+            "*": "any",
+        }
+        return alias.get(s, "any")
+
+    def _class_matches_target(self, cls_name: str) -> bool:
+        c = self._normalize_target_class(cls_name)
+        t = self._yolo_target_class
+        if t == "any":
+            return True
+        if c == t:
+            return True
+        # Open-source COCO fallback aliases.
+        fallback = {
+            "banana": {"banana"},
+            "mustard": {"bottle", "cup", "wineglass"},
+            "sugar": {"book", "cup", "bottle"},
+        }
+        return c in fallback.get(t, {t})
+
+    def _init_yolo(self) -> None:
+        if not self._ENABLE_YOLO:
+            print("[TaskB][YOLO] disabled.", flush=True)
+            return
+        if YOLO is None:
+            print("[TaskB][YOLO] ultralytics unavailable, fallback to depth.", flush=True)
+            return
+        try:
+            self._yolo = YOLO(self._YOLO_MODEL_PATH)
+            print(
+                f"[TaskB][YOLO] loaded model={self._YOLO_MODEL_PATH}, target={self._yolo_target_class}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[TaskB][YOLO] init failed: {e}; fallback to depth.", flush=True)
+            self._yolo = None
+
+    def _pixel_to_cam_point(self, u: float, v: float, depth_val: float) -> np.ndarray:
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
+        z = -float(depth_val)
+        x = -(float(u) - cx) * z / fx
+        y = (float(v) - cy) * z / fy
+        return np.array([x, y, z], dtype=np.float32)
+
+    def _depth_point_from_box(self, depth: np.ndarray, xyxy: np.ndarray) -> tuple[np.ndarray | None, float | None]:
+        if depth is None:
+            return None, None
+        d = depth.squeeze()
+        if d.ndim != 2:
+            return None, None
+        h, w = d.shape
+        x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy]
+        x1 = int(np.clip(x1, 0, w - 1))
+        x2 = int(np.clip(x2, 0, w - 1))
+        y1 = int(np.clip(y1, 0, h - 1))
+        y2 = int(np.clip(y2, 0, h - 1))
+        if x2 <= x1 or y2 <= y1:
+            return None, None
+
+        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        bw = max(3, int((x2 - x1) * 0.4))
+        bh = max(3, int((y2 - y1) * 0.4))
+        sx1 = int(np.clip(cx - bw * 0.5, x1, x2 - 1))
+        sx2 = int(np.clip(cx + bw * 0.5, sx1 + 1, x2))
+        sy1 = int(np.clip(cy - bh * 0.5, y1, y2 - 1))
+        sy2 = int(np.clip(cy + bh * 0.5, sy1 + 1, y2))
+        patch = d[sy1:sy2, sx1:sx2]
+        valid = patch[np.isfinite(patch) & (patch > 0.05) & (patch < 8.0)]
+        if valid.size == 0:
+            return None, None
+        depth_val = float(np.median(valid))
+        point = self._pixel_to_cam_point(cx, cy, depth_val)
+        dist = float(np.linalg.norm(point))
+        return point, dist
+
+    def _find_target_by_yolo(self, rgb: np.ndarray, depth: np.ndarray) -> tuple[np.ndarray | None, float | None]:
+        if self._yolo is None or rgb is None or depth is None:
+            return None, None
+        try:
+            pred = self._yolo.predict(
+                source=rgb,
+                conf=self._YOLO_CONF,
+                iou=self._YOLO_IOU,
+                max_det=self._YOLO_MAX_DET,
+                verbose=False,
+            )
+            if not pred:
+                return None, None
+            result = pred[0]
+            boxes = getattr(result, "boxes", None)
+            if boxes is None or boxes.xyxy is None or len(boxes.xyxy) == 0:
+                return None, None
+            names = getattr(result, "names", {})
+            if isinstance(names, dict):
+                self._yolo_names = names
+
+            best = None
+            best_score = None
+            for i in range(len(boxes.xyxy)):
+                cls_id = int(boxes.cls[i].item())
+                conf = float(boxes.conf[i].item())
+                cls_name = self._yolo_names.get(cls_id, str(cls_id))
+                if not self._class_matches_target(cls_name):
+                    continue
+                xyxy = boxes.xyxy[i].detach().cpu().numpy()
+                box_w = float(xyxy[2] - xyxy[0])
+                box_h = float(xyxy[3] - xyxy[1])
+                if box_w < self._YOLO_MIN_BOX or box_h < self._YOLO_MIN_BOX:
+                    continue
+                point, dist = self._depth_point_from_box(depth, xyxy)
+                if point is None:
+                    continue
+                score = conf + 0.25 / max(dist, 0.2)
+                if best_score is None or score > best_score:
+                    best = (point, dist, self._normalize_target_class(cls_name), score)
+                    best_score = score
+            if best is None:
+                return None, None
+            self._last_target_class = best[2]
+            self._last_target_score = float(best[3])
+            return best[0], best[1]
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _cluster_shape_features(cur_points: np.ndarray) -> dict | None:
+        if cur_points.shape[0] < 12:
+            return None
+        mins = np.min(cur_points, axis=0)
+        maxs = np.max(cur_points, axis=0)
+        ext = np.maximum(maxs - mins, 1e-6)  # x,y,z extents
+
+        xy = np.maximum(ext[:2], 1e-6)
+        long_xy = float(np.max(xy))
+        short_xy = float(np.min(xy))
+        ratio_xy = long_xy / short_xy
+        z_extent = float(ext[2])
+        volume = float(ext[0] * ext[1] * ext[2])
+
+        return {
+            "long_xy": long_xy,
+            "short_xy": short_xy,
+            "ratio_xy": ratio_xy,
+            "z_extent": z_extent,
+            "volume": volume,
+        }
+
+    def _class_score(self, feats: dict, target_cls: str) -> float:
+        # Heuristic shape templates in flattened-ground frame.
+        ratio = feats["ratio_xy"]
+        long_xy = feats["long_xy"]
+        short_xy = feats["short_xy"]
+        z_ext = feats["z_extent"]
+        vol = feats["volume"]
+
+        # Banana: elongated in XY, relatively low profile.
+        banana = (
+            2.2 * ratio
+            + 1.6 * long_xy
+            - 1.2 * z_ext
+            - 0.7 * short_xy
+            - 0.1 * abs(vol - 0.0025)
+        )
+        # Mustard bottle: upright-ish, compact XY, higher Z.
+        mustard = (
+            2.6 * z_ext
+            - 0.9 * ratio
+            - 1.0 * short_xy
+            + 0.2 * long_xy
+            - 0.1 * abs(vol - 0.0018)
+        )
+        # Sugar box: moderate XY, less elongated than banana.
+        sugar = (
+            1.8 * short_xy
+            + 0.8 * long_xy
+            + 0.6 * z_ext
+            - 1.3 * abs(ratio - 1.4)
+            - 0.1 * abs(vol - 0.0020)
+        )
+
+        table = {"banana": banana, "mustard": mustard, "sugar": sugar}
+        if target_cls == "any":
+            return max(table.values())
+        return table[target_cls]
 
     def init(self):
         # ==========================================
@@ -377,6 +604,8 @@ class AlgSolution:
         self.cmd_max_wz = 1.0
         self._last_bin_bearing = None
         self._last_bin_dist = None
+        self._last_target_class = None
+        self._last_target_score = None
         self._set_squat_leg_pd(False)
         self.cur_idx = 0
 
@@ -499,11 +728,19 @@ class AlgSolution:
         num_iterations: 迭代次数
         返回: (ground_mask, plane_model)
         """
+        if points is None or len(points) < ransac_n:
+            # Not enough points for plane fitting; treat all points as non-ground.
+            return np.zeros(0, dtype=bool), None
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
 
         # 执行平面分割
-        plane_model, inliers = pcd.segment_plane(distance_threshold, ransac_n, num_iterations)
+        try:
+            plane_model, inliers = pcd.segment_plane(distance_threshold, ransac_n, num_iterations)
+        except RuntimeError:
+            # Open3D may still fail on degenerate tiny clouds.
+            return np.zeros(len(points), dtype=bool), None
 
         # 提取平面内点
         ground_mask = np.zeros(len(points), dtype=bool)
@@ -534,6 +771,8 @@ class AlgSolution:
         points: (N, 3) 原始点云
         plane_model: (a, b, c, d) 平面参数
         """
+        if plane_model is None:
+            return points, np.eye(3), np.zeros(3)
         a, b, c, d = plane_model
         normal = np.array([a, b, c])
 
@@ -591,7 +830,11 @@ class AlgSolution:
 
     def find_target_by_depth(self, depth):
         points = self.depth_to_point_cloud(depth.squeeze())
+        if points is None or len(points) < 3:
+            return None, None
         ground_mask, plane_model = self.detect_ground_ransac(points, distance_threshold=0.03)
+        if plane_model is None or len(ground_mask) != len(points):
+            ground_mask = np.zeros(len(points), dtype=bool)
         points_flat, R, p0 = self.transform_ground_to_zero(points, plane_model)
         others = points_flat[~ground_mask]
         if len(others) == 0:
@@ -601,18 +844,45 @@ class AlgSolution:
         labels, n_clusters = self.cluster_euclidean_open3d(others)
         min_dist = None
         target = None
+        best_cls = None
+        best_score = None
+        target_cls = self._target_object_class
         # 1. 筛选并计算每个聚类的中心距离
         for label in range(n_clusters):
             cur_points = others[labels == label]
             z_max = np.max(cur_points[:, 2])
             if z_max > 0.4:
                 continue
+            feats = self._cluster_shape_features(cur_points)
+            if feats is None:
+                continue
             # 计算该簇的几何中心
             centroid = np.mean(cur_points, axis=0)
             dist_to_origin = np.linalg.norm(centroid)
-            if min_dist is None or dist_to_origin < min_dist:
-                min_dist = dist_to_origin
+            cls_scores = {
+                "banana": self._class_score(feats, "banana"),
+                "mustard": self._class_score(feats, "mustard"),
+                "sugar": self._class_score(feats, "sugar"),
+            }
+            pred_cls = max(cls_scores, key=cls_scores.get)
+            pred_score = cls_scores[pred_cls]
+
+            # If user wants a specific class, only keep that class.
+            if target_cls != "any" and pred_cls != target_cls:
+                continue
+
+            # Pick candidate by class confidence first, then distance.
+            if (
+                best_score is None
+                or pred_score > best_score + 1e-6
+                or (abs(pred_score - best_score) <= 1e-6 and (min_dist is None or dist_to_origin < min_dist))
+            ):
+                best_score = float(pred_score)
+                best_cls = pred_cls
+                min_dist = float(dist_to_origin)
                 target = centroid
+        self._last_target_class = best_cls
+        self._last_target_score = best_score
         return target, min_dist
 
     def predicts(self, obs, current_score):
@@ -626,16 +896,27 @@ class AlgSolution:
         if self.status == Status.SEARCH:
             if self.cur_idx % 4 == 0:
                 head_depth = self._obs_depth(obs, "head_depth")
+                head_rgb = self._obs_rgb(obs, "head_rgb")
                 target, min_dist = (None, None)
-                if head_depth is not None:
+                if head_rgb is not None and head_depth is not None:
+                    target, min_dist = self._find_target_by_yolo(head_rgb, head_depth)
+                if target is None and head_depth is not None:
                     target, min_dist = self.find_target_by_depth(head_depth)
                 if target is None:
                     ee_depth = self._obs_depth(obs, "ee_depth")
-                    if ee_depth is not None:
+                    ee_rgb = self._obs_rgb(obs, "ee_rgb")
+                    if ee_rgb is not None and ee_depth is not None:
+                        target, min_dist = self._find_target_by_yolo(ee_rgb, ee_depth)
+                    if target is None and ee_depth is not None:
                         target, min_dist = self.find_target_by_depth(ee_depth)
                 if target is not None:
                     self.calculate_velocity(target[0], target[1], 1, 0.5, 1)
-                print(f"[SEARCH] target={target}, min_dist={min_dist}", flush=True)
+                print(
+                    f"[SEARCH] target={target}, min_dist={min_dist}, "
+                    f"cls={self._last_target_class}, cls_score={self._last_target_score}, "
+                    f"want={self._yolo_target_class}",
+                    flush=True,
+                )
 
         elif self.status == Status.PICK and self.start_pick_idx is not None:
             if self.cur_idx < self.start_pick_idx + 10:
