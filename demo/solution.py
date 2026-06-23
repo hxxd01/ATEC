@@ -8,6 +8,26 @@ import torch
 
 from demo.utils import approach_dustbin
 try:
+    from demo.grasp_ik_task_e import (
+        ACTION_SCALE as TASKE_ACTION_SCALE,
+        GRASP_STATE_ORDER,
+        GRIPPER_CLOSE_POS,
+        GRIPPER_OPEN_POS,
+        STEPS as TASKE_GRASP_STEPS,
+        TaskEGraspOnlySM,
+        compute_grasp_quat,
+        gripper_tensor,
+    )
+except Exception:  # pragma: no cover
+    TASKE_ACTION_SCALE = 0.5
+    GRASP_STATE_ORDER = ("PRE_GRASP", "REACH", "CLOSE", "LIFT")
+    GRIPPER_CLOSE_POS = [-0.015, 0.015]
+    GRIPPER_OPEN_POS = [0.035, -0.035]
+    TASKE_GRASP_STEPS = {}
+    TaskEGraspOnlySM = None
+    compute_grasp_quat = None
+    gripper_tensor = None
+try:
     from atec_rl_lab.utils import CartesianController
     from isaaclab.utils.math import subtract_frame_transforms
 except Exception:  # pragma: no cover
@@ -124,6 +144,14 @@ class AlgSolution:
         "on",
     )
     _DIRECT_SQUAT_IK = os.environ.get("ATEC_DIRECT_SQUAT_IK", "0").strip().lower() in ("1", "true", "yes", "on")
+    _GRASP_USE_TASKE_IK = os.environ.get("ATEC_GRASP_USE_TASKE_IK", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    _GRASP_IK_CARRY_Z = float(os.environ.get("ATEC_GRASP_IK_CARRY_Z", "0"))
+    _GRASP_IK_Z_OFFSET = float(os.environ.get("ATEC_GRASP_IK_Z_OFFSET", "0.09"))
+    _GRASP_RECORD = os.environ.get("ATEC_GRASP_RECORD", "0").strip().lower() in ("1", "true", "yes", "on")
+    _GRASP_RECORD_DIR = os.environ.get("ATEC_GRASP_RECORD_DIR", "logs/grasp_demos")
+    _TASK_B_NUM_OBJECTS = 18
     # Geometry-only object selection (no model).
     # Set via env: ATEC_TARGET_OBJECT_CLASS=banana|mustard|sugar|any
     _TARGET_OBJECT_CLASS = os.environ.get("ATEC_TARGET_OBJECT_CLASS", "any")
@@ -283,6 +311,10 @@ class AlgSolution:
         self._search_track_target = None
         self._search_last_seen_dist = None
         self._search_last_seen_step = None
+        self._grasp_sm = None
+        self._grasp_obj_idx = None
+        self._grasp_ik_active = False
+        self._reset_grasp_record_buffers()
         print("[TaskB] bin reached -> SEARCH (loop)", flush=True)
 
     def _update_go_bin_cmd(self, obs) -> None:
@@ -321,13 +353,68 @@ class AlgSolution:
         self.cmd_max_wz = float(np.clip(0.4 * bearing_f, -0.4, 0.4))
 
     def bind_env(self, env) -> None:
-        del env
-        # Pure-vision mode: never read/write simulator internals.
-        self._env = None
-        self.robot = None
-        self._squat_pd_active = False
-        self.cartesian_ctrl = None
-        print("[TaskB] visual-IK mode: bind_env ignored.", flush=True)
+        self._env = env
+        unwrapped = env.unwrapped if hasattr(env, "unwrapped") else env
+        self.robot = unwrapped.scene.articulations["robot"]
+        self.device = str(self.robot.device)
+        self._leg_joint_ids = None
+        try:
+            leg_ids, _ = self.robot.find_joints(list(self._LEG_JOINT_NAMES))
+            self._leg_joint_ids = list(leg_ids)
+            self._default_leg_stiffness = self.robot.data.joint_stiffness[0, self._leg_joint_ids].clone()
+            self._default_leg_damping = self.robot.data.joint_damping[0, self._leg_joint_ids].clone()
+        except Exception as exc:
+            print(f"[TaskB] bind_env leg PD setup failed: {exc}", flush=True)
+        if self._GRASP_USE_TASKE_IK:
+            self._setup_task_e_grasp_ik()
+        elif self._ENABLE_DEPTH_IK_PICK:
+            self._setup_depth_ik_pick()
+        print("[TaskB] bind_env OK — sim access + squat leg PD enabled.", flush=True)
+
+    def _setup_task_e_grasp_ik(self) -> None:
+        """Task E collect_demos_task_e.py IK: pose CartesianController + grasp SM."""
+        if TaskEGraspOnlySM is None or CartesianController is None:
+            print("[TaskB][GraspIK] task_e helpers unavailable, fallback to visual GRASP.", flush=True)
+            return
+        try:
+            self.ee_name = self._resolve_ee_body_name()
+            self.arm_ids = self._resolve_joint_ids(self.ARM_JOINT_NAME_CANDIDATES)
+            all_names = list(getattr(self.robot.data, "joint_names", []))
+            gripper_name_candidates = [
+                "joint7", "joint8",
+                "arm_joint7", "arm_joint8",
+                "left_finger_joint", "right_finger_joint",
+            ]
+            gripper_names = [n for n in gripper_name_candidates if n in all_names]
+            if len(gripper_names) >= 2:
+                self.gripper_ids, _ = self.robot.find_joints(gripper_names[:2])
+                self.gripper_ids = list(self.gripper_ids)
+            else:
+                self.gripper_ids = [18, 19]
+            self.default_joint_pos = self.robot.data.default_joint_pos.clone()
+            dev = self.device
+            dtype = self.robot.data.joint_pos.dtype
+            self.gripper_open_pos = torch.tensor([list(GRIPPER_OPEN_POS)], device=dev, dtype=dtype)
+            self.gripper_close_pos = torch.tensor([list(GRIPPER_CLOSE_POS)], device=dev, dtype=dtype)
+            num_envs = int(getattr(self._env.unwrapped, "num_envs", self.robot.data.joint_pos.shape[0]))
+            self.cartesian_ctrl = CartesianController(
+                robot=self.robot,
+                ee_body_name=self.ee_name,
+                arm_joint_names=self.arm_joint_names,
+                num_envs=num_envs,
+                device=dev,
+                command_type="pose",
+                lambda_val=0.05,
+                max_joint_delta=0.2,
+            )
+            print(
+                f"[TaskB][GraspIK] Task E IK enabled ee={self.ee_name}, "
+                f"arm={self.arm_joint_names}, gripper_ids={self.gripper_ids}",
+                flush=True,
+            )
+        except Exception as exc:
+            self.cartesian_ctrl = None
+            print(f"[TaskB][GraspIK] init failed: {exc}; fallback to visual GRASP.", flush=True)
 
     def _setup_depth_ik_pick(self) -> None:
         if not self._ENABLE_DEPTH_IK_PICK:
@@ -508,6 +595,10 @@ class AlgSolution:
         self._search_track_target = None
         self._search_last_seen_dist = None
         self._search_last_seen_step = None
+        self._grasp_sm = None
+        self._grasp_obj_idx = None
+        self._grasp_ik_active = False
+        self._reset_grasp_record_buffers()
         self._init_anygrasp()
         self._init_moveit_bridge()
 
@@ -883,6 +974,10 @@ class AlgSolution:
         self._search_track_target = None
         self._search_last_seen_dist = None
         self._search_last_seen_step = None
+        self._grasp_sm = None
+        self._grasp_obj_idx = None
+        self._grasp_ik_active = False
+        self._reset_grasp_record_buffers()
         self._set_squat_leg_pd(False)
         self.cur_idx = 0
 
@@ -1177,15 +1272,193 @@ class AlgSolution:
         except Exception:
             return None
 
+    def _grasp_use_task_e_ik(self) -> bool:
+        return (
+            self._GRASP_USE_TASKE_IK
+            and self._env is not None
+            and self.cartesian_ctrl is not None
+            and TaskEGraspOnlySM is not None
+            and compute_grasp_quat is not None
+        )
+
+    def _get_object_asset(self, obj_idx: int):
+        scene = self._env.unwrapped.scene
+        key = f"object_{obj_idx}"
+        if hasattr(scene, "rigid_objects") and key in scene.rigid_objects:
+            return scene.rigid_objects[key]
+        return scene[key]
+
+    def _nearest_grasp_object(self) -> tuple[int, torch.Tensor] | None:
+        if self._env is None:
+            return None
+        robot_pos = self.robot.data.root_pos_w[0]
+        rx, ry = float(robot_pos[0].item()), float(robot_pos[1].item())
+        best: tuple[int, torch.Tensor, float] | None = None
+        for obj_idx in range(1, self._TASK_B_NUM_OBJECTS + 1):
+            try:
+                pos = self._get_object_asset(obj_idx).data.root_pos_w[0].clone()
+            except (AttributeError, KeyError):
+                continue
+            dx = float(pos[0].item()) - rx
+            dy = float(pos[1].item()) - ry
+            dist = (dx * dx + dy * dy) ** 0.5
+            if best is None or dist < best[2]:
+                best = (obj_idx, pos, dist)
+        if best is None:
+            return None
+        return best[0], best[1]
+
+    def _reset_grasp_record_buffers(self) -> None:
+        self._grasp_rec_qpos = []
+        self._grasp_rec_qvel = []
+        self._grasp_rec_action = []
+        self._grasp_rec_ee_pos = []
+        self._grasp_rec_ee_quat = []
+
+    def _grasp_record_step(self, action_row: torch.Tensor) -> None:
+        self._grasp_rec_qpos.append(self.robot.data.joint_pos[0].detach().cpu().numpy())
+        self._grasp_rec_qvel.append(self.robot.data.joint_vel[0].detach().cpu().numpy())
+        self._grasp_rec_action.append(action_row.detach().cpu().numpy())
+        self._grasp_rec_ee_pos.append(self.cartesian_ctrl.ee_pos_w[0].detach().cpu().numpy())
+        self._grasp_rec_ee_quat.append(self.cartesian_ctrl.ee_quat_w[0].detach().cpu().numpy())
+
+    def _grasp_record_flush(self) -> None:
+        if not self._grasp_rec_qpos:
+            return
+        try:
+            import h5py
+        except ImportError:
+            print("[TaskB][GraspIK] h5py missing — skip demo save.", flush=True)
+            return
+        os.makedirs(self._GRASP_RECORD_DIR, exist_ok=True)
+        traj_path = os.path.join(self._GRASP_RECORD_DIR, "trajectory.hdf5")
+        mode = "a" if os.path.isfile(traj_path) else "w"
+        with h5py.File(traj_path, mode) as f:
+            idx = len(f.keys())
+            grp = f.create_group(f"traj_{idx}")
+            grp.create_dataset("obs", data=np.stack(self._grasp_rec_qpos), compression="gzip")
+            grp.create_dataset("actions", data=np.stack(self._grasp_rec_action), compression="gzip")
+            grp.create_dataset("qvel", data=np.stack(self._grasp_rec_qvel), compression="gzip")
+            grp.create_dataset("ee_pos", data=np.stack(self._grasp_rec_ee_pos), compression="gzip")
+            grp.create_dataset("ee_quat", data=np.stack(self._grasp_rec_ee_quat), compression="gzip")
+        print(
+            f"[TaskB][GraspIK] saved traj_{idx} ({len(self._grasp_rec_qpos)} steps) -> {traj_path}",
+            flush=True,
+        )
+        self._reset_grasp_record_buffers()
+
+    def _begin_task_e_grasp_sm(self, obj_idx: int) -> None:
+        obj = self._get_object_asset(obj_idx)
+        obj_quat = obj.data.root_state_w[0, 3:7]
+        grasp_quat = compute_grasp_quat(obj_quat, self.device)
+        carry_z = self._GRASP_IK_CARRY_Z if self._GRASP_IK_CARRY_Z > 0.0 else 0.0
+        self._grasp_sm = TaskEGraspOnlySM(
+            grasp_quat,
+            self.device,
+            carry_z=carry_z if carry_z > 0.0 else None,
+            grasp_z_offset=self._GRASP_IK_Z_OFFSET,
+        )
+        self._grasp_obj_idx = obj_idx
+        self._grasp_ik_active = True
+        self._ik_pick_active = True
+        if self.cartesian_ctrl is not None:
+            self.cartesian_ctrl.reset()
+        if self._GRASP_RECORD:
+            self._reset_grasp_record_buffers()
+        print(
+            f"[TaskB][GraspIK] object_{obj_idx} -> PRE_GRASP "
+            f"(steps={ {s: TASKE_GRASP_STEPS.get(s, '?') for s in GRASP_STATE_ORDER} })",
+            flush=True,
+        )
+
+    def _finish_grasp_to_stand(self) -> None:
+        self.status = Status.STAND
+        self.get_down = False
+        self.start_stand_idx = self.cur_idx
+        self.v_list = [0.0 for _ in range(8)]
+        self.cmd_max_vx = 0.0
+        self.cmd_max_vy = 0.0
+        self.cmd_max_wz = 0.0
+        self._ik_phase = None
+        self._ik_phase_start = None
+        self._ik_target_pos_b = None
+        self._ik_lift_pos_b = None
+        self._ik_acquire_pos_b = None
+        self._ik_no_target_count = 0
+        self._last_target_cam = None
+        self._ik_pick_active = False
+        self._pick_arm_hold_cmd = None
+        self._grasp_target_cam = None
+        self._grasp_axis_cam = None
+        self._grasp_approach_inited = False
+        self._grasp_target_cam_ema = None
+        self._grasp_reached_hold_count = 0
+        self._grasp_prev_l_err = None
+        self._grasp_prev_f_err = None
+        self._grasp_prev_v_err = None
+        self._grasp_close_reason = None
+        self._grasp_wrist_yaw_target = None
+        self._grasp_sm = None
+        self._grasp_obj_idx = None
+        self._grasp_ik_active = False
+
+    def _task_e_grasp_arm_action(self) -> list[float] | None:
+        if self._grasp_sm is None or self.cartesian_ctrl is None or self._grasp_obj_idx is None:
+            return None
+        obj_pos = self._get_object_asset(self._grasp_obj_idx).data.root_pos_w[0].clone()
+        ee_pos_des, ee_quat_des, gripper_cmd = self._grasp_sm.tick(obj_pos)
+        dev = self.device
+        dtype = self.robot.data.joint_pos.dtype
+        ee_pos = ee_pos_des.unsqueeze(0).to(device=dev, dtype=dtype)
+        ee_quat = ee_quat_des.unsqueeze(0).to(device=dev, dtype=dtype)
+        arm_jpos_des = self.cartesian_ctrl.compute(ee_pos, ee_quat)
+        gripper_target = gripper_tensor(gripper_cmd, dev, dtype)
+        full_target = self.robot.data.joint_pos.clone()
+        full_target[:, self.arm_ids] = arm_jpos_des
+        full_target[:, self.gripper_ids] = gripper_target
+        arm_env = (full_target - self.default_joint_pos) / TASKE_ACTION_SCALE
+        if self._GRASP_RECORD:
+            self._grasp_record_step(arm_env[0])
+        state = self._grasp_sm.state
+        step_total = TASKE_GRASP_STEPS.get(state, "?")
+        self._set_video_hud(
+            f"status=GRASP ik=taske state={state} step={self._grasp_sm._count}/{step_total}",
+            f"obj={self._grasp_obj_idx} gripper={gripper_cmd}",
+            f"ee=[{float(ee_pos_des[0]):.2f},{float(ee_pos_des[1]):.2f},{float(ee_pos_des[2]):.2f}]",
+        )
+        if self._grasp_sm.done:
+            print("[TaskB][GraspIK] LIFT done -> STAND", flush=True)
+            if self._GRASP_RECORD:
+                self._grasp_record_flush()
+            self._finish_grasp_to_stand()
+        return arm_env[0, self.arm_joint_indices].detach().cpu().tolist()
+
+    def _update_task_e_grasp_ik(self, obs) -> None:
+        del obs
+        if self._grasp_sm is None:
+            nearest = self._nearest_grasp_object()
+            if nearest is None:
+                self._set_video_hud("status=GRASP ik=taske", "no sim object found")
+                return
+            self._begin_task_e_grasp_sm(nearest[0])
+        arm = self._task_e_grasp_arm_action()
+        if arm is not None:
+            self.v_list = [float(x) for x in arm]
+
     def _try_begin_depth_pick(self, obs, *, during_lower: bool = False) -> bool:
-        """Start depth/PCA pick once an ee-depth object is visible."""
+        """Start pick once an ee-depth object is visible."""
         if self._ik_pick_active:
             return True
         ee_depth = self._obs_depth(obs, "ee_depth")
-        # For PICK trigger: any clustered object in ee_depth is enough.
         target_cam, _ = self._find_target_cam_by_depth(ee_depth) if ee_depth is not None else (None, None)
         if target_cam is None or ee_depth is None:
             return False
+        if self._grasp_use_task_e_ik():
+            self.status = Status.GRASP
+            self._ik_pick_active = True
+            where = "lower" if during_lower else "hold"
+            print(f"[TaskB][GraspIK] target during {where} -> GRASP (Task E IK)", flush=True)
+            return True
         self._snapshot_pick_hold_arm_cmd()
         self._last_target_cam = target_cam.astype(np.float32)
         self._grasp_target_cam = self._last_target_cam.copy()
@@ -1243,10 +1516,12 @@ class AlgSolution:
 
         # After detect window, force transition to grasp stage.
         self.status = Status.GRASP
-        self._update_ik_pick_state(obs)
+        self._run_pick_grasp_stage(obs)
 
     def _run_pick_grasp_stage(self, obs) -> None:
-        # Stage 2: execute grasp controller only.
+        if self._grasp_use_task_e_ik():
+            self._update_task_e_grasp_ik(obs)
+            return
         self._update_ik_pick_state(obs)
 
     def _update_ik_pick_state(self, obs) -> None:
