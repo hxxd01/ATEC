@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -28,6 +29,18 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Disable HUD text (vel/reward/time) on recorded videos.",
+)
+parser.add_argument(
+    "--no-ground-video",
+    action="store_true",
+    default=False,
+    help="With --video: do not record a separate low side-view ground_view.mp4.",
+)
+parser.add_argument(
+    "--ground-video-fps",
+    type=int,
+    default=50,
+    help="FPS for ground_view.mp4 (default: 50, matched to sim step rate).",
 )
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
@@ -238,6 +251,9 @@ if args_cli.policy_img_w is not None:
 
 _is_task_b = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
 _is_task_d = isinstance(args_cli.task, str) and "TaskD" in args_cli.task
+if _is_task_b and args_cli.debug:
+    os.environ.setdefault("ATEC_GRASP_DEBUG", "1")
+    os.environ.setdefault("ATEC_GRASP_DEBUG_EVERY", "1")
 if args_cli.cameras_only or args_cli.depth_lidar or args_cli.full_obs:
     args_cli.enable_cameras = True
     args_cli.fast = False
@@ -299,11 +315,17 @@ except ImportError:  # pragma: no cover
     imageio = None
 
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent  # noqa: E402
-from isaaclab.utils.dict import print_dict  # noqa: E402
 
 import atec_rl_lab.tasks  # noqa: F401, E402 (register your tasks)
 from isaaclab_tasks.utils import parse_env_cfg
-from rl_utils import camera_follow, RenderOverlayWrapper, to_uint8_hwc
+from rl_utils import (
+    camera_follow,
+    draw_text_overlay,
+    ground_camera_follow,
+    obs_image_rgb,
+    RenderOverlayWrapper,
+    to_uint8_hwc,
+)
 
 
 def _disable_heavy_sensors(env_cfg) -> None:
@@ -579,11 +601,20 @@ def _build_video_overlay_lines(
     show_box_pose: bool = False,
 ) -> list[str]:
     """Build HUD lines matching --debug terminal output."""
+    in_pick_hud = (
+        solution is not None
+        and hasattr(solution, "status")
+        and getattr(solution.status, "name", str(solution.status)) in ("DETECT", "GRASP")
+    )
     lines = [
         f"step={timestep}",
         f"score={display_score:.2f}",
         f"time={total_elapsed_time:.2f}s",
     ]
+
+    if in_pick_hud and hasattr(solution, "get_video_overlay_lines"):
+        lines.extend(solution.get_video_overlay_lines())
+        return lines
 
     proprio = obs.get("proprio") if isinstance(obs, dict) else None
     if proprio is not None:
@@ -697,6 +728,43 @@ def _configure_taskb_play(env_cfg) -> None:
     _disable_taskd_terminations(env_cfg)
 
 
+def _enable_ground_view_camera(env_cfg) -> None:
+    """Add a follow-cam for low side-view recording (ground_view.mp4)."""
+    from isaaclab.envs import mdp
+    from isaaclab.managers import ObservationTermCfg as ObsTerm
+    from isaaclab.managers import SceneEntityCfg
+    from isaaclab.sensors import CameraCfg
+    import isaaclab.sim as sim_utils
+
+    if not hasattr(env_cfg, "scene"):
+        return
+    env_cfg.scene.ground_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/ground_camera",
+        update_period=0.0,
+        height=480,
+        width=640,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 50.0),
+        ),
+        offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+    )
+    img = getattr(getattr(env_cfg, "observations", None), "image", None)
+    if img is not None:
+        img.ground_rgb = ObsTerm(
+            func=mdp.image,
+            params={
+                "sensor_cfg": SceneEntityCfg("ground_camera"),
+                "data_type": "rgb",
+                "normalize": False,
+            },
+        )
+    print("[play] ground view camera enabled -> ground_view.mp4", flush=True)
+
+
 def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool = False) -> None:
     """Print done flags and best-effort termination cause."""
     term_val = bool(terminated.item() if hasattr(terminated, "item") else terminated)
@@ -775,6 +843,8 @@ def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool
         if is_task_b:
             illegal_flag = False
             circle_done_flag = False
+            illegal_threshold = 1.0
+            illegal_body_patterns = None
             try:
                 tm = getattr(env.unwrapped, "termination_manager", None)
                 if tm is not None:
@@ -790,6 +860,15 @@ def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool
                                 circle_done_flag = val
             except Exception:
                 pass
+            try:
+                cfg = env.unwrapped.cfg
+                tcfg = getattr(getattr(cfg, "terminations", None), "illegal_contact", None)
+                if tcfg is not None and isinstance(getattr(tcfg, "params", None), dict):
+                    illegal_threshold = float(tcfg.params.get("threshold", illegal_threshold))
+                    sensor_cfg = tcfg.params.get("sensor_cfg", None)
+                    illegal_body_patterns = getattr(sensor_cfg, "body_names", None)
+            except Exception:
+                pass
             print(
                 f"[play] infer TaskB terms: fall={int(fall_flag)} "
                 f"time_out={int(time_out_flag)} "
@@ -797,6 +876,45 @@ def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool
                 f"objects_in_circle_done={int(circle_done_flag)}",
                 flush=True,
             )
+            if illegal_flag:
+                try:
+                    scene = env.unwrapped.scene
+                    if hasattr(scene, "sensors") and "contact_sensor" in scene.sensors:
+                        contact_sensor = scene.sensors["contact_sensor"]
+                    else:
+                        contact_sensor = scene["contact_sensor"]
+                    body_names = list(getattr(contact_sensor, "body_names", []))
+                    forces_w = contact_sensor.data.net_forces_w
+                    if forces_w is not None and len(body_names) > 0:
+                        force_norm = forces_w[0].detach().cpu().norm(dim=-1).numpy().tolist()
+                        active = []
+                        for i, (name, fnorm) in enumerate(zip(body_names, force_norm)):
+                            if illegal_body_patterns:
+                                pats = (
+                                    illegal_body_patterns
+                                    if isinstance(illegal_body_patterns, (list, tuple))
+                                    else [illegal_body_patterns]
+                                )
+                                if not any(re.search(str(p), name) for p in pats):
+                                    continue
+                            if float(fnorm) >= illegal_threshold:
+                                active.append((name, float(fnorm), i))
+                        active.sort(key=lambda x: x[1], reverse=True)
+                        if active:
+                            print(
+                                f"[play] illegal_contact bodies (threshold={illegal_threshold:.3f}):",
+                                flush=True,
+                            )
+                            for name, fnorm, _ in active[:12]:
+                                print(f"  - {name}: |F|={fnorm:.3f}", flush=True)
+                        else:
+                            print(
+                                "[play] illegal_contact=1 but no body exceeds threshold in current frame "
+                                "(likely transient previous frame).",
+                                flush=True,
+                            )
+                except Exception as e:
+                    print(f"[play] illegal_contact debug unavailable: {e}", flush=True)
         else:
             x_thresh = 3.5
             try:
@@ -819,6 +937,32 @@ def _print_done_reason(terminated, truncated, info, env=None, *, is_task_b: bool
 def _to_uint8_hwc(frame) -> np.ndarray | None:
     """Convert image tensor/array to uint8 HWC for video writing."""
     return to_uint8_hwc(frame)
+
+
+class GroundViewRecorder:
+    """Record obs['image']['ground_rgb'] to a separate low side-view mp4."""
+
+    def __init__(self, out_path: str, fps: int):
+        self.out_path = os.path.abspath(out_path)
+        self.fps = int(fps)
+        self.writer = None
+
+    def write(self, obs: dict, overlay_lines: list[str] | None = None) -> None:
+        frame = obs_image_rgb(obs, "ground_rgb")
+        if frame is None:
+            return
+        if overlay_lines:
+            frame = draw_text_overlay(frame, overlay_lines)
+        if self.writer is None:
+            os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
+            self.writer = imageio.get_writer(self.out_path, fps=self.fps)
+            print(f"[play] recording ground view: {self.out_path}", flush=True)
+        self.writer.append_data(frame)
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
 
 
 class CameraViewRecorder:
@@ -873,6 +1017,8 @@ def play() -> tuple[float, float]:
 
     if _is_task_b:
         _configure_taskb_play(env_cfg)
+    if args_cli.video and not args_cli.no_ground_video:
+        _enable_ground_view_camera(env_cfg)
 
     if _use_pit_solution and _is_task_d and hasattr(solution, "configure_env_cfg"):
         solution.configure_env_cfg(env_cfg, args_cli)
@@ -954,6 +1100,11 @@ def play() -> tuple[float, float]:
             "[INFO] Video layout: global viewport | head_rgb | ee_rgb (same step, left-to-right).",
             flush=True,
         )
+        if not args_cli.no_ground_video:
+            print(
+                "[INFO] Ground view: separate ground_view.mp4 (low side camera, follows robot).",
+                flush=True,
+            )
 
         # Put videos in ./logs/videos/play by default (edit as you like)
         pit_warmup = (
@@ -961,16 +1112,19 @@ def play() -> tuple[float, float]:
             if getattr(args_cli, "pit_edge_only", False)
             else 0
         )
+        step_trigger = (lambda w: lambda step: step == w)(pit_warmup)
         video_kwargs = {
             "video_folder": os.path.abspath(os.path.join("logs", "videos", args_cli.task, "play")),
-            "step_trigger": lambda step, w=pit_warmup: step == w,
+            "step_trigger": step_trigger,
             "video_length": video_length,
             "disable_logger": True,
         }
         if pit_warmup > 0:
             print(f"[INFO] Pit warmup: {pit_warmup} steps before video recording.", flush=True)
         print("[INFO] Recording videos during play.")
-        print_dict(video_kwargs, nesting=4)
+        print(f"    video_folder: {video_kwargs['video_folder']}")
+        print(f"    step_trigger: step == {pit_warmup}")
+        print(f"    video_length: {video_kwargs['video_length']}")
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
 
@@ -994,6 +1148,14 @@ def play() -> tuple[float, float]:
     obs, _ = env.reset()
     print("[play] env.reset() done, entering control loop.", flush=True)
     camera_recorder = None
+    ground_recorder = None
+    if args_cli.video and not args_cli.no_ground_video:
+        if imageio is None:
+            raise ImportError("imageio is required for ground_view.mp4. Install with: pip install imageio")
+        ground_out = os.path.abspath(
+            os.path.join("logs", "videos", args_cli.task, "play", "ground_view.mp4")
+        )
+        ground_recorder = GroundViewRecorder(out_path=ground_out, fps=args_cli.ground_video_fps)
     if args_cli.save_camera_views:
         if imageio is None:
             raise ImportError("imageio is required for --save-camera-views. Install with: pip install imageio")
@@ -1007,6 +1169,8 @@ def play() -> tuple[float, float]:
 
     if args_cli.video and not is_task_e:
         camera_follow(env)
+    if ground_recorder is not None:
+        ground_camera_follow(env)
     if hasattr(solution, "reset"):
         solution.reset(task=args_cli.task)
     _is_task_b_play = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
@@ -1101,9 +1265,31 @@ def play() -> tuple[float, float]:
                     )
                 )
 
+            if ground_recorder is not None:
+                ground_camera_follow(env)
+
             obs, reward, terminated, truncated, info = env.step(actions)
             if camera_recorder is not None:
                 camera_recorder.write(obs)
+            if ground_recorder is not None:
+                ground_overlay = None
+                if use_video_overlay:
+                    post_elapsed = total_elapsed_time
+                    if isinstance(info, dict) and "Elapsed_Time" in info:
+                        elapsed = info["Elapsed_Time"]
+                        post_elapsed = elapsed.item() if hasattr(elapsed, "item") else float(elapsed)
+                    elif dt is not None:
+                        post_elapsed = total_elapsed_time + dt
+                    ground_overlay = _build_video_overlay_lines(
+                        obs,
+                        env,
+                        solution,
+                        timestep + 1,
+                        display_score,
+                        post_elapsed,
+                        show_box_pose=show_box_pose,
+                    )
+                ground_recorder.write(obs, overlay_lines=ground_overlay)
             if not is_task_e and (args_cli.video or not args_cli.headless):
                 camera_follow(env)
 
@@ -1122,16 +1308,22 @@ def play() -> tuple[float, float]:
             timestep += 1
 
             if args_cli.debug:
-                _debug_print_motion(
-                    obs,
-                    env,
-                    display_score,
-                    total_elapsed_time,
-                    solution=solution,
-                    timestep=timestep,
-                    print_box_pose=show_box_pose,
-                    env_reward=total_episode_reward if platform_score_tracker is not None else None,
+                in_grasp = (
+                    solution is not None
+                    and hasattr(solution, "status")
+                    and getattr(solution.status, "name", str(solution.status)) == "GRASP"
                 )
+                if not in_grasp:
+                    _debug_print_motion(
+                        obs,
+                        env,
+                        display_score,
+                        total_elapsed_time,
+                        solution=solution,
+                        timestep=timestep,
+                        print_box_pose=show_box_pose,
+                        env_reward=total_episode_reward if platform_score_tracker is not None else None,
+                    )
             elif show_box_pose:
                 _print_taskd_box_pose(env, timestep)
 
@@ -1169,6 +1361,8 @@ def play() -> tuple[float, float]:
 
     if camera_recorder is not None:
         camera_recorder.close()
+    if ground_recorder is not None:
+        ground_recorder.close()
     env.close()
 
     final_score = (

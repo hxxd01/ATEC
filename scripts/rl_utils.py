@@ -236,6 +236,56 @@ class RenderOverlayWrapper(gym.Wrapper):
         return frame
 
 
+def _unwrap_play_env(env):
+    base = env
+    while hasattr(base, "env"):
+        base = base.env
+    return base
+
+
+def ground_camera_follow(env, robot_name: str = "robot", env_index: int = 0, alpha: float = 0.15):
+    """Low side-view camera that follows the robot (for ground_view.mp4)."""
+    unwrapped = _unwrap_play_env(env)
+    if not hasattr(unwrapped, "scene"):
+        return
+    try:
+        ground_cam = unwrapped.scene["ground_camera"]
+        robot = unwrapped.scene[robot_name]
+    except KeyError:
+        return
+
+    from isaaclab.utils.math import quat_apply
+
+    device = unwrapped.device
+    robot_pos = robot.data.root_pos_w[env_index]
+    robot_quat = robot.data.root_quat_w[env_index : env_index + 1]
+
+    # Body-frame offsets: behind-left, near ground; look at torso/arm height.
+    eye_local = torch.tensor([[-1.6, -1.3, 0.32]], device=device, dtype=torch.float32)
+    target_local = torch.tensor([[0.9, 0.0, 0.38]], device=device, dtype=torch.float32)
+    eye = quat_apply(robot_quat, eye_local).squeeze(0) + robot_pos
+    lookat = quat_apply(robot_quat, target_local).squeeze(0) + robot_pos
+    eye[2] = torch.clamp(eye[2], min=0.12)
+
+    if not hasattr(ground_camera_follow, "_smooth_eye"):
+        ground_camera_follow._smooth_eye = {}
+        ground_camera_follow._smooth_look = {}
+    if env_index not in ground_camera_follow._smooth_eye:
+        ground_camera_follow._smooth_eye[env_index] = eye.clone()
+        ground_camera_follow._smooth_look[env_index] = lookat.clone()
+
+    smooth_eye = (1.0 - alpha) * ground_camera_follow._smooth_eye[env_index] + alpha * eye
+    smooth_look = (1.0 - alpha) * ground_camera_follow._smooth_look[env_index] + alpha * lookat
+    ground_camera_follow._smooth_eye[env_index] = smooth_eye
+    ground_camera_follow._smooth_look[env_index] = smooth_look
+
+    ground_cam.set_world_poses_from_view(
+        smooth_eye.unsqueeze(0),
+        smooth_look.unsqueeze(0),
+        env_ids=[env_index],
+    )
+
+
 def camera_follow(env, robot_name: str = "robot", env_index: int = 0, alpha: float = 0.15):
     unwrapped = env.unwrapped
 

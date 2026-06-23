@@ -1,4 +1,5 @@
 import os
+import importlib
 from enum import Enum
 
 import numpy as np
@@ -7,28 +8,40 @@ import torch
 
 from demo.utils import approach_dustbin
 try:
-    from ultralytics import YOLO
+    from atec_rl_lab.utils import CartesianController
+    from isaaclab.utils.math import subtract_frame_transforms
 except Exception:  # pragma: no cover
-    YOLO = None
-
-
+    CartesianController = None
+    subtract_frame_transforms = None
 class Status(Enum):
     SEARCH = 1
     LOCK = 2
-    PICK = 3
-    STAND = 4
-    GO_BIN = 5
+    DETECT = 3
+    GRASP = 4
+    STAND = 5
+    GO_BIN = 6
 
 
 class AlgSolution:
     ACTION_SCALE = 0.5
     _SQUAT_STEPS = 100
     _PICK_ARM_STEPS = 25
+    _PICK_SCRIPTED_PRE_STEPS = 34
+    _PICK_SCRIPTED_HOLD_STEPS = 18
     _STAND_STEPS = 80
     _BIN_ARRIVE_DIST = 0.4
     _GO_BIN_ALIGN_RAD = 0.3
     _GO_BIN_WZ_GAIN = 0.8
     _GO_BIN_VX = 1.5
+    _SEARCH_CRUISE_VX = 1.5
+    _SEARCH_DECEL_START_DIST = 1.8
+    _SEARCH_SLOW_VX = 0.4
+    _LOCK_ARRIVE_DIST = float(os.environ.get("ATEC_LOCK_ARRIVE_DIST", "0.25"))
+    _LOCK_LOST_COMMIT_DIST = float(os.environ.get("ATEC_LOCK_LOST_COMMIT_DIST", "0.35"))
+    _LOCK_LOST_COMMIT_STEPS = int(os.environ.get("ATEC_LOCK_LOST_COMMIT_STEPS", "8"))
+    _LOCK_PRE_ZERO_STEPS = int(os.environ.get("ATEC_LOCK_PRE_ZERO_STEPS", "25"))
+    _SEARCH_TRACK_ENABLE_DIST = float(os.environ.get("ATEC_SEARCH_TRACK_ENABLE_DIST", "1.0"))
+    _SEARCH_TRACK_MAX_JUMP = float(os.environ.get("ATEC_SEARCH_TRACK_MAX_JUMP", "0.85"))
     _LEG_JOINT_NAMES = (
         "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
         "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -36,15 +49,81 @@ class AlgSolution:
         "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
     )
     # b2.py default leg PD 160/5; squat position-hold uses stiffer gains.
-    _SQUAT_LEG_STIFFNESS = 640.0
-    _SQUAT_LEG_DAMPING = 20.0
-    _ENABLE_YOLO = True
-    _YOLO_MODEL_PATH = os.environ.get("ATEC_YOLO_MODEL_PATH", "yolo11n.pt")
-    _YOLO_TARGET_CLASS = os.environ.get("ATEC_YOLO_TARGET_CLASS", "banana")
-    _YOLO_CONF = 0.35
-    _YOLO_IOU = 0.45
-    _YOLO_MAX_DET = 12
-    _YOLO_MIN_BOX = 8
+    _SQUAT_LEG_STIFFNESS = 160.0
+    _SQUAT_LEG_DAMPING = 40.0
+    # LOCK low-splay pose for DETECT/GRASP:
+    #   hip: outward (FR/RR -, FL/RL +), thigh/calf: lower trunk close to ground.
+    _LOCK_SPLAY_HIP_MAG = float(os.environ.get("ATEC_LOCK_SPLAY_HIP_MAG", "0.34"))
+    _LOCK_SQUAT_THIGH = float(os.environ.get("ATEC_LOCK_SQUAT_THIGH", "0.78"))
+    _LOCK_SQUAT_CALF = float(os.environ.get("ATEC_LOCK_SQUAT_CALF", "-1.45"))
+    _ENABLE_ANYGRASP = os.environ.get("ATEC_ENABLE_ANYGRASP", "1").strip().lower() in ("1", "true", "yes", "on")
+    _ANYGRASP_CKPT = os.environ.get("ATEC_ANYGRASP_CKPT", "").strip()
+    _ANYGRASP_TOPK = int(os.environ.get("ATEC_ANYGRASP_TOPK", "5"))
+    _ANYGRASP_PRINT_EVERY = 20
+    _PICK_DETECT_CHECK_EVERY = int(os.environ.get("ATEC_PICK_DETECT_CHECK_EVERY", "20"))
+    _PICK_DETECT_MIN_STEPS = int(os.environ.get("ATEC_PICK_DETECT_MIN_STEPS", "2"))
+    _ENABLE_MOVEIT_PICK = os.environ.get("ATEC_ENABLE_MOVEIT_PICK", "0").strip().lower() in ("1", "true", "yes", "on")
+    _MOVEIT_BRIDGE_MODULE = os.environ.get("ATEC_MOVEIT_BRIDGE_MODULE", "demo.piper_moveit_bridge").strip()
+    _MOVEIT_BRIDGE_CLASS = os.environ.get("ATEC_MOVEIT_BRIDGE_CLASS", "MoveItBridge").strip()
+    _GRASP_TOP_OFFSET_RATIO = float(os.environ.get("ATEC_GRASP_TOP_OFFSET_RATIO", "0.5"))
+    _GRASP_TOP_OFFSET_MAX = float(os.environ.get("ATEC_GRASP_TOP_OFFSET_MAX", "0.08"))
+    _GRASP_USE_PCA = os.environ.get("ATEC_GRASP_USE_PCA", "0").strip().lower() in ("1", "true", "yes")
+    _GRASP_ALIGN_YAW_ENABLE = os.environ.get("ATEC_GRASP_ALIGN_YAW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+    _GRASP_ALIGN_YAW_STEPS = int(os.environ.get("ATEC_GRASP_ALIGN_YAW_STEPS", "10"))
+    _GRASP_ALIGN_YAW_GAIN = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_GAIN", "0.7"))
+    _GRASP_ALIGN_YAW_STEP = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_STEP", "0.08"))
+    _GRASP_ALIGN_YAW_SIGN = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_SIGN", "1.0"))
+    _GRASP_ALIGN_YAW_OFFSET = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_OFFSET", "0.0"))
+    _GRASP_ALIGN_YAW_TARGET_CLIP = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_TARGET_CLIP", "1.8"))
+    _GRASP_ALIGN_YAW_ERR_TOL = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_ERR_TOL", "0.08"))
+    _GRASP_WRIST_YAW_EXTRA_MAX = float(os.environ.get("ATEC_GRASP_WRIST_YAW_EXTRA_MAX", "1.2"))
+    _ENABLE_DEPTH_IK_PICK = True
+    _IK_PRE_STEPS = 14
+    _IK_DESCEND_STEPS = 22
+    _IK_CLOSE_STEPS = 14
+    _IK_LIFT_STEPS = 20
+    _IK_ACQUIRE_STEPS = 28
+    _IK_ACQUIRE_MOVE_STEPS = 20
+    # GRASP approach tuning (env overrides for sim tuning).
+    _GRASP_TARGET_FORWARD = float(os.environ.get("ATEC_GRASP_TARGET_FORWARD", "0.12"))#期望前后距离（m）
+    _GRASP_TARGET_LATERAL = float(os.environ.get("ATEC_GRASP_TARGET_LATERAL", "0.0"))#期望左右偏移
+    _GRASP_TARGET_VERTICAL = float(os.environ.get("ATEC_GRASP_TARGET_VERTICAL", "0.00"))#期望高度
+    _GRASP_F_ERR_TOL = float(os.environ.get("ATEC_GRASP_F_ERR_TOL", "0.04"))
+    _GRASP_L_ERR_TOL = float(os.environ.get("ATEC_GRASP_L_ERR_TOL", "0.04"))
+    _GRASP_V_ERR_TOL = float(os.environ.get("ATEC_GRASP_V_ERR_TOL", "0.04"))
+    _GRASP_MIN_APPROACH_STEPS = int(os.environ.get("ATEC_GRASP_MIN_APPROACH_STEPS", "8"))
+    _GRASP_APPROACH_TIMEOUT = int(os.environ.get("ATEC_GRASP_APPROACH_TIMEOUT", "45"))
+    _GRASP_REACHED_HOLD_STEPS = int(os.environ.get("ATEC_GRASP_REACHED_HOLD_STEPS", "4"))
+    _GRASP_TARGET_EMA_ALPHA = float(os.environ.get("ATEC_GRASP_TARGET_EMA_ALPHA", "0.35"))
+    _GRASP_J0_GAIN = float(os.environ.get("ATEC_GRASP_J0_GAIN", "0.85"))  # lateral P -> joint1
+    _GRASP_J0_LATERAL_SIGN = float(os.environ.get("ATEC_GRASP_J0_LATERAL_SIGN", "1.0"))
+    _GRASP_J0_DEADBAND = float(os.environ.get("ATEC_GRASP_J0_DEADBAND", "0.02"))
+    #F负责forward V负责高度 ，j1和j2分别是两个自由度。
+    _GRASP_P_F_J1 = float(os.environ.get("ATEC_GRASP_P_F_J1", "0.6"))
+    _GRASP_P_V_J1 = float(os.environ.get("ATEC_GRASP_P_V_J1", "0.5"))
+    _GRASP_P_F_J2 = float(os.environ.get("ATEC_GRASP_P_F_J2", "-0.75"))
+    _GRASP_P_V_J2 = float(os.environ.get("ATEC_GRASP_P_V_J2", "-0.6"))
+    _GRASP_D_ERR_CLIP = float(os.environ.get("ATEC_GRASP_D_ERR_CLIP", "0.12"))
+    _GRASP_D_L_KD = float(os.environ.get("ATEC_GRASP_D_L_KD", "0.22"))
+    _GRASP_D_F_KD = float(os.environ.get("ATEC_GRASP_D_F_KD", "0.16"))
+    _GRASP_D_V_KD = float(os.environ.get("ATEC_GRASP_D_V_KD", "0.14"))
+    _GRASP_JOINT_STEP_MAX = (
+        float(os.environ.get("ATEC_GRASP_J0_STEP", "0.14")),
+        float(os.environ.get("ATEC_GRASP_J1_STEP", "0.18")),
+        float(os.environ.get("ATEC_GRASP_J2_STEP", "0.18")),
+    )
+    _GRASP_JOINT_EXTRA_MAX = float(os.environ.get("ATEC_GRASP_JOINT_EXTRA_MAX", "1.00"))
+    _GRASP_CLOSE_PUSH_J1 = float(os.environ.get("ATEC_GRASP_CLOSE_PUSH_J1", "0.035"))
+    _GRASP_CLOSE_PUSH_J2 = float(os.environ.get("ATEC_GRASP_CLOSE_PUSH_J2", "-0.022"))
+    _GRASP_DEBUG = os.environ.get("ATEC_GRASP_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+    _GRASP_DEBUG_EVERY = int(os.environ.get("ATEC_GRASP_DEBUG_EVERY", "1"))
+    _DEPTH_CLUSTER_DEBUG = os.environ.get("ATEC_DEPTH_CLUSTER_DEBUG", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    _DIRECT_SQUAT_IK = os.environ.get("ATEC_DIRECT_SQUAT_IK", "0").strip().lower() in ("1", "true", "yes", "on")
     # Geometry-only object selection (no model).
     # Set via env: ATEC_TARGET_OBJECT_CLASS=banana|mustard|sugar|any
     _TARGET_OBJECT_CLASS = os.environ.get("ATEC_TARGET_OBJECT_CLASS", "any")
@@ -76,20 +155,79 @@ class AlgSolution:
         # 仅当目标距离较远时才大幅旋转，近距离时减小旋转以防震荡
         wz = np.clip(k_w * angle_to_target, -max_wz, max_wz)
 
-        # 4. 捡垃圾：仅 SEARCH 阶段触发 LOCK；GO_BIN 不触发
-        if lock_on_arrive and dist < 0.4:
-            self.status = Status.LOCK
-            self.get_down = True
-            self.start_get_down_idx = self.cur_idx
-            self.cmd_max_vx = 0.0
-            self.cmd_max_vy = 0.0
-            self.cmd_max_wz = 0.0
+        # 4. 到达阈值后立即进入 LOCK；pre-zero 在 LOCK 阶段执行（见 predicts）。
+        if lock_on_arrive and dist < self._LOCK_ARRIVE_DIST and self.status == Status.SEARCH:
+            self._begin_lock_prezero(f"arrive dist={dist:.2f}<{self._LOCK_ARRIVE_DIST:.2f}")
             return 0.0, 0.0, 0.0
         # 与 SEARCH 相同：写死 cmd，供策略 obs 里的 velocity_commands 使用
-        self.cmd_max_vy = 0
-        self.cmd_max_wz = 0.8 * -target_x
-        self.cmd_max_vx = 1.5 * 1
+        self.cmd_max_vy = 0.0
+        wz_cmd = float(1.4 * -target_x)
+        if dist < self._SEARCH_DECEL_START_DIST:
+            t = float(np.clip(dist / self._SEARCH_DECEL_START_DIST, 0.0, 1.0))
+            vx_cmd = self._SEARCH_SLOW_VX + (self._SEARCH_CRUISE_VX - self._SEARCH_SLOW_VX) * t
+            wz_cmd *= t
+        else:
+            vx_cmd = self._SEARCH_CRUISE_VX
+        self.cmd_max_wz = wz_cmd
+        self.cmd_max_vx = vx_cmd
         return vx, vy, wz
+
+    def _begin_lock_prezero(self, reason: str) -> None:
+        self.status = Status.LOCK
+        self.get_down = False
+        self._lock_prepare_start_idx = self.cur_idx
+        self.cmd_max_vx = 0.0
+        self.cmd_max_vy = 0.0
+        self.cmd_max_wz = 0.0
+        print(
+            f"[TaskB] -> LOCK pre-zero ({self._LOCK_PRE_ZERO_STEPS} steps, {reason}): "
+            "vx/vy/wz=0 hold",
+            flush=True,
+        )
+
+    def _find_search_target_from_obs(self, obs) -> tuple[np.ndarray | None, float | None]:
+        head_depth = self._obs_depth(obs, "head_depth")
+        target, min_dist = (None, None)
+        if head_depth is not None:
+            target, min_dist = self.find_target_by_depth(head_depth)
+        if target is None:
+            ee_depth = self._obs_depth(obs, "ee_depth")
+            if ee_depth is not None:
+                target, min_dist = self.find_target_by_depth(ee_depth)
+        return target, min_dist
+
+    def _search_near_commit_zone(self) -> bool:
+        if self._search_last_seen_dist is None or self._search_last_seen_step is None:
+            return False
+        return (
+            self._search_last_seen_dist <= self._LOCK_LOST_COMMIT_DIST
+            and (self.cur_idx - self._search_last_seen_step) <= self._LOCK_LOST_COMMIT_STEPS
+        )
+
+    def _search_target_implies_near_loss(
+        self,
+        target: np.ndarray | None,
+        min_dist: float | None,
+    ) -> tuple[bool, str]:
+        if not self._search_near_commit_zone():
+            return False, ""
+        last_dist = float(self._search_last_seen_dist)
+        if target is None or min_dist is None:
+            return True, f"lost_target last_dist={last_dist:.2f}<={self._LOCK_LOST_COMMIT_DIST:.2f}"
+        if float(min_dist) > self._LOCK_LOST_COMMIT_DIST:
+            return True, (
+                f"far_cluster min_dist={float(min_dist):.2f}"
+                f">commit={self._LOCK_LOST_COMMIT_DIST:.2f}"
+                f" last_dist={last_dist:.2f}"
+            )
+        if self._search_track_target is not None:
+            jump = float(np.linalg.norm(target - self._search_track_target))
+            if jump > self._SEARCH_TRACK_MAX_JUMP:
+                return True, (
+                    f"track_jump={jump:.2f}>{self._SEARCH_TRACK_MAX_JUMP:.2f}"
+                    f" last_dist={last_dist:.2f}"
+                )
+        return False, ""
 
     def _obs_depth(self, obs, key: str) -> np.ndarray | None:
         image = obs.get("image")
@@ -124,6 +262,27 @@ class AlgSolution:
         self.cmd_max_wz = 1.0
         self._last_bin_bearing = None
         self._last_bin_dist = None
+        self._ik_phase = None
+        self._ik_phase_start = None
+        self._ik_target_pos_b = None
+        self._ik_lift_pos_b = None
+        self._ik_acquire_pos_b = None
+        self._ik_no_target_count = 0
+        self._last_target_cam = None
+        self._ik_pick_active = False
+        self._pick_arm_hold_cmd = None
+        self._grasp_target_cam = None
+        self._grasp_axis_cam = None
+        self._grasp_target_cam_ema = None
+        self._grasp_reached_hold_count = 0
+        self._grasp_prev_l_err = None
+        self._grasp_prev_f_err = None
+        self._grasp_prev_v_err = None
+        self._grasp_wrist_yaw_target = None
+        self._lock_prepare_start_idx = None
+        self._search_track_target = None
+        self._search_last_seen_dist = None
+        self._search_last_seen_step = None
         print("[TaskB] bin reached -> SEARCH (loop)", flush=True)
 
     def _update_go_bin_cmd(self, obs) -> None:
@@ -162,18 +321,59 @@ class AlgSolution:
         self.cmd_max_wz = float(np.clip(0.4 * bearing_f, -0.4, 0.4))
 
     def bind_env(self, env) -> None:
-        """Attach sim so squat/pick can raise leg PD (play / local only)."""
-        self._env = env
-        self.robot = env.unwrapped.scene["robot"]
-        leg_ids, _ = self.robot.find_joints(list(self._LEG_JOINT_NAMES))
-        self._leg_joint_ids = list(leg_ids)
-        self._default_leg_stiffness = self.robot.data.default_joint_stiffness[
-            :, self._leg_joint_ids
-        ].clone()
-        self._default_leg_damping = self.robot.data.default_joint_damping[
-            :, self._leg_joint_ids
-        ].clone()
+        del env
+        # Pure-vision mode: never read/write simulator internals.
+        self._env = None
+        self.robot = None
         self._squat_pd_active = False
+        self.cartesian_ctrl = None
+        print("[TaskB] visual-IK mode: bind_env ignored.", flush=True)
+
+    def _setup_depth_ik_pick(self) -> None:
+        if not self._ENABLE_DEPTH_IK_PICK:
+            return
+        if CartesianController is None or subtract_frame_transforms is None:
+            print("[TaskB][IK] dependency unavailable, fallback to scripted PICK.", flush=True)
+            return
+        try:
+            self.ee_name = self._resolve_ee_body_name()
+            self.arm_ids = self._resolve_joint_ids(self.ARM_JOINT_NAME_CANDIDATES)
+            all_names = list(getattr(self.robot.data, "joint_names", []))
+            gripper_name_candidates = [
+                "joint7", "joint8",
+                "arm_joint7", "arm_joint8",
+                "left_finger_joint", "right_finger_joint",
+            ]
+            gripper_names = [n for n in gripper_name_candidates if n in all_names]
+            if len(gripper_names) >= 2:
+                self.gripper_ids, _ = self.robot.find_joints(gripper_names[:2])
+                self.gripper_ids = list(self.gripper_ids)
+            else:
+                # Fallback: use the last two non-leg joints as gripper.
+                self.gripper_ids = [18, 19]
+            self.default_joint_pos = self.robot.data.default_joint_pos.clone()
+            self.gripper_open_pos = self.default_joint_pos[:, self.gripper_ids].clone()
+            close_delta = torch.tensor([[0.03, -0.03]], device=self.device, dtype=torch.float32)
+            self.gripper_close_pos = self.gripper_open_pos + close_delta
+            num_envs = int(getattr(self._env.unwrapped, "num_envs", self.robot.data.joint_pos.shape[0]))
+            self.cartesian_ctrl = CartesianController(
+                robot=self.robot,
+                ee_body_name=self.ee_name,
+                arm_joint_names=self.arm_joint_names,
+                num_envs=num_envs,
+                device=self.device,
+                command_type="position",
+                lambda_val=0.08,
+                max_joint_delta=0.08,
+            )
+            print(
+                f"[TaskB][IK] enabled ee={self.ee_name}, arm={self.arm_joint_names}, "
+                f"gripper_ids={self.gripper_ids}",
+                flush=True,
+            )
+        except Exception as e:
+            self.cartesian_ctrl = None
+            print(f"[TaskB][IK] init failed: {e}; fallback to scripted PICK.", flush=True)
 
     def _set_squat_leg_pd(self, enabled: bool) -> None:
         if self._env is None or not hasattr(self, "_leg_joint_ids"):
@@ -273,10 +473,43 @@ class AlgSolution:
         self._target_object_class = self._normalize_target_class(self._TARGET_OBJECT_CLASS)
         self._last_target_class = None
         self._last_target_score = None
-        self._yolo = None
-        self._yolo_names = {}
-        self._yolo_target_class = self._normalize_target_class(self._YOLO_TARGET_CLASS)
-        self._init_yolo()
+        self.cartesian_ctrl = None
+        self.ee_name = None
+        self.arm_ids = None
+        self.gripper_ids = None
+        self.default_joint_pos = None
+        self.gripper_open_pos = None
+        self.gripper_close_pos = None
+        self._ik_phase = None
+        self._ik_phase_start = None
+        self._ik_target_pos_b = None
+        self._ik_lift_pos_b = None
+        self._ik_acquire_pos_b = None
+        self._ik_no_target_count = 0
+        self._last_target_cam = None
+        self._ik_pick_active = False
+        self._pick_arm_hold_cmd = None
+        self._anygrasp = None
+        self._anygrasp_ready = False
+        self._last_anygrasp_score = None
+        self._moveit_bridge = None
+        self._moveit_ready = False
+        self._grasp_target_cam = None
+        self._grasp_axis_cam = None
+        self._grasp_approach_inited = False
+        self._grasp_target_cam_ema = None
+        self._grasp_reached_hold_count = 0
+        self._grasp_prev_l_err = None
+        self._grasp_prev_f_err = None
+        self._grasp_prev_v_err = None
+        self._grasp_close_reason = None
+        self._video_hud_lines: list[str] = []
+        self._lock_prepare_start_idx = None
+        self._search_track_target = None
+        self._search_last_seen_dist = None
+        self._search_last_seen_step = None
+        self._init_anygrasp()
+        self._init_moveit_bridge()
 
     @staticmethod
     def _normalize_target_class(name: str) -> str:
@@ -294,125 +527,145 @@ class AlgSolution:
         }
         return alias.get(s, "any")
 
-    def _class_matches_target(self, cls_name: str) -> bool:
-        c = self._normalize_target_class(cls_name)
-        t = self._yolo_target_class
-        if t == "any":
-            return True
-        if c == t:
-            return True
-        # Open-source COCO fallback aliases.
-        fallback = {
-            "banana": {"banana"},
-            "mustard": {"bottle", "cup", "wineglass"},
-            "sugar": {"book", "cup", "bottle"},
-        }
-        return c in fallback.get(t, {t})
-
-    def _init_yolo(self) -> None:
-        if not self._ENABLE_YOLO:
-            print("[TaskB][YOLO] disabled.", flush=True)
+    def _init_anygrasp(self) -> None:
+        if not self._ENABLE_ANYGRASP:
+            print("[TaskB][AnyGrasp] disabled.", flush=True)
             return
-        if YOLO is None:
-            print("[TaskB][YOLO] ultralytics unavailable, fallback to depth.", flush=True)
+        if not self._ANYGRASP_CKPT:
+            print("[TaskB][AnyGrasp] checkpoint not set (ATEC_ANYGRASP_CKPT).", flush=True)
             return
         try:
-            self._yolo = YOLO(self._YOLO_MODEL_PATH)
+            module = None
+            cls = None
+            for mod_name in ("anygrasp", "gsnet", "graspnetAPI.anygrasp"):
+                try:
+                    module = importlib.import_module(mod_name)
+                    if hasattr(module, "AnyGrasp"):
+                        cls = getattr(module, "AnyGrasp")
+                        break
+                except Exception:
+                    continue
+            if cls is None:
+                raise ImportError("Cannot import AnyGrasp class.")
+            try:
+                self._anygrasp = cls(checkpoint_path=self._ANYGRASP_CKPT)
+            except TypeError:
+                try:
+                    self._anygrasp = cls(checkpoint=self._ANYGRASP_CKPT)
+                except TypeError:
+                    self._anygrasp = cls(self._ANYGRASP_CKPT)
+            if hasattr(self._anygrasp, "load_net"):
+                self._anygrasp.load_net()
+            elif hasattr(self._anygrasp, "load"):
+                try:
+                    self._anygrasp.load()
+                except TypeError:
+                    self._anygrasp.load(self._ANYGRASP_CKPT)
+            self._anygrasp_ready = True
+            print(f"[TaskB][AnyGrasp] loaded ckpt={self._ANYGRASP_CKPT}", flush=True)
+        except Exception as e:
+            self._anygrasp = None
+            self._anygrasp_ready = False
+            print(f"[TaskB][AnyGrasp] init failed: {e}", flush=True)
+
+    def _init_moveit_bridge(self) -> None:
+        if not self._ENABLE_MOVEIT_PICK:
+            print("[TaskB][MoveIt] disabled.", flush=True)
+            return
+        try:
+            module = importlib.import_module(self._MOVEIT_BRIDGE_MODULE)
+            cls = getattr(module, self._MOVEIT_BRIDGE_CLASS)
+            self._moveit_bridge = cls()
+            self._moveit_ready = True
             print(
-                f"[TaskB][YOLO] loaded model={self._YOLO_MODEL_PATH}, target={self._yolo_target_class}",
+                f"[TaskB][MoveIt] bridge ready {self._MOVEIT_BRIDGE_MODULE}.{self._MOVEIT_BRIDGE_CLASS}",
                 flush=True,
             )
         except Exception as e:
-            print(f"[TaskB][YOLO] init failed: {e}; fallback to depth.", flush=True)
-            self._yolo = None
+            self._moveit_bridge = None
+            self._moveit_ready = False
+            print(f"[TaskB][MoveIt] bridge init failed: {e}", flush=True)
 
-    def _pixel_to_cam_point(self, u: float, v: float, depth_val: float) -> np.ndarray:
-        fx, fy = self.K[0, 0], self.K[1, 1]
-        cx, cy = self.K[0, 2], self.K[1, 2]
-        z = -float(depth_val)
-        x = -(float(u) - cx) * z / fx
-        y = (float(v) - cy) * z / fy
-        return np.array([x, y, z], dtype=np.float32)
+    @staticmethod
+    def _grasp_score(g) -> float:
+        for key in ("score", "grasp_score", "confidence"):
+            if hasattr(g, key):
+                return float(getattr(g, key))
+            if isinstance(g, dict) and key in g:
+                return float(g[key])
+        return 0.0
 
-    def _depth_point_from_box(self, depth: np.ndarray, xyxy: np.ndarray) -> tuple[np.ndarray | None, float | None]:
-        if depth is None:
+    @staticmethod
+    def _grasp_translation(g) -> np.ndarray | None:
+        keys = ("translation", "center", "position")
+        for key in keys:
+            if hasattr(g, key):
+                arr = np.asarray(getattr(g, key), dtype=np.float32).reshape(-1)
+                if arr.size >= 3:
+                    return arr[:3]
+            if isinstance(g, dict) and key in g:
+                arr = np.asarray(g[key], dtype=np.float32).reshape(-1)
+                if arr.size >= 3:
+                    return arr[:3]
+        return None
+
+    def _find_target_by_anygrasp(self, rgb: np.ndarray, depth: np.ndarray) -> tuple[np.ndarray | None, float | None]:
+        if not self._anygrasp_ready or self._anygrasp is None or rgb is None or depth is None:
             return None, None
-        d = depth.squeeze()
-        if d.ndim != 2:
-            return None, None
-        h, w = d.shape
-        x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy]
-        x1 = int(np.clip(x1, 0, w - 1))
-        x2 = int(np.clip(x2, 0, w - 1))
-        y1 = int(np.clip(y1, 0, h - 1))
-        y2 = int(np.clip(y2, 0, h - 1))
-        if x2 <= x1 or y2 <= y1:
+        h, w = depth.shape[:2]
+        K = np.asarray(self.K, dtype=np.float32)
+        workspace = np.array([[-0.5, 0.5], [-0.5, 0.5], [0.0, 1.2]], dtype=np.float32)
+        out = None
+        last_e = None
+        for fn_name in ("get_grasp", "inference", "predict", "infer"):
+            if not hasattr(self._anygrasp, fn_name):
+                continue
+            fn = getattr(self._anygrasp, fn_name)
+            try:
+                out = fn(
+                    rgb=rgb,
+                    depth=depth,
+                    camera_intrinsic=K,
+                    workspace_limits=workspace,
+                    topk=max(1, int(self._ANYGRASP_TOPK)),
+                )
+                break
+            except TypeError:
+                try:
+                    out = fn(rgb, depth, K, workspace)
+                    break
+                except Exception as e:
+                    last_e = e
+            except Exception as e:
+                last_e = e
+        if out is None:
+            if self.cur_idx % self._ANYGRASP_PRINT_EVERY == 0 and last_e is not None:
+                print(f"[TaskB][AnyGrasp] inference failed: {last_e}", flush=True)
             return None, None
 
-        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
-        bw = max(3, int((x2 - x1) * 0.4))
-        bh = max(3, int((y2 - y1) * 0.4))
-        sx1 = int(np.clip(cx - bw * 0.5, x1, x2 - 1))
-        sx2 = int(np.clip(cx + bw * 0.5, sx1 + 1, x2))
-        sy1 = int(np.clip(cy - bh * 0.5, y1, y2 - 1))
-        sy2 = int(np.clip(cy + bh * 0.5, sy1 + 1, y2))
-        patch = d[sy1:sy2, sx1:sx2]
-        valid = patch[np.isfinite(patch) & (patch > 0.05) & (patch < 8.0)]
-        if valid.size == 0:
+        grasps = []
+        if isinstance(out, (list, tuple)):
+            if len(out) > 0 and isinstance(out[0], (list, tuple)):
+                grasps = list(out[0])
+            else:
+                grasps = list(out)
+        elif hasattr(out, "grasps"):
+            grasps = list(getattr(out, "grasps"))
+        elif hasattr(out, "__iter__"):
+            grasps = list(out)
+        if len(grasps) == 0:
             return None, None
-        depth_val = float(np.median(valid))
-        point = self._pixel_to_cam_point(cx, cy, depth_val)
-        dist = float(np.linalg.norm(point))
-        return point, dist
 
-    def _find_target_by_yolo(self, rgb: np.ndarray, depth: np.ndarray) -> tuple[np.ndarray | None, float | None]:
-        if self._yolo is None or rgb is None or depth is None:
+        best_g = max(grasps, key=self._grasp_score)
+        trans = self._grasp_translation(best_g)
+        if trans is None:
             return None, None
-        try:
-            pred = self._yolo.predict(
-                source=rgb,
-                conf=self._YOLO_CONF,
-                iou=self._YOLO_IOU,
-                max_det=self._YOLO_MAX_DET,
-                verbose=False,
-            )
-            if not pred:
-                return None, None
-            result = pred[0]
-            boxes = getattr(result, "boxes", None)
-            if boxes is None or boxes.xyxy is None or len(boxes.xyxy) == 0:
-                return None, None
-            names = getattr(result, "names", {})
-            if isinstance(names, dict):
-                self._yolo_names = names
 
-            best = None
-            best_score = None
-            for i in range(len(boxes.xyxy)):
-                cls_id = int(boxes.cls[i].item())
-                conf = float(boxes.conf[i].item())
-                cls_name = self._yolo_names.get(cls_id, str(cls_id))
-                if not self._class_matches_target(cls_name):
-                    continue
-                xyxy = boxes.xyxy[i].detach().cpu().numpy()
-                box_w = float(xyxy[2] - xyxy[0])
-                box_h = float(xyxy[3] - xyxy[1])
-                if box_w < self._YOLO_MIN_BOX or box_h < self._YOLO_MIN_BOX:
-                    continue
-                point, dist = self._depth_point_from_box(depth, xyxy)
-                if point is None:
-                    continue
-                score = conf + 0.25 / max(dist, 0.2)
-                if best_score is None or score > best_score:
-                    best = (point, dist, self._normalize_target_class(cls_name), score)
-                    best_score = score
-            if best is None:
-                return None, None
-            self._last_target_class = best[2]
-            self._last_target_score = float(best[3])
-            return best[0], best[1]
-        except Exception:
-            return None, None
+        # Convert to this codebase camera sign convention (z forward is negative).
+        cam_point = np.array([trans[0], trans[1], -abs(trans[2])], dtype=np.float32)
+        self._last_anygrasp_score = float(self._grasp_score(best_g))
+        dist = float(np.linalg.norm(cam_point))
+        return cam_point, dist
 
     @staticmethod
     def _cluster_shape_features(cur_points: np.ndarray) -> dict | None:
@@ -606,8 +859,93 @@ class AlgSolution:
         self._last_bin_dist = None
         self._last_target_class = None
         self._last_target_score = None
+        self._ik_phase = None
+        self._ik_phase_start = None
+        self._ik_target_pos_b = None
+        self._ik_lift_pos_b = None
+        self._ik_acquire_pos_b = None
+        self._ik_no_target_count = 0
+        self._last_target_cam = None
+        self._ik_pick_active = False
+        self._pick_arm_hold_cmd = None
+        self._grasp_target_cam = None
+        self._grasp_axis_cam = None
+        self._grasp_approach_inited = False
+        self._grasp_target_cam_ema = None
+        self._grasp_reached_hold_count = 0
+        self._grasp_prev_l_err = None
+        self._grasp_prev_f_err = None
+        self._grasp_prev_v_err = None
+        self._grasp_close_reason = None
+        self._grasp_wrist_yaw_target = None
+        self._video_hud_lines = []
+        self._lock_prepare_start_idx = None
+        self._search_track_target = None
+        self._search_last_seen_dist = None
+        self._search_last_seen_step = None
         self._set_squat_leg_pd(False)
         self.cur_idx = 0
+
+    def get_video_overlay_lines(self) -> list[str]:
+        return list(self._video_hud_lines)
+
+    def _set_video_hud(self, *lines: str) -> None:
+        self._video_hud_lines = [str(line) for line in lines if line]
+
+    def _log_grasp_debug(self, tag: str, **fields) -> None:
+        if not self._GRASP_DEBUG:
+            return
+        parts = " ".join(f"{k}={v}" for k, v in fields.items())
+        print(f"[TaskB][GRASP][{tag}] {parts}", flush=True)
+
+    def _live_grasp_target_cam(self, obs) -> np.ndarray | None:
+        """Prefer live ee_depth cluster; fall back to locked target."""
+        ee_depth = self._obs_depth(obs, "ee_depth")
+        if ee_depth is not None:
+            target_cam, _ = self._find_target_cam_by_depth(ee_depth)
+            if target_cam is not None:
+                return target_cam.astype(np.float32)
+        if self._grasp_target_cam is not None:
+            return self._grasp_target_cam.astype(np.float32)
+        return None
+
+    def _clamp_arm_cmd_to_hold(self) -> None:
+        if self._pick_arm_hold_cmd is None:
+            return
+        extra = self._GRASP_JOINT_EXTRA_MAX
+        for i in range(3):
+            lo = self._pick_arm_hold_cmd[i] - extra
+            hi = self._pick_arm_hold_cmd[i] + extra
+            self.v_list[i] = float(np.clip(self.v_list[i], lo, hi))
+
+    def _clamp_wrist_yaw_to_hold(self) -> None:
+        if self._pick_arm_hold_cmd is None:
+            return
+        extra = self._GRASP_WRIST_YAW_EXTRA_MAX
+        lo = self._pick_arm_hold_cmd[3] - extra
+        hi = self._pick_arm_hold_cmd[3] + extra
+        self.v_list[3] = float(np.clip(self.v_list[3], lo, hi))
+
+    def _snapshot_pick_hold_arm_cmd(self) -> None:
+        self._pick_arm_hold_cmd = [float(v) for v in self.v_list]
+
+    def _apply_pick_hold_arm_cmd(
+        self,
+        *,
+        yaw_delta: float = 0.0,
+        j1_delta: float = 0.0,
+        j2_delta: float = 0.0,
+        gripper_close: bool = False,
+    ) -> None:
+        if self._pick_arm_hold_cmd is None:
+            return
+        self.v_list = [float(v) for v in self._pick_arm_hold_cmd]
+        self.v_list[0] += float(yaw_delta)
+        self.v_list[1] += float(j1_delta)
+        self.v_list[2] += float(j2_delta)
+        if gripper_close:
+            self.v_list[6] = -1.0
+            self.v_list[7] = -1.0
 
     def _resolve_joint_ids(self, candidates: tuple[list[str], ...]) -> list[int]:
         for names in candidates:
@@ -630,16 +968,637 @@ class AlgSolution:
                 continue
         raise ValueError("Cannot resolve EE body.")
 
-    def _ensure_cartesian_targets(self):
-        self.cartesian_ctrl.reset()
+    def _current_ee_pose_base(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self._env is None or self.ee_name is None or subtract_frame_transforms is None:
+            return None, None
+        try:
+            ee_body_id, _ = self.robot.find_bodies(self.ee_name)
+            ee_body_id = int(ee_body_id[0])
+            if hasattr(self.robot.data, "root_pose_w") and hasattr(self.robot.data, "body_pose_w"):
+                root_pose_w = self.robot.data.root_pose_w
+                ee_pose_w = self.robot.data.body_pose_w[:, ee_body_id]
+                root_pos_w = root_pose_w[:, :3]
+                root_quat_w = root_pose_w[:, 3:]
+                ee_pos_w = ee_pose_w[:, :3]
+                ee_quat_w = ee_pose_w[:, 3:]
+            else:
+                root_pos_w = self.robot.data.root_pos_w
+                root_quat_w = self.robot.data.root_quat_w
+                ee_pos_w = self.robot.data.body_pos_w[:, ee_body_id]
+                ee_quat_w = self.robot.data.body_quat_w[:, ee_body_id]
+            ee_pos_b, ee_quat_b = subtract_frame_transforms(
+                root_pos_w, root_quat_w, ee_pos_w, ee_quat_w
+            )
+            return ee_pos_b, ee_quat_b
+        except Exception:
+            return None, None
 
-    def _compute_arm_overlay_action(self) -> torch.Tensor:
-        self._ensure_cartesian_targets()
-        arm_jpos_des = self.cartesian_ctrl.compute_base(self.ee_pos_target_b, self.ee_quat_target_b)
-        full_target = self.robot.data.joint_pos.clone()
-        full_target[:, self.arm_ids] = arm_jpos_des
-        full_target[:, self.gripper_ids] = self.gripper_open_pos.repeat(full_target.shape[0], 1)
-        return (full_target - self.default_joint_pos) / self.ACTION_SCALE
+    def _find_target_cam_by_depth(self, depth: np.ndarray) -> tuple[np.ndarray | None, float | None]:
+        if depth is None:
+            return None, None
+        points = self.depth_to_point_cloud(depth.squeeze())
+        if points is None or len(points) < 3:
+            return None, None
+        ground_mask, plane_model = self.detect_ground_ransac(points, distance_threshold=0.03)
+        if plane_model is None or len(ground_mask) != len(points):
+            ground_mask = np.zeros(len(points), dtype=bool)
+        others = points[~ground_mask]
+        if len(others) < 8:
+            return None, None
+        others = np.unique(np.round(others * 35.0), axis=0) / 35.0
+        labels, n_clusters = self.cluster_euclidean_open3d(others, eps=0.08, min_points=8)
+        best, best_dist = None, None
+        for label in range(n_clusters):
+            cur = others[labels == label]
+            if cur.shape[0] < 8:
+                continue
+            centroid = np.mean(cur, axis=0)
+            # Camera depth point uses z<0 in front of the camera.
+            forward = float(-centroid[2])
+            if forward < 0.1 or forward > 1.2:
+                continue
+            dist = float(np.linalg.norm(centroid))
+            if best_dist is None or dist < best_dist:
+                best = centroid
+                best_dist = dist
+        return best, best_dist
+
+    def _extract_local_object_cloud(
+        self, depth: np.ndarray, center_cam: np.ndarray | None
+    ) -> np.ndarray | None:
+        if depth is None:
+            return None
+        points = self.depth_to_point_cloud(depth.squeeze())
+        if points is None or len(points) < 30:
+            return None
+        forward = -points[:, 2]
+        keep = np.isfinite(forward) & (forward > 0.08) & (forward < 1.1)
+        points = points[keep]
+        if len(points) < 20:
+            return None
+        if center_cam is not None:
+            dist = np.linalg.norm(points - center_cam.reshape(1, 3), axis=1)
+            points = points[dist < 0.20]
+            if len(points) < 20:
+                return None
+        points = np.unique(np.round(points * 80.0), axis=0) / 80.0
+        if len(points) < 20:
+            return None
+        labels, n_clusters = self.cluster_euclidean_open3d(points, eps=0.055, min_points=12)
+        if n_clusters <= 0:
+            return None
+        best_cluster = None
+        best_metric = None
+        for label in range(n_clusters):
+            cur = points[labels == label]
+            if len(cur) < 15:
+                continue
+            centroid = np.mean(cur, axis=0)
+            metric = float(np.linalg.norm(centroid - center_cam)) if center_cam is not None else float(np.linalg.norm(centroid))
+            if best_metric is None or metric < best_metric:
+                best_metric = metric
+                best_cluster = cur
+        return best_cluster
+
+    @staticmethod
+    def _estimate_grasp_pose_from_cloud(points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if points is None or len(points) < 12:
+            return None, None
+        centroid = np.mean(points, axis=0).astype(np.float32)
+        centered = points - centroid.reshape(1, 3)
+        cov = centered.T @ centered / max(1, centered.shape[0] - 1)
+        try:
+            eigvals, eigvecs = np.linalg.eigh(cov)
+        except np.linalg.LinAlgError:
+            return centroid, None
+        axis = eigvecs[:, int(np.argmax(eigvals))].astype(np.float32)
+        n = float(np.linalg.norm(axis))
+        if n < 1e-6:
+            return centroid, None
+        axis = axis / n
+        if abs(float(axis[1])) > 0.75:
+            axis[1] = 0.0
+            m = float(np.linalg.norm(axis))
+            if m > 1e-6:
+                axis = axis / m
+        return centroid, axis
+
+    def _build_grasp_pose_from_ee_depth(
+        self, ee_depth: np.ndarray, center_cam: np.ndarray | None
+    ) -> dict | None:
+        local_points = self._extract_local_object_cloud(ee_depth, center_cam)
+        centroid, axis = self._estimate_grasp_pose_from_cloud(local_points)
+        if centroid is None:
+            return None
+        # Grab upper half instead of geometric center: center + ratio * object_height * z_axis.
+        # In this camera frame, -Y is "up".
+        z_axis = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+        object_height = 0.0
+        grasp_center = centroid.astype(np.float32)
+        if local_points is not None and len(local_points) >= 10:
+            proj = np.asarray(local_points @ z_axis.reshape(3, 1), dtype=np.float32).reshape(-1)
+            if proj.size > 0:
+                lo = float(np.percentile(proj, 5.0))
+                hi = float(np.percentile(proj, 95.0))
+                object_height = max(0.0, hi - lo)
+                up_shift = float(
+                    np.clip(
+                        self._GRASP_TOP_OFFSET_RATIO * object_height,
+                        0.0,
+                        self._GRASP_TOP_OFFSET_MAX,
+                    )
+                )
+                grasp_center = (centroid + up_shift * z_axis).astype(np.float32)
+        return {
+            "center_cam": grasp_center,
+            "centroid_cam": centroid.astype(np.float32),
+            "axis_cam": (axis if axis is not None else np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+            "approach_cam": np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            "z_axis_cam": z_axis,
+            "object_height": float(object_height),
+            "num_points": int(local_points.shape[0]) if local_points is not None else 0,
+        }
+
+    def _estimate_grasp_wrist_yaw_target(self, obs) -> float | None:
+        """Estimate desired wrist yaw (v_list[3]) from object major axis in ee camera image plane."""
+        ee_depth = self._obs_depth(obs, "ee_depth")
+        if ee_depth is None:
+            return None
+        center_cam = self._grasp_target_cam_ema if self._grasp_target_cam_ema is not None else self._grasp_target_cam
+        local_points = self._extract_local_object_cloud(ee_depth, center_cam)
+        _, axis = self._estimate_grasp_pose_from_cloud(local_points)
+        if axis is None:
+            return None
+        axis_xy = np.asarray([axis[0], axis[1]], dtype=np.float32)
+        norm_xy = float(np.linalg.norm(axis_xy))
+        if norm_xy < 1e-5:
+            return None
+        axis_xy /= norm_xy
+        # Image-plane major-axis orientation ("横竖"): atan2(y, x).
+        orient_img = float(np.arctan2(axis_xy[1], axis_xy[0]))
+        yaw_target = self._GRASP_ALIGN_YAW_SIGN * orient_img + self._GRASP_ALIGN_YAW_OFFSET
+        return float(np.clip(yaw_target, -self._GRASP_ALIGN_YAW_TARGET_CLIP, self._GRASP_ALIGN_YAW_TARGET_CLIP))
+
+    def _derive_ik_target_base_from_obs(self, obs) -> torch.Tensor | None:
+        ee_pos_b, _ = self._current_ee_pose_base()
+        if ee_pos_b is None:
+            return None
+        cam_point, _ = (None, None)
+        ee_depth = self._obs_depth(obs, "ee_depth")
+        if ee_depth is not None:
+            cam_point, _ = self._find_target_cam_by_depth(ee_depth)
+        if cam_point is None:
+            return None
+        # Heuristic ee-camera -> base delta mapping:
+        #   forward ~= -z, lateral ~= -x, vertical ~= -y.
+        d_forward = float(np.clip(-cam_point[2] - 0.20, -0.15, 0.30))
+        d_lateral = float(np.clip(-cam_point[0], -0.16, 0.16))
+        d_vertical = float(np.clip(-cam_point[1], -0.10, 0.08))
+        target = ee_pos_b.clone()
+        target[:, 0] = target[:, 0] + d_forward
+        target[:, 1] = target[:, 1] + d_lateral
+        target[:, 2] = torch.clamp(target[:, 2] + d_vertical, 0.03, 0.45)
+        return target
+
+    def _compute_ik_pick_arm_action(self, target_pos_b: torch.Tensor, close_gripper: bool) -> torch.Tensor | None:
+        if self.cartesian_ctrl is None or target_pos_b is None:
+            return None
+        try:
+            self.cartesian_ctrl.reset()
+            arm_jpos_des = self.cartesian_ctrl.compute_base(target_pos_b, None)
+            full_target = self.robot.data.joint_pos.clone()
+            full_target[:, self.arm_ids] = arm_jpos_des
+            if close_gripper:
+                full_target[:, self.gripper_ids] = self.gripper_close_pos.repeat(full_target.shape[0], 1)
+            else:
+                full_target[:, self.gripper_ids] = self.gripper_open_pos.repeat(full_target.shape[0], 1)
+            arm_action = (full_target - self.default_joint_pos) / self.ACTION_SCALE
+            return arm_action[:, self.arm_joint_indices]
+        except Exception:
+            return None
+
+    def _try_begin_depth_pick(self, obs, *, during_lower: bool = False) -> bool:
+        """Start depth/PCA pick once an ee-depth object is visible."""
+        if self._ik_pick_active:
+            return True
+        ee_depth = self._obs_depth(obs, "ee_depth")
+        # For PICK trigger: any clustered object in ee_depth is enough.
+        target_cam, _ = self._find_target_cam_by_depth(ee_depth) if ee_depth is not None else (None, None)
+        if target_cam is None or ee_depth is None:
+            return False
+        self._snapshot_pick_hold_arm_cmd()
+        self._last_target_cam = target_cam.astype(np.float32)
+        self._grasp_target_cam = self._last_target_cam.copy()
+        self._grasp_axis_cam = None
+        self._ik_pick_active = True
+        self._ik_no_target_count = 0
+        self.status = Status.GRASP
+        self._ik_phase = "acquire"
+        self._ik_phase_start = self.cur_idx
+        self._apply_pick_hold_arm_cmd()
+        where = "lower" if during_lower else "hold"
+        print(
+            f"[TaskB][DepthPCA] target during {where} -> acquire (realtime PCA in acquire/approach) "
+            f"center={self._grasp_target_cam} arm={self._pick_arm_hold_cmd}",
+            flush=True,
+        )
+        return True
+
+    def _run_pick_detect_stage(self, obs, pick_elapsed: int) -> None:
+        if pick_elapsed < self._PICK_SCRIPTED_PRE_STEPS:
+            self._set_video_hud(
+                f"status=DETECT phase=pre-lower step={pick_elapsed}/{self._PICK_SCRIPTED_PRE_STEPS}",
+                f"arm=[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}]",
+            )
+            # Stage 1: keep lowering while detecting.
+            if pick_elapsed < 10:
+                self.v_list[1] += 0.12
+            self.v_list[1] += 0.12
+            self.v_list[2] -= 0.07
+            if pick_elapsed == 0:
+                print("[TaskB][PICK_DETECT] scripted pre-lower start", flush=True)
+            if (
+                pick_elapsed >= self._PICK_DETECT_MIN_STEPS
+                and pick_elapsed % self._PICK_DETECT_CHECK_EVERY == 0
+            ):
+                self._try_begin_depth_pick(obs, during_lower=True)
+            return
+
+        if pick_elapsed < (self._PICK_SCRIPTED_PRE_STEPS + self._PICK_SCRIPTED_HOLD_STEPS):
+            hold_elapsed = pick_elapsed - self._PICK_SCRIPTED_PRE_STEPS
+            self._set_video_hud(
+                f"status=DETECT phase=hold-detect step={hold_elapsed}/{self._PICK_SCRIPTED_HOLD_STEPS}",
+                f"arm=[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}]",
+            )
+            if pick_elapsed == self._PICK_SCRIPTED_PRE_STEPS:
+                self._snapshot_pick_hold_arm_cmd()
+                print(
+                    f"[TaskB][PICK_DETECT] scripted bottom hold arm={self._pick_arm_hold_cmd}",
+                    flush=True,
+                )
+            self._apply_pick_hold_arm_cmd()
+            if pick_elapsed % self._PICK_DETECT_CHECK_EVERY == 0:
+                self._try_begin_depth_pick(obs, during_lower=False)
+            return
+
+        # After detect window, force transition to grasp stage.
+        self.status = Status.GRASP
+        self._update_ik_pick_state(obs)
+
+    def _run_pick_grasp_stage(self, obs) -> None:
+        # Stage 2: execute grasp controller only.
+        self._update_ik_pick_state(obs)
+
+    def _update_ik_pick_state(self, obs) -> None:
+        # ee_depth local point-cloud center + PCA principal axis.
+        if self._pick_arm_hold_cmd is None:
+            self._snapshot_pick_hold_arm_cmd()
+        if self._ik_phase is None:
+            self._ik_phase = "acquire"
+            self._ik_phase_start = self.cur_idx
+            self._ik_no_target_count = 0
+            self._ik_pick_active = True
+            self._last_target_cam = None
+            self._apply_pick_hold_arm_cmd()
+            print("[TaskB][DepthPCA] PICK acquire start (hold lowered pose)", flush=True)
+            self._set_video_hud("status=GRASP ik=acquire step=0", "scanning ee_depth...")
+            return
+
+        elapsed = self.cur_idx - int(self._ik_phase_start)
+        if self._ik_phase == "acquire":
+            ee_depth = self._obs_depth(obs, "ee_depth")
+            if self._grasp_target_cam is None:
+                target_cam, _ = self._find_target_cam_by_depth(ee_depth) if ee_depth is not None else (None, None)
+                if target_cam is None or ee_depth is None:
+                    self._ik_no_target_count += 1
+                    scan = 0.08 if ((self._ik_no_target_count // 8) % 2 == 0) else -0.08
+                    self._apply_pick_hold_arm_cmd(yaw_delta=scan)
+                    self._set_video_hud(
+                        f"status=GRASP ik=acquire step={elapsed}",
+                        f"no_target count={self._ik_no_target_count}",
+                    )
+                    if self._ik_no_target_count % 15 == 0:
+                        print(
+                            f"[TaskB][DepthPCA] no target yet (count={self._ik_no_target_count})",
+                            flush=True,
+                        )
+                    return
+                self._grasp_target_cam = target_cam.astype(np.float32)
+
+            # Lock-on policy: once grasp target is set, keep using it.
+            # Optional PCA refine (upper-grasp center + bottle axis); off by default.
+            if self._GRASP_USE_PCA and self._grasp_axis_cam is None and ee_depth is not None:
+                grasp_pose = self._build_grasp_pose_from_ee_depth(ee_depth, self._grasp_target_cam)
+                if grasp_pose is not None:
+                    self._grasp_target_cam = grasp_pose["center_cam"].astype(np.float32)
+                    self._grasp_axis_cam = grasp_pose["axis_cam"].astype(np.float32)
+                    print(
+                        f"[TaskB][DepthPCA] lock target center={self._grasp_target_cam} "
+                        f"centroid={grasp_pose.get('centroid_cam')} h={grasp_pose.get('object_height')} "
+                        f"axis={self._grasp_axis_cam}",
+                        flush=True,
+                    )
+
+            self._last_target_cam = self._grasp_target_cam.copy()
+            self._ik_phase = "approach"
+            self._ik_phase_start = self.cur_idx
+            self._grasp_approach_inited = False
+            self._grasp_target_cam_ema = None
+            self._grasp_reached_hold_count = 0
+            self._grasp_prev_l_err = None
+            self._grasp_prev_f_err = None
+            self._grasp_prev_v_err = None
+            self._apply_pick_hold_arm_cmd()
+            print(f"[TaskB][DepthPCA] target acquired and locked center={self._grasp_target_cam}", flush=True)
+            return
+
+        if self._ik_phase == "approach":
+            if not self._grasp_approach_inited:
+                if self._pick_arm_hold_cmd is not None:
+                    self.v_list = [float(v) for v in self._pick_arm_hold_cmd]
+                self._grasp_approach_inited = True
+
+            target_cam_raw = self._live_grasp_target_cam(obs)
+            if target_cam_raw is None:
+                self._log_grasp_debug("approach", phase="approach", elapsed=elapsed, note="no_target")
+                self._set_video_hud(
+                    f"status=GRASP ik=approach step={elapsed}/{self._GRASP_APPROACH_TIMEOUT}",
+                    "no_target in ee_depth",
+                )
+                return
+            if self._grasp_target_cam_ema is None:
+                self._grasp_target_cam_ema = target_cam_raw.copy()
+            else:
+                alpha = float(np.clip(self._GRASP_TARGET_EMA_ALPHA, 0.0, 1.0))
+                self._grasp_target_cam_ema = (
+                    alpha * target_cam_raw + (1.0 - alpha) * self._grasp_target_cam_ema
+                ).astype(np.float32)
+            target_cam = self._grasp_target_cam_ema
+
+            forward = float(-target_cam[2])
+            lateral = float(-target_cam[0])
+            vertical = float(-target_cam[1])
+            dist_3d = float(np.linalg.norm(target_cam))
+
+            f_err = forward - self._GRASP_TARGET_FORWARD
+            l_err = lateral - self._GRASP_TARGET_LATERAL
+            v_err = vertical - self._GRASP_TARGET_VERTICAL
+            lateral_centered = abs(l_err) < self._GRASP_L_ERR_TOL
+
+            d_clip = self._GRASP_D_ERR_CLIP
+            if self._grasp_prev_l_err is None:
+                d_l_err = 0.0
+                d_f_err = 0.0
+                d_v_err = 0.0
+            else:
+                d_l_err = float(np.clip(l_err - self._grasp_prev_l_err, -d_clip, d_clip))
+                d_f_err = float(np.clip(f_err - self._grasp_prev_f_err, -d_clip, d_clip))
+                d_v_err = float(np.clip(v_err - self._grasp_prev_v_err, -d_clip, d_clip))
+
+            reached = (
+                abs(f_err) < self._GRASP_F_ERR_TOL
+                and abs(l_err) < self._GRASP_L_ERR_TOL
+                and abs(v_err) < self._GRASP_V_ERR_TOL
+            )
+            if reached and self._grasp_reached_hold_count == 0:
+                self._grasp_reached_hold_count = 1
+            elif self._grasp_reached_hold_count > 0:
+                self._grasp_reached_hold_count += 1
+
+            hold_freeze = self._grasp_reached_hold_count > 0
+            if hold_freeze:
+                j0 = 0.0
+                j1 = 0.0
+                j2 = 0.0
+            else:
+                axis_yaw_bias = 0.0
+                if (
+                    self._GRASP_USE_PCA
+                    and self._grasp_axis_cam is not None
+                    and not lateral_centered
+                ):
+                    axis_yaw_bias = float(np.clip(0.25 * self._grasp_axis_cam[0], -0.08, 0.08))
+                lateral_for_yaw = 0.0 if lateral_centered or abs(l_err) < self._GRASP_J0_DEADBAND else l_err
+                d_l_for_j0 = 0.0 if lateral_centered else d_l_err
+                j0_max, j1_max, j2_max = self._GRASP_JOINT_STEP_MAX
+                j0_lat = self._GRASP_J0_LATERAL_SIGN * (
+                    self._GRASP_J0_GAIN * lateral_for_yaw + self._GRASP_D_L_KD * d_l_for_j0
+                )
+                j0_raw = j0_lat + axis_yaw_bias
+                j1_raw = (
+                    self._GRASP_P_F_J1 * f_err
+                    + self._GRASP_P_V_J1 * v_err
+                    + self._GRASP_D_F_KD * d_f_err
+                    + self._GRASP_D_V_KD * d_v_err
+                )
+                j2_raw = (
+                    self._GRASP_P_F_J2 * f_err
+                    + self._GRASP_P_V_J2 * v_err
+                    - self._GRASP_D_F_KD * d_f_err
+                    - self._GRASP_D_V_KD * d_v_err
+                )
+                j0 = float(np.clip(j0_raw, -j0_max, j0_max))
+                j1 = float(np.clip(j1_raw, -j1_max, j1_max))
+                j2 = float(np.clip(j2_raw, -j2_max, j2_max))
+                self.v_list[0] += j0
+                self.v_list[1] += j1
+                self.v_list[2] += j2
+                self._clamp_arm_cmd_to_hold()
+
+            force_close = elapsed >= self._GRASP_APPROACH_TIMEOUT
+            reached_hold_done = self._grasp_reached_hold_count >= self._GRASP_REACHED_HOLD_STEPS
+            self._grasp_prev_l_err = float(l_err)
+            self._grasp_prev_f_err = float(f_err)
+            self._grasp_prev_v_err = float(v_err)
+            self._set_video_hud(
+                f"status=GRASP ik=approach step={elapsed}/{self._GRASP_APPROACH_TIMEOUT}",
+                f"forward={forward:.3f} lat={lateral:+.3f} vert={vertical:+.3f} dist3d={dist_3d:.3f}",
+                f"f_err={f_err:+.3f} l_err={l_err:+.3f} v_err={v_err:+.3f} tgt={self._GRASP_TARGET_FORWARD:.2f}",
+                (
+                    f"j0={j0:+.3f} j1={j1:+.3f} j2={j2:+.3f} "
+                    f"reached={reached} hold={self._grasp_reached_hold_count}/{self._GRASP_REACHED_HOLD_STEPS} "
+                    f"freeze={hold_freeze} timeout={force_close}"
+                ),
+                f"arm=[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}] "
+                f"grip=[{self.v_list[6]:.2f},{self.v_list[7]:.2f}]",
+            )
+            if elapsed % self._GRASP_DEBUG_EVERY == 0 or force_close:
+                self._log_grasp_debug(
+                    "approach",
+                    step=elapsed,
+                    forward=f"{forward:.3f}",
+                    lateral=f"{lateral:.3f}",
+                    vertical=f"{vertical:.3f}",
+                    f_err=f"{f_err:.3f}",
+                    l_err=f"{l_err:.3f}",
+                    v_err=f"{v_err:.3f}",
+                    j0=f"{j0:.3f}",
+                    j1=f"{j1:.3f}",
+                    j2=f"{j2:.3f}",
+                    arm=f"[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}]",
+                    grip=f"[{self.v_list[6]:.2f},{self.v_list[7]:.2f}]",
+                    reached=reached,
+                    hold=f"{self._grasp_reached_hold_count}/{self._GRASP_REACHED_HOLD_STEPS}",
+                    freeze=hold_freeze,
+                    d_l=f"{d_l_err:.3f}",
+                    d_f=f"{d_f_err:.3f}",
+                    d_v=f"{d_v_err:.3f}",
+                    force_close=force_close,
+                )
+
+            if (reached_hold_done and elapsed >= self._GRASP_MIN_APPROACH_STEPS) or force_close:
+                if self._moveit_ready and self._moveit_bridge is not None:
+                    try:
+                        ok = bool(
+                            self._moveit_bridge.plan_and_execute_grasp(
+                                {
+                                    "center_cam": self._grasp_target_cam.tolist(),
+                                    "axis_cam": (
+                                        self._grasp_axis_cam.tolist()
+                                        if self._grasp_axis_cam is not None
+                                        else [1.0, 0.0, 0.0]
+                                    ),
+                                }
+                            )
+                        )
+                    except Exception as e:
+                        ok = False
+                        print(f"[TaskB][MoveIt] execution failed: {e}", flush=True)
+                    if ok:
+                        self._ik_phase = "lift"
+                        self._ik_phase_start = self.cur_idx
+                        print("[TaskB][MoveIt] grasp executed, start lift", flush=True)
+                        return
+                self._grasp_wrist_yaw_target = self._estimate_grasp_wrist_yaw_target(obs)
+                if self._GRASP_ALIGN_YAW_ENABLE and self._GRASP_ALIGN_YAW_STEPS > 0:
+                    self._ik_phase = "align_yaw"
+                else:
+                    self._ik_phase = "close"
+                self._ik_phase_start = self.cur_idx
+                reason = "timeout" if force_close and not reached_hold_done else "reached_hold"
+                self._grasp_close_reason = reason
+                next_phase = self._ik_phase
+                print(f"[TaskB][DepthPCA] approach done -> {next_phase} ({reason})", flush=True)
+                not_reached = reason == "timeout"
+                self._set_video_hud(
+                    f"status=GRASP ik={next_phase}-enter reason={reason.upper()}",
+                    "NOT REACHED - forced close by timeout" if not_reached else "position OK - closing gripper",
+                    f"forward={forward:.3f} f_err={f_err:+.3f} dist3d={dist_3d:.3f}",
+                    (
+                        f"arm=[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}] "
+                        f"wrist_yaw={self.v_list[3]:+.2f} yaw_tgt={self._grasp_wrist_yaw_target}"
+                    ),
+                )
+                self._log_grasp_debug(
+                    f"{next_phase}_enter",
+                    step=elapsed,
+                    forward=f"{forward:.3f}",
+                    f_err=f"{f_err:.3f}",
+                    arm=f"[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}]",
+                )
+            return
+
+        if self._ik_phase == "align_yaw":
+            if self._grasp_wrist_yaw_target is None:
+                self._grasp_wrist_yaw_target = self._estimate_grasp_wrist_yaw_target(obs)
+            if elapsed >= self._GRASP_ALIGN_YAW_STEPS:
+                self._ik_phase = "close"
+                self._ik_phase_start = self.cur_idx
+                return
+            yaw_tgt = self._grasp_wrist_yaw_target
+            j3 = 0.0
+            yaw_err = 0.0
+            if yaw_tgt is not None:
+                yaw_err = float(yaw_tgt - self.v_list[3])
+                if abs(yaw_err) > self._GRASP_ALIGN_YAW_ERR_TOL:
+                    j3_raw = self._GRASP_ALIGN_YAW_GAIN * yaw_err
+                    j3 = float(np.clip(j3_raw, -self._GRASP_ALIGN_YAW_STEP, self._GRASP_ALIGN_YAW_STEP))
+                    self.v_list[3] += j3
+                    self._clamp_wrist_yaw_to_hold()
+            self._set_video_hud(
+                f"status=GRASP ik=align_yaw step={elapsed}/{self._GRASP_ALIGN_YAW_STEPS}",
+                (
+                    f"wrist_yaw={self.v_list[3]:+.3f} yaw_tgt="
+                    f"{yaw_tgt:+.3f}" if yaw_tgt is not None else "wrist_yaw_target=none"
+                ),
+                f"yaw_err={yaw_err:+.3f} j3={j3:+.3f}",
+            )
+            if elapsed == 0 or elapsed % self._GRASP_DEBUG_EVERY == 0:
+                self._log_grasp_debug(
+                    "align_yaw",
+                    step=elapsed,
+                    j3=f"{j3:.3f}",
+                    yaw=f"{self.v_list[3]:.3f}",
+                    yaw_tgt=f"{yaw_tgt:.3f}" if yaw_tgt is not None else "none",
+                    yaw_err=f"{yaw_err:.3f}",
+                )
+            return
+
+        if self._ik_phase == "close" and elapsed >= self._IK_CLOSE_STEPS:
+            self._ik_phase = "lift"
+            self._ik_phase_start = self.cur_idx
+            return
+
+        if self._ik_phase == "close":
+            # Keep current arm pose; do not reset to hold snapshot.
+            self.v_list[1] += self._GRASP_CLOSE_PUSH_J1
+            self.v_list[2] += self._GRASP_CLOSE_PUSH_J2
+            self._clamp_arm_cmd_to_hold()
+            self.v_list[6] = -1.0
+            self.v_list[7] = -1.0
+            reason = self._grasp_close_reason or "?"
+            self._set_video_hud(
+                f"status=GRASP ik=close step={elapsed}/{self._IK_CLOSE_STEPS} reason={reason.upper()}",
+                f"arm=[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}] "
+                f"grip=[{self.v_list[6]:.2f},{self.v_list[7]:.2f}]",
+            )
+            if elapsed == 0 or elapsed % self._GRASP_DEBUG_EVERY == 0:
+                self._log_grasp_debug(
+                    "close",
+                    step=elapsed,
+                    arm=f"[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}]",
+                    grip=f"[{self.v_list[6]:.2f},{self.v_list[7]:.2f}]",
+                )
+            return
+
+        if self._ik_phase == "lift":
+            self.v_list[1] -= 0.10
+            self.v_list[2] += 0.08
+            self._clamp_arm_cmd_to_hold()
+            self.v_list[6] = -1.0
+            self.v_list[7] = -1.0
+            self._set_video_hud(
+                f"status=GRASP ik=lift step={elapsed}/{self._IK_LIFT_STEPS}",
+                f"arm=[{self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}] "
+                f"grip=[{self.v_list[6]:.2f},{self.v_list[7]:.2f}]",
+            )
+
+        if self._ik_phase == "lift" and elapsed >= self._IK_LIFT_STEPS:
+            self.status = Status.STAND
+            self.get_down = False
+            self.start_stand_idx = self.cur_idx
+            self.v_list = [0.0 for _ in range(8)]
+            self.cmd_max_vx = 0.0
+            self.cmd_max_vy = 0.0
+            self.cmd_max_wz = 0.0
+            self._ik_phase = None
+            self._ik_phase_start = None
+            self._ik_target_pos_b = None
+            self._ik_lift_pos_b = None
+            self._ik_acquire_pos_b = None
+            self._ik_no_target_count = 0
+            self._last_target_cam = None
+            self._ik_pick_active = False
+            self._pick_arm_hold_cmd = None
+            self._grasp_target_cam = None
+            self._grasp_axis_cam = None
+            self._grasp_target_cam_ema = None
+            self._grasp_reached_hold_count = 0
+            self._grasp_prev_l_err = None
+            self._grasp_prev_f_err = None
+            self._grasp_prev_v_err = None
+            self._grasp_wrist_yaw_target = None
+            print("[TaskB][DepthPCA] GRASP done -> STAND", flush=True)
 
     def _get_velocity_commands(self, proprio: torch.Tensor) -> torch.Tensor:
         b = proprio.shape[0]
@@ -825,64 +1784,69 @@ class AlgSolution:
         cluster_labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
 
         n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-        print(f"Open3D聚类: 找到 {n_clusters} 个物体")
+        if self._DEPTH_CLUSTER_DEBUG or self._GRASP_DEBUG:
+            print(f"Open3D聚类: 找到 {n_clusters} 个物体", flush=True)
         return cluster_labels, n_clusters
 
     def find_target_by_depth(self, depth):
-        points = self.depth_to_point_cloud(depth.squeeze())
-        if points is None or len(points) < 3:
+        if depth is None:
             return None, None
+        depth = np.squeeze(depth)
+        if depth.ndim != 2:
+            return None, None
+
+        points = self.depth_to_point_cloud(depth)
+        if points is None or len(points) < 10:
+            return None, None
+
         ground_mask, plane_model = self.detect_ground_ransac(points, distance_threshold=0.03)
         if plane_model is None or len(ground_mask) != len(points):
             ground_mask = np.zeros(len(points), dtype=bool)
+
         points_flat, R, p0 = self.transform_ground_to_zero(points, plane_model)
         others = points_flat[~ground_mask]
-        if len(others) == 0:
+        if len(others) < 5:
             return None, None
-        others *= 30
-        others = np.unique(np.round(others), axis=0) / 30.0
+
         labels, n_clusters = self.cluster_euclidean_open3d(others)
-        min_dist = None
-        target = None
-        best_cls = None
-        best_score = None
-        target_cls = self._target_object_class
-        # 1. 筛选并计算每个聚类的中心距离
+        if n_clusters == 0:
+            return None, None
+
+        candidates: list[tuple[np.ndarray, float]] = []
         for label in range(n_clusters):
             cur_points = others[labels == label]
             z_max = np.max(cur_points[:, 2])
             if z_max > 0.4:
                 continue
-            feats = self._cluster_shape_features(cur_points)
-            if feats is None:
-                continue
-            # 计算该簇的几何中心
             centroid = np.mean(cur_points, axis=0)
             dist_to_origin = np.linalg.norm(centroid)
-            cls_scores = {
-                "banana": self._class_score(feats, "banana"),
-                "mustard": self._class_score(feats, "mustard"),
-                "sugar": self._class_score(feats, "sugar"),
-            }
-            pred_cls = max(cls_scores, key=cls_scores.get)
-            pred_score = cls_scores[pred_cls]
+            candidates.append((centroid, float(dist_to_origin)))
 
-            # If user wants a specific class, only keep that class.
-            if target_cls != "any" and pred_cls != target_cls:
-                continue
+        if len(candidates) == 0:
+            self._search_track_target = None
+            return None, None
 
-            # Pick candidate by class confidence first, then distance.
-            if (
-                best_score is None
-                or pred_score > best_score + 1e-6
-                or (abs(pred_score - best_score) <= 1e-6 and (min_dist is None or dist_to_origin < min_dist))
-            ):
-                best_score = float(pred_score)
-                best_cls = pred_cls
-                min_dist = float(dist_to_origin)
-                target = centroid
-        self._last_target_class = best_cls
-        self._last_target_score = best_score
+        # Base choice: globally nearest cluster.
+        target, min_dist = min(candidates, key=lambda item: item[1])
+
+        # Continuity constraint:
+        # once close enough (< enable_dist), prefer cluster nearest to last target.
+        if self._search_track_target is not None and (
+            min_dist < self._SEARCH_TRACK_ENABLE_DIST
+            or float(np.linalg.norm(self._search_track_target)) < self._SEARCH_TRACK_ENABLE_DIST
+        ):
+            cont_target, _ = min(
+                candidates,
+                key=lambda item: float(np.linalg.norm(item[0] - self._search_track_target)),
+            )
+            jump = float(np.linalg.norm(cont_target - self._search_track_target))
+            if jump <= self._SEARCH_TRACK_MAX_JUMP:
+                target = cont_target
+                min_dist = float(np.linalg.norm(target))
+        self._search_track_target = target.copy()
+
+        self._last_target_class = None
+        self._last_target_score = None
         return target, min_dist
 
     def predicts(self, obs, current_score):
@@ -894,47 +1858,76 @@ class AlgSolution:
         self.cur_idx += 1
 
         if self.status == Status.SEARCH:
-            if self.cur_idx % 4 == 0:
-                head_depth = self._obs_depth(obs, "head_depth")
-                head_rgb = self._obs_rgb(obs, "head_rgb")
-                target, min_dist = (None, None)
-                if head_rgb is not None and head_depth is not None:
-                    target, min_dist = self._find_target_by_yolo(head_rgb, head_depth)
-                if target is None and head_depth is not None:
-                    target, min_dist = self.find_target_by_depth(head_depth)
-                if target is None:
-                    ee_depth = self._obs_depth(obs, "ee_depth")
-                    ee_rgb = self._obs_rgb(obs, "ee_rgb")
-                    if ee_rgb is not None and ee_depth is not None:
-                        target, min_dist = self._find_target_by_yolo(ee_rgb, ee_depth)
-                    if target is None and ee_depth is not None:
-                        target, min_dist = self.find_target_by_depth(ee_depth)
-                if target is not None:
-                    self.calculate_velocity(target[0], target[1], 1, 0.5, 1)
-                print(
-                    f"[SEARCH] target={target}, min_dist={min_dist}, "
-                    f"cls={self._last_target_class}, cls_score={self._last_target_score}, "
-                    f"want={self._yolo_target_class}",
-                    flush=True,
-                )
-
-        elif self.status == Status.PICK and self.start_pick_idx is not None:
-            if self.cur_idx < self.start_pick_idx + 10:
-                self.v_list[1] += 0.1
-            if self.cur_idx < self.start_pick_idx + self._PICK_ARM_STEPS:
-                self.v_list[1] += 0.1
-                self.v_list[2] -= 0.06
-            elif self.cur_idx >= self.start_pick_idx + self._PICK_ARM_STEPS:
-                self.status = Status.STAND
-                self.get_down = False
-                self.start_stand_idx = self.cur_idx
-                self.v_list = [0.0 for _ in range(8)]
+            if self._DIRECT_SQUAT_IK and self.start_get_down_idx is None:
+                self.status = Status.LOCK
+                self.get_down = True
+                self.start_get_down_idx = self.cur_idx
+                self._lock_prepare_start_idx = None
                 self.cmd_max_vx = 0.0
                 self.cmd_max_vy = 0.0
                 self.cmd_max_wz = 0.0
-                print("[TaskB] PICK done -> STAND", flush=True)
+                print("[TaskB] direct LOCK -> squat for IK pick", flush=True)
+            near_commit_zone = self._search_near_commit_zone()
+            should_detect = (self.cur_idx % 4 == 0) or near_commit_zone
+            if should_detect and not self._DIRECT_SQUAT_IK:
+                target, min_dist = self._find_search_target_from_obs(obs)
+                commit_lock, commit_reason = self._search_target_implies_near_loss(target, min_dist)
+                if commit_lock:
+                    self._begin_lock_prezero(commit_reason)
+                elif target is not None:
+                    if min_dist is not None:
+                        self._search_last_seen_dist = float(min_dist)
+                        self._search_last_seen_step = self.cur_idx
+                    self.calculate_velocity(target[0], target[1], 1, 0.5, 1)
+                print(
+                    f"[SEARCH] target={target}, min_dist={min_dist}, "
+                    f"last_seen={self._search_last_seen_dist}",
+                    flush=True,
+                )
+            pre_steps = 0
+            if self._lock_prepare_start_idx is not None:
+                pre_steps = self.cur_idx - self._lock_prepare_start_idx
+            self._set_video_hud(
+                f"status=SEARCH cmd_vx={self.cmd_max_vx:.2f} cmd_wz={self.cmd_max_wz:.2f}",
+            )
+
+        elif self.status == Status.LOCK:
+            if not self.get_down:
+                if self._lock_prepare_start_idx is None:
+                    self._lock_prepare_start_idx = self.cur_idx
+                pre_elapsed = self.cur_idx - self._lock_prepare_start_idx
+                # Pre-zero: hold still (no depth clustering / no body yaw correction).
+                self.cmd_max_vx = 0.0
+                self.cmd_max_vy = 0.0
+                self.cmd_max_wz = 0.0
+                if pre_elapsed >= self._LOCK_PRE_ZERO_STEPS:
+                    self.get_down = True
+                    self.start_get_down_idx = self.cur_idx
+                    self._lock_prepare_start_idx = None
+                    print("[TaskB] lock pre-zero done -> squat", flush=True)
+                self._set_video_hud(
+                    f"status=LOCK phase=pre-zero step={pre_elapsed}/{self._LOCK_PRE_ZERO_STEPS}",
+                    "cmd_vx=0.00 cmd_vy=0.00 cmd_wz=0.00",
+                )
+            else:
+                squat_elapsed = 0
+                if self.start_get_down_idx is not None:
+                    squat_elapsed = self.cur_idx - self.start_get_down_idx
+                self._set_video_hud(
+                    f"status=LOCK phase=squat step={squat_elapsed}/{self._SQUAT_STEPS}",
+                )
+
+        elif self.status == Status.DETECT and self.start_pick_idx is not None:
+            pick_elapsed = self.cur_idx - self.start_pick_idx
+            self._run_pick_detect_stage(obs, pick_elapsed)
+        elif self.status == Status.GRASP and self.start_pick_idx is not None:
+            self._run_pick_grasp_stage(obs)
 
         elif self.status == Status.STAND and self.start_stand_idx is not None:
+            stand_elapsed = self.cur_idx - self.start_stand_idx
+            self._set_video_hud(
+                f"status=STAND step={stand_elapsed}/{self._STAND_STEPS}",
+            )
             if self.cur_idx >= self.start_stand_idx + self._STAND_STEPS:
                 self.status = Status.GO_BIN
                 print("[TaskB] STAND done -> GO_BIN (LiDAR yaw + depth range)", flush=True)
@@ -946,6 +1939,9 @@ class AlgSolution:
                     f"[GO_BIN] bearing={self._last_bin_bearing} dist={self._last_bin_dist}",
                     flush=True,
                 )
+            self._set_video_hud(
+                f"status=GO_BIN bearing={self._last_bin_bearing} dist={self._last_bin_dist}",
+            )
 
         proprio = obs["proprio"].to(self.device)
 
@@ -978,21 +1974,35 @@ class AlgSolution:
             self.cmd_max_vx = 0.0
             self.cmd_max_vy = 0.0
             self.cmd_max_wz = 0.0
+            hip = self._LOCK_SPLAY_HIP_MAG
+            thigh = self._LOCK_SQUAT_THIGH
+            calf = self._LOCK_SQUAT_CALF
             squat_pose = [
-                0.0, 0.5, -1,
-                0.0, 0.5, -1,
-                0.0, 0.5, -1,
-                0.0, 0.5, -1,
+                -hip, thigh, calf,  # FR
+                +hip, thigh, calf,  # FL
+                -hip, thigh, calf,  # RR
+                +hip, thigh, calf,  # RL
             ]
             if (
                 self.start_get_down_idx is not None
                 and self.cur_idx == self.start_get_down_idx + self._SQUAT_STEPS
             ):
-                self.status = Status.PICK
+                self.status = Status.DETECT
                 self.start_pick_idx = self.cur_idx
-                print("[TaskB] squat done -> PICK", flush=True)
+                self._ik_phase = None
+                self._ik_phase_start = None
+                self._ik_target_pos_b = None
+                self._ik_lift_pos_b = None
+                self._ik_acquire_pos_b = None
+                self._ik_no_target_count = 0
+                self._ik_pick_active = False
+                self._pick_arm_hold_cmd = None
+                self._grasp_target_cam = None
+                self._grasp_axis_cam = None
+                self.v_list = [0.0 for _ in range(8)]
+                print("[TaskB] squat done -> DETECT", flush=True)
             action[:12] = squat_pose
-        if self.status == Status.PICK:
+        if self.status in (Status.DETECT, Status.GRASP):
             action[12:20] = self.v_list
         else:
             action[12:20] = [0.0 for _ in range(8)]

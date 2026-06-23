@@ -372,4 +372,4 @@ python scripts/play_taskd_pit_student_platform.py \
   --pit_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_00-28-28/model_200.pt
 
 DISABLE_O3D_VIS=1 python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper \
-  --depth-lidar --headless --debug --video --video_length 600
+  --depth-lidar --headless --debug --video --video_length 300
