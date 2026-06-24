@@ -7,6 +7,7 @@ import open3d as o3d
 import torch
 
 from demo.utils import approach_dustbin
+
 try:
     from demo.grasp_ik_task_e import (
         ACTION_SCALE as TASKE_ACTION_SCALE,
@@ -33,6 +34,8 @@ try:
 except Exception:  # pragma: no cover
     CartesianController = None
     subtract_frame_transforms = None
+
+
 class Status(Enum):
     SEARCH = 1
     LOCK = 2
@@ -56,7 +59,7 @@ class AlgSolution:
     _SEARCH_CRUISE_VX = 1.5
     _SEARCH_DECEL_START_DIST = 1.8
     _SEARCH_SLOW_VX = 0.4
-    _LOCK_ARRIVE_DIST = float(os.environ.get("ATEC_LOCK_ARRIVE_DIST", "0.25"))
+    _LOCK_ARRIVE_DIST = float(os.environ.get("ATEC_LOCK_ARRIVE_DIST", "0.65"))
     _LOCK_LOST_COMMIT_DIST = float(os.environ.get("ATEC_LOCK_LOST_COMMIT_DIST", "0.35"))
     _LOCK_LOST_COMMIT_STEPS = int(os.environ.get("ATEC_LOCK_LOST_COMMIT_STEPS", "8"))
     _LOCK_PRE_ZERO_STEPS = int(os.environ.get("ATEC_LOCK_PRE_ZERO_STEPS", "25"))
@@ -88,7 +91,8 @@ class AlgSolution:
     _GRASP_TOP_OFFSET_RATIO = float(os.environ.get("ATEC_GRASP_TOP_OFFSET_RATIO", "0.5"))
     _GRASP_TOP_OFFSET_MAX = float(os.environ.get("ATEC_GRASP_TOP_OFFSET_MAX", "0.08"))
     _GRASP_USE_PCA = os.environ.get("ATEC_GRASP_USE_PCA", "0").strip().lower() in ("1", "true", "yes")
-    _GRASP_ALIGN_YAW_ENABLE = os.environ.get("ATEC_GRASP_ALIGN_YAW_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+    _GRASP_ALIGN_YAW_ENABLE = os.environ.get("ATEC_GRASP_ALIGN_YAW_ENABLE", "1").strip().lower() in ("1", "true", "yes",
+                                                                                                     "on")
     _GRASP_ALIGN_YAW_STEPS = int(os.environ.get("ATEC_GRASP_ALIGN_YAW_STEPS", "10"))
     _GRASP_ALIGN_YAW_GAIN = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_GAIN", "0.7"))
     _GRASP_ALIGN_YAW_STEP = float(os.environ.get("ATEC_GRASP_ALIGN_YAW_STEP", "0.08"))
@@ -105,9 +109,9 @@ class AlgSolution:
     _IK_ACQUIRE_STEPS = 28
     _IK_ACQUIRE_MOVE_STEPS = 20
     # GRASP approach tuning (env overrides for sim tuning).
-    _GRASP_TARGET_FORWARD = float(os.environ.get("ATEC_GRASP_TARGET_FORWARD", "0.12"))#期望前后距离（m）
-    _GRASP_TARGET_LATERAL = float(os.environ.get("ATEC_GRASP_TARGET_LATERAL", "0.0"))#期望左右偏移
-    _GRASP_TARGET_VERTICAL = float(os.environ.get("ATEC_GRASP_TARGET_VERTICAL", "0.00"))#期望高度
+    _GRASP_TARGET_FORWARD = float(os.environ.get("ATEC_GRASP_TARGET_FORWARD", "0.12"))  # 期望前后距离（m）
+    _GRASP_TARGET_LATERAL = float(os.environ.get("ATEC_GRASP_TARGET_LATERAL", "0.0"))  # 期望左右偏移
+    _GRASP_TARGET_VERTICAL = float(os.environ.get("ATEC_GRASP_TARGET_VERTICAL", "0.00"))  # 期望高度
     _GRASP_F_ERR_TOL = float(os.environ.get("ATEC_GRASP_F_ERR_TOL", "0.04"))
     _GRASP_L_ERR_TOL = float(os.environ.get("ATEC_GRASP_L_ERR_TOL", "0.04"))
     _GRASP_V_ERR_TOL = float(os.environ.get("ATEC_GRASP_V_ERR_TOL", "0.04"))
@@ -118,7 +122,7 @@ class AlgSolution:
     _GRASP_J0_GAIN = float(os.environ.get("ATEC_GRASP_J0_GAIN", "0.85"))  # lateral P -> joint1
     _GRASP_J0_LATERAL_SIGN = float(os.environ.get("ATEC_GRASP_J0_LATERAL_SIGN", "1.0"))
     _GRASP_J0_DEADBAND = float(os.environ.get("ATEC_GRASP_J0_DEADBAND", "0.02"))
-    #F负责forward V负责高度 ，j1和j2分别是两个自由度。
+    # F负责forward V负责高度 ，j1和j2分别是两个自由度。
     _GRASP_P_F_J1 = float(os.environ.get("ATEC_GRASP_P_F_J1", "0.6"))
     _GRASP_P_V_J1 = float(os.environ.get("ATEC_GRASP_P_V_J1", "0.5"))
     _GRASP_P_F_J2 = float(os.environ.get("ATEC_GRASP_P_F_J2", "-0.75"))
@@ -162,7 +166,7 @@ class AlgSolution:
     )
 
     def calculate_velocity(
-        self, target_x, target_y, max_vx, max_vy, max_wz, k_v=0.5, k_w=1.0, *, lock_on_arrive=True
+            self, target_x, target_y, max_vx, max_vy, max_wz, k_v=0.5, k_w=1.0, *, lock_on_arrive=True
     ):
         """
         target_x, target_y: 目标相对坐标
@@ -217,25 +221,25 @@ class AlgSolution:
         head_depth = self._obs_depth(obs, "head_depth")
         target, min_dist = (None, None)
         if head_depth is not None:
-            target, min_dist = self.find_target_by_depth(head_depth)
+            target, min_dist = self.find_target_by_depth(head_depth, self.head_K)
         if target is None:
             ee_depth = self._obs_depth(obs, "ee_depth")
             if ee_depth is not None:
-                target, min_dist = self.find_target_by_depth(ee_depth)
+                target, min_dist = self.find_target_by_depth(ee_depth, self.ee_K)
         return target, min_dist
 
     def _search_near_commit_zone(self) -> bool:
         if self._search_last_seen_dist is None or self._search_last_seen_step is None:
             return False
         return (
-            self._search_last_seen_dist <= self._LOCK_LOST_COMMIT_DIST
-            and (self.cur_idx - self._search_last_seen_step) <= self._LOCK_LOST_COMMIT_STEPS
+                self._search_last_seen_dist <= self._LOCK_LOST_COMMIT_DIST
+                and (self.cur_idx - self._search_last_seen_step) <= self._LOCK_LOST_COMMIT_STEPS
         )
 
     def _search_target_implies_near_loss(
-        self,
-        target: np.ndarray | None,
-        min_dist: float | None,
+            self,
+            target: np.ndarray | None,
+            min_dist: float | None,
     ) -> tuple[bool, str]:
         if not self._search_near_commit_zone():
             return False, ""
@@ -321,7 +325,7 @@ class AlgSolution:
         fused = approach_dustbin(
             self._obs_extero(obs),
             self._obs_depth(obs, "head_depth"),
-            self.K,
+            self.head_K,
         )
         bearing = fused.get("bearing")
         dist = fused.get("dist")
@@ -554,7 +558,9 @@ class AlgSolution:
         self.start_pick_idx = None
         self.start_pose = None
         self.cur_idx = 0
-        self.K = np.array([[458.12, 0, 320], [0, 458.12, 240], [0, 0, 1]])
+        self.head_K = np.array([[733.0017, 0, 320], [0, 733.0017, 240], [0, 0, 1]])
+        self.ee_K = np.array([[458.12, 0, 320], [0, 458.12, 240], [0, 0, 1]])
+        # self.head_K = self.ee_K
         self._env = None
         self._squat_pd_active = False
         self._target_object_class = self._normalize_target_class(self._TARGET_OBJECT_CLASS)
@@ -704,7 +710,7 @@ class AlgSolution:
         if not self._anygrasp_ready or self._anygrasp is None or rgb is None or depth is None:
             return None, None
         h, w = depth.shape[:2]
-        K = np.asarray(self.K, dtype=np.float32)
+        K = np.asarray(self.head_K, dtype=np.float32)
         workspace = np.array([[-0.5, 0.5], [-0.5, 0.5], [0.0, 1.2]], dtype=np.float32)
         out = None
         last_e = None
@@ -791,27 +797,27 @@ class AlgSolution:
 
         # Banana: elongated in XY, relatively low profile.
         banana = (
-            2.2 * ratio
-            + 1.6 * long_xy
-            - 1.2 * z_ext
-            - 0.7 * short_xy
-            - 0.1 * abs(vol - 0.0025)
+                2.2 * ratio
+                + 1.6 * long_xy
+                - 1.2 * z_ext
+                - 0.7 * short_xy
+                - 0.1 * abs(vol - 0.0025)
         )
         # Mustard bottle: upright-ish, compact XY, higher Z.
         mustard = (
-            2.6 * z_ext
-            - 0.9 * ratio
-            - 1.0 * short_xy
-            + 0.2 * long_xy
-            - 0.1 * abs(vol - 0.0018)
+                2.6 * z_ext
+                - 0.9 * ratio
+                - 1.0 * short_xy
+                + 0.2 * long_xy
+                - 0.1 * abs(vol - 0.0018)
         )
         # Sugar box: moderate XY, less elongated than banana.
         sugar = (
-            1.8 * short_xy
-            + 0.8 * long_xy
-            + 0.6 * z_ext
-            - 1.3 * abs(ratio - 1.4)
-            - 0.1 * abs(vol - 0.0020)
+                1.8 * short_xy
+                + 0.8 * long_xy
+                + 0.6 * z_ext
+                - 1.3 * abs(ratio - 1.4)
+                - 0.1 * abs(vol - 0.0020)
         )
 
         table = {"banana": banana, "mustard": mustard, "sugar": sugar}
@@ -830,8 +836,9 @@ class AlgSolution:
         if os.environ.get("DISABLE_O3D_VIS", "0") == "1":
             self.inited = True
             return
-        self.vis = o3d.visualization.VisualizerWithKeyCallback()
-        self.vis.create_window(window_name="Isaac Lab LiDAR Viewer", width=1024, height=768)
+
+        # self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        # self.vis.create_window(window_name="Isaac Lab LiDAR Viewer", width=1024, height=768)
 
         def space_callback(vis):
             self.key = None
@@ -896,30 +903,30 @@ class AlgSolution:
             self.v_list[2] -= 0.2
             return False
 
-        self.vis.register_key_callback(ord(' '), space_callback)
-        self.vis.register_key_callback(ord('W'), w_key_callback)
-        self.vis.register_key_callback(ord('A'), a_key_callback)
-        self.vis.register_key_callback(ord('S'), s_key_callback)
-        self.vis.register_key_callback(ord('D'), d_key_callback)
-        self.vis.register_key_callback(ord('I'), i_key_callback)
-        self.vis.register_key_callback(ord('K'), k_key_callback)
-        self.vis.register_key_callback(ord('N'), n_key_callback)
-        self.vis.register_key_callback(ord('M'), m_key_callback)
-        self.vis.register_key_callback(ord('G'), key4_callback)
-        self.vis.register_key_callback(ord('J'), key6_callback)
-        self.vis.register_key_callback(ord('Y'), key8_callback)
-        self.vis.register_key_callback(ord('H'), key2_callback)
-
-        self.vis.register_key_callback(ord('O'), o_key_callback)
-        self.vis.register_key_callback(ord('P'), p_key_callback)
-
-        # 创建全局 PointCloud 和坐标系几何体
-        self.pcd = o3d.geometry.PointCloud()
-        self.coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
-
-        # 将几何体添加到渲染器 (此时点云是空的)
-        self.vis.add_geometry(self.pcd)
-        self.vis.add_geometry(self.coord_frame)
+        # self.vis.register_key_callback(ord(' '), space_callback)
+        # self.vis.register_key_callback(ord('W'), w_key_callback)
+        # self.vis.register_key_callback(ord('A'), a_key_callback)
+        # self.vis.register_key_callback(ord('S'), s_key_callback)
+        # self.vis.register_key_callback(ord('D'), d_key_callback)
+        # self.vis.register_key_callback(ord('I'), i_key_callback)
+        # self.vis.register_key_callback(ord('K'), k_key_callback)
+        # self.vis.register_key_callback(ord('N'), n_key_callback)
+        # self.vis.register_key_callback(ord('M'), m_key_callback)
+        # self.vis.register_key_callback(ord('G'), key4_callback)
+        # self.vis.register_key_callback(ord('J'), key6_callback)
+        # self.vis.register_key_callback(ord('Y'), key8_callback)
+        # self.vis.register_key_callback(ord('H'), key2_callback)
+        #
+        # self.vis.register_key_callback(ord('O'), o_key_callback)
+        # self.vis.register_key_callback(ord('P'), p_key_callback)
+        #
+        # # 创建全局 PointCloud 和坐标系几何体
+        # self.pcd = o3d.geometry.PointCloud()
+        # self.coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+        #
+        # # 将几何体添加到渲染器 (此时点云是空的)
+        # self.vis.add_geometry(self.pcd)
+        # self.vis.add_geometry(self.coord_frame)
         self.cur_idx = 0
         self.inited = True
 
@@ -997,7 +1004,7 @@ class AlgSolution:
         """Prefer live ee_depth cluster; fall back to locked target."""
         ee_depth = self._obs_depth(obs, "ee_depth")
         if ee_depth is not None:
-            target_cam, _ = self._find_target_cam_by_depth(ee_depth)
+            target_cam, _ = self._find_target_cam_by_depth(ee_depth, self.ee_K)
             if target_cam is not None:
                 return target_cam.astype(np.float32)
         if self._grasp_target_cam is not None:
@@ -1025,12 +1032,12 @@ class AlgSolution:
         self._pick_arm_hold_cmd = [float(v) for v in self.v_list]
 
     def _apply_pick_hold_arm_cmd(
-        self,
-        *,
-        yaw_delta: float = 0.0,
-        j1_delta: float = 0.0,
-        j2_delta: float = 0.0,
-        gripper_close: bool = False,
+            self,
+            *,
+            yaw_delta: float = 0.0,
+            j1_delta: float = 0.0,
+            j2_delta: float = 0.0,
+            gripper_close: bool = False,
     ) -> None:
         if self._pick_arm_hold_cmd is None:
             return
@@ -1088,10 +1095,10 @@ class AlgSolution:
         except Exception:
             return None, None
 
-    def _find_target_cam_by_depth(self, depth: np.ndarray) -> tuple[np.ndarray | None, float | None]:
+    def _find_target_cam_by_depth(self, depth: np.ndarray, k) -> tuple[np.ndarray | None, float | None]:
         if depth is None:
             return None, None
-        points = self.depth_to_point_cloud(depth.squeeze())
+        points = self.depth_to_point_cloud(depth.squeeze(), k)
         if points is None or len(points) < 3:
             return None, None
         ground_mask, plane_model = self.detect_ground_ransac(points, distance_threshold=0.03)
@@ -1119,11 +1126,11 @@ class AlgSolution:
         return best, best_dist
 
     def _extract_local_object_cloud(
-        self, depth: np.ndarray, center_cam: np.ndarray | None
+            self, depth: np.ndarray, center_cam: np.ndarray | None, k
     ) -> np.ndarray | None:
         if depth is None:
             return None
-        points = self.depth_to_point_cloud(depth.squeeze())
+        points = self.depth_to_point_cloud(depth.squeeze(), k)
         if points is None or len(points) < 30:
             return None
         forward = -points[:, 2]
@@ -1149,7 +1156,8 @@ class AlgSolution:
             if len(cur) < 15:
                 continue
             centroid = np.mean(cur, axis=0)
-            metric = float(np.linalg.norm(centroid - center_cam)) if center_cam is not None else float(np.linalg.norm(centroid))
+            metric = float(np.linalg.norm(centroid - center_cam)) if center_cam is not None else float(
+                np.linalg.norm(centroid))
             if best_metric is None or metric < best_metric:
                 best_metric = metric
                 best_cluster = cur
@@ -1179,9 +1187,9 @@ class AlgSolution:
         return centroid, axis
 
     def _build_grasp_pose_from_ee_depth(
-        self, ee_depth: np.ndarray, center_cam: np.ndarray | None
+            self, ee_depth: np.ndarray, center_cam: np.ndarray | None
     ) -> dict | None:
-        local_points = self._extract_local_object_cloud(ee_depth, center_cam)
+        local_points = self._extract_local_object_cloud(ee_depth, center_cam, self.ee_K)
         centroid, axis = self._estimate_grasp_pose_from_cloud(local_points)
         if centroid is None:
             return None
@@ -1241,7 +1249,7 @@ class AlgSolution:
         cam_point, _ = (None, None)
         ee_depth = self._obs_depth(obs, "ee_depth")
         if ee_depth is not None:
-            cam_point, _ = self._find_target_cam_by_depth(ee_depth)
+            cam_point, _ = self._find_target_cam_by_depth(ee_depth, self.ee_K)
         if cam_point is None:
             return None
         # Heuristic ee-camera -> base delta mapping:
@@ -1274,11 +1282,11 @@ class AlgSolution:
 
     def _grasp_use_task_e_ik(self) -> bool:
         return (
-            self._GRASP_USE_TASKE_IK
-            and self._env is not None
-            and self.cartesian_ctrl is not None
-            and TaskEGraspOnlySM is not None
-            and compute_grasp_quat is not None
+                self._GRASP_USE_TASKE_IK
+                and self._env is not None
+                and self.cartesian_ctrl is not None
+                and TaskEGraspOnlySM is not None
+                and compute_grasp_quat is not None
         )
 
     def _get_object_asset(self, obj_idx: int):
@@ -1450,7 +1458,7 @@ class AlgSolution:
         if self._ik_pick_active:
             return True
         ee_depth = self._obs_depth(obs, "ee_depth")
-        target_cam, _ = self._find_target_cam_by_depth(ee_depth) if ee_depth is not None else (None, None)
+        target_cam, _ = self._find_target_cam_by_depth(ee_depth, self.ee_K) if ee_depth is not None else (None, None)
         if target_cam is None or ee_depth is None:
             return False
         if self._grasp_use_task_e_ik():
@@ -1491,8 +1499,8 @@ class AlgSolution:
             if pick_elapsed == 0:
                 print("[TaskB][PICK_DETECT] scripted pre-lower start", flush=True)
             if (
-                pick_elapsed >= self._PICK_DETECT_MIN_STEPS
-                and pick_elapsed % self._PICK_DETECT_CHECK_EVERY == 0
+                    pick_elapsed >= self._PICK_DETECT_MIN_STEPS
+                    and pick_elapsed % self._PICK_DETECT_CHECK_EVERY == 0
             ):
                 self._try_begin_depth_pick(obs, during_lower=True)
             return
@@ -1543,7 +1551,8 @@ class AlgSolution:
         if self._ik_phase == "acquire":
             ee_depth = self._obs_depth(obs, "ee_depth")
             if self._grasp_target_cam is None:
-                target_cam, _ = self._find_target_cam_by_depth(ee_depth) if ee_depth is not None else (None, None)
+                target_cam, _ = self._find_target_cam_by_depth(ee_depth, self.ee_K) if ee_depth is not None else (None,
+                                                                                                                  None)
                 if target_cam is None or ee_depth is None:
                     self._ik_no_target_count += 1
                     scan = 0.08 if ((self._ik_no_target_count // 8) % 2 == 0) else -0.08
@@ -1606,7 +1615,7 @@ class AlgSolution:
             else:
                 alpha = float(np.clip(self._GRASP_TARGET_EMA_ALPHA, 0.0, 1.0))
                 self._grasp_target_cam_ema = (
-                    alpha * target_cam_raw + (1.0 - alpha) * self._grasp_target_cam_ema
+                        alpha * target_cam_raw + (1.0 - alpha) * self._grasp_target_cam_ema
                 ).astype(np.float32)
             target_cam = self._grasp_target_cam_ema
 
@@ -1631,9 +1640,9 @@ class AlgSolution:
                 d_v_err = float(np.clip(v_err - self._grasp_prev_v_err, -d_clip, d_clip))
 
             reached = (
-                abs(f_err) < self._GRASP_F_ERR_TOL
-                and abs(l_err) < self._GRASP_L_ERR_TOL
-                and abs(v_err) < self._GRASP_V_ERR_TOL
+                    abs(f_err) < self._GRASP_F_ERR_TOL
+                    and abs(l_err) < self._GRASP_L_ERR_TOL
+                    and abs(v_err) < self._GRASP_V_ERR_TOL
             )
             if reached and self._grasp_reached_hold_count == 0:
                 self._grasp_reached_hold_count = 1
@@ -1648,29 +1657,29 @@ class AlgSolution:
             else:
                 axis_yaw_bias = 0.0
                 if (
-                    self._GRASP_USE_PCA
-                    and self._grasp_axis_cam is not None
-                    and not lateral_centered
+                        self._GRASP_USE_PCA
+                        and self._grasp_axis_cam is not None
+                        and not lateral_centered
                 ):
                     axis_yaw_bias = float(np.clip(0.25 * self._grasp_axis_cam[0], -0.08, 0.08))
                 lateral_for_yaw = 0.0 if lateral_centered or abs(l_err) < self._GRASP_J0_DEADBAND else l_err
                 d_l_for_j0 = 0.0 if lateral_centered else d_l_err
                 j0_max, j1_max, j2_max = self._GRASP_JOINT_STEP_MAX
                 j0_lat = self._GRASP_J0_LATERAL_SIGN * (
-                    self._GRASP_J0_GAIN * lateral_for_yaw + self._GRASP_D_L_KD * d_l_for_j0
+                        self._GRASP_J0_GAIN * lateral_for_yaw + self._GRASP_D_L_KD * d_l_for_j0
                 )
                 j0_raw = j0_lat + axis_yaw_bias
                 j1_raw = (
-                    self._GRASP_P_F_J1 * f_err
-                    + self._GRASP_P_V_J1 * v_err
-                    + self._GRASP_D_F_KD * d_f_err
-                    + self._GRASP_D_V_KD * d_v_err
+                        self._GRASP_P_F_J1 * f_err
+                        + self._GRASP_P_V_J1 * v_err
+                        + self._GRASP_D_F_KD * d_f_err
+                        + self._GRASP_D_V_KD * d_v_err
                 )
                 j2_raw = (
-                    self._GRASP_P_F_J2 * f_err
-                    + self._GRASP_P_V_J2 * v_err
-                    - self._GRASP_D_F_KD * d_f_err
-                    - self._GRASP_D_V_KD * d_v_err
+                        self._GRASP_P_F_J2 * f_err
+                        + self._GRASP_P_V_J2 * v_err
+                        - self._GRASP_D_F_KD * d_f_err
+                        - self._GRASP_D_V_KD * d_v_err
                 )
                 j0 = float(np.clip(j0_raw, -j0_max, j0_max))
                 j1 = float(np.clip(j1_raw, -j1_max, j1_max))
@@ -1983,12 +1992,12 @@ class AlgSolution:
         # 平面模型: [a, b, c, d] 满足 a*x + b*y + c*z + d = 0
         return ground_mask, plane_model
 
-    def depth_to_point_cloud(self, depth_map):
+    def depth_to_point_cloud(self, depth_map, k):
         height, width = depth_map.shape
         # 1. 创建像素网格
         i, j = np.meshgrid(np.arange(width), np.arange(height), indexing='xy')
         # 2. 将像素坐标转换为相机坐标系下的点
-        K = self.K
+        K = k
         z = -depth_map
         x = -(i - K[0, 2]) * z / K[0, 0]
         y = (j - K[1, 2]) * z / K[1, 1]
@@ -1997,7 +2006,7 @@ class AlgSolution:
         point_cloud = np.stack((x, y, z), axis=-1).reshape(-1, 3)
 
         # 过滤掉无效深度值 (例如远端截断值)
-        valid_mask = (depth_map > 0.05) & (depth_map < 50.0)
+        valid_mask = (depth_map > 0.1) & (depth_map < 50.0)
         return point_cloud[valid_mask.reshape(-1)]
 
     def transform_ground_to_zero(self, points, plane_model):
@@ -2063,14 +2072,14 @@ class AlgSolution:
             print(f"Open3D聚类: 找到 {n_clusters} 个物体", flush=True)
         return cluster_labels, n_clusters
 
-    def find_target_by_depth(self, depth):
+    def find_target_by_depth(self, depth, k):
         if depth is None:
             return None, None
         depth = np.squeeze(depth)
         if depth.ndim != 2:
             return None, None
 
-        points = self.depth_to_point_cloud(depth)
+        points = self.depth_to_point_cloud(depth, k)
         if points is None or len(points) < 10:
             return None, None
 
@@ -2091,7 +2100,7 @@ class AlgSolution:
         for label in range(n_clusters):
             cur_points = others[labels == label]
             z_max = np.max(cur_points[:, 2])
-            if z_max > 0.4:
+            if z_max > 0.04:
                 continue
             centroid = np.mean(cur_points, axis=0)
             dist_to_origin = np.linalg.norm(centroid)
@@ -2107,8 +2116,8 @@ class AlgSolution:
         # Continuity constraint:
         # once close enough (< enable_dist), prefer cluster nearest to last target.
         if self._search_track_target is not None and (
-            min_dist < self._SEARCH_TRACK_ENABLE_DIST
-            or float(np.linalg.norm(self._search_track_target)) < self._SEARCH_TRACK_ENABLE_DIST
+                min_dist < self._SEARCH_TRACK_ENABLE_DIST
+                or float(np.linalg.norm(self._search_track_target)) < self._SEARCH_TRACK_ENABLE_DIST
         ):
             cont_target, _ = min(
                 candidates,
@@ -2239,7 +2248,7 @@ class AlgSolution:
         action_dim = (int(proprio.shape[-1]) - 12) // 3
         action = [0 for _ in range(action_dim)]
         use_policy_legs = self.status in (Status.SEARCH, Status.STAND, Status.GO_BIN) or (
-            self.status == Status.LOCK and not self.get_down
+                self.status == Status.LOCK and not self.get_down
         )
         self._set_squat_leg_pd(not use_policy_legs)
         if use_policy_legs:
@@ -2259,8 +2268,8 @@ class AlgSolution:
                 +hip, thigh, calf,  # RL
             ]
             if (
-                self.start_get_down_idx is not None
-                and self.cur_idx == self.start_get_down_idx + self._SQUAT_STEPS
+                    self.start_get_down_idx is not None
+                    and self.cur_idx == self.start_get_down_idx + self._SQUAT_STEPS
             ):
                 self.status = Status.DETECT
                 self.start_pick_idx = self.cur_idx
