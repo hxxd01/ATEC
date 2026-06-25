@@ -50,7 +50,12 @@ parser.add_argument(
 parser.add_argument("--tiled_cameras", action="store_true", help="Use TiledCameraCfg for head/ee.")
 parser.add_argument("--camera_far_clip", type=float, default=50.0)
 parser.add_argument("--nav_log_interval", type=int, default=10)
-parser.add_argument("--w_dense_dist", type=float, default=0.3, help="Dense reward scale for visible unscored EE-3D progress.")
+parser.add_argument(
+    "--w_dense_dist",
+    type=float,
+    default=0.1,
+    help="Guide progress scale: w * max(0, prev_min_3d - min_3d_unscored).",
+)
 parser.add_argument(
     "--sparse_only",
     action="store_true",
@@ -85,12 +90,12 @@ parser.add_argument(
     "--visible_depth_tol",
     type=float,
     default=0.25,
-    help="Depth occlusion tolerance (m) when --visible_check_depth is set.",
+    help="(Deprecated) kept for backward compatibility.",
 )
 parser.add_argument(
     "--visible_check_depth",
     action="store_true",
-    help="Enable depth-buffer occlusion for dense visible target (slower; default is frustum-only).",
+    help="(Deprecated) kept for backward compatibility.",
 )
 parser.add_argument("--video", action="store_true", default=False, help="Record rollout video(s) during training.")
 parser.add_argument(
@@ -382,9 +387,8 @@ def main():
         f"[INFO] TaskB nav train: num_envs={args_cli.num_envs} inner_steps={args_cli.inner_steps} "
         f"sim_cam={cam_h}x{cam_w} policy={policy_h}x{policy_w} "
         f"cams=head+ee img={img_ch}ch depth_only={args_cli.depth_only} "
-        f"rewards dense={args_cli.w_dense_dist} sparse={args_cli.sparse_touch_reward} "
+        f"rewards guide_prog={args_cli.w_dense_dist} sparse={args_cli.sparse_touch_reward} "
         f"sparse_only={args_cli.sparse_only} "
-        f"visible_depth={args_cli.visible_check_depth} depth_tol={args_cli.visible_depth_tol} "
         f"time_pen={args_cli.time_penalty_per_env_step} no_touch_timeout_s={args_cli.no_touch_timeout_s} "
         f"finished_reward={args_cli.finished_reward}",
         flush=True,

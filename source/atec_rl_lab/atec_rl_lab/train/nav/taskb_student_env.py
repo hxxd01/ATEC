@@ -55,6 +55,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         finished_reward: float = 100.0,
         visible_depth_tol: float = 0.25,
         visible_check_depth: bool = False,
+        guide_milestone_thresholds: tuple[float, ...] = (1.2, 0.8, 0.5, 0.3),
+        guide_milestone_rewards: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4),
     ):
         super().__init__(
             env=env,
@@ -85,6 +87,14 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._visible_depth_tol = float(visible_depth_tol)
         self._visible_check_depth = bool(visible_check_depth)
         self._env_step_dt = float(getattr(self.env.unwrapped, "step_dt", 0.02))
+        if len(guide_milestone_thresholds) != len(guide_milestone_rewards):
+            raise ValueError("guide_milestone_thresholds and guide_milestone_rewards must have same length.")
+        self._guide_thresholds = torch.tensor(
+            guide_milestone_thresholds, device=self._device, dtype=torch.float32
+        )
+        self._guide_rewards = torch.tensor(
+            guide_milestone_rewards, device=self._device, dtype=torch.float32
+        )
 
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
         self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
@@ -106,6 +116,12 @@ class TaskBStudentEnv(TaskDStudentEnv):
             float("nan"),
             device=self._device,
             dtype=torch.float32,
+        )
+        self._prev_min_guide_dist = torch.full(
+            (self.num_envs,), float("nan"), device=self._device, dtype=torch.float32
+        )
+        self._guide_milestone_hit = torch.zeros(
+            (self.num_envs, self._guide_thresholds.numel()), device=self._device, dtype=torch.bool
         )
         self._scored = torch.zeros(
             (self.num_envs, TASK_B_NUM_OBJECTS), device=self._device, dtype=torch.bool
@@ -139,8 +155,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         print(
             f"[TaskBStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
             f"(+{self._critic_extra_dim} priv: robot/ee/r_vel/contact/min_dist/scored/trash) "
-            f"dense_w={self._w_dense_dist} dense={'visible_per_object_3d' if self._dense_enabled else 'off(sparse_only)'} "
-            f"depth_check={self._visible_check_depth} depth_tol={self._visible_depth_tol} "
+            f"guide_w_prog={self._w_dense_dist} guide=min_3d_progress+milestones "
+            f"milestones={guide_milestone_thresholds}->{guide_milestone_rewards} "
+            f"guide_on={self._dense_enabled} "
             f"sparse_touch={self._sparse_touch_reward} "
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
@@ -326,6 +343,53 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         return dense
 
+    def _guide_min_dist_reward(
+        self,
+        dist_3d_all: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sparse guidance from EE to nearest unscored object (no camera projection).
+
+        - progress: ``w * max(0, prev_min - min_dist)``
+        - milestones: one-time bonuses on first crossing distance thresholds
+        """
+        valid_obj = ~self._scored
+        update_mask = torch.ones(self.num_envs, device=self._device, dtype=torch.bool)
+        if active_mask is not None:
+            valid_obj = valid_obj & active_mask.unsqueeze(-1)
+            update_mask = active_mask
+
+        masked = dist_3d_all.masked_fill(~valid_obj, float("inf"))
+        min_dist, _ = masked.min(dim=1)
+        has_target = torch.isfinite(min_dist)
+
+        progress = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        prev = self._prev_min_guide_dist
+        valid_prog = has_target & torch.isfinite(prev)
+        progress = torch.where(
+            valid_prog,
+            self._w_dense_dist * torch.clamp(prev - min_dist, min=0.0),
+            progress,
+        )
+
+        crossed = (
+            has_target.unsqueeze(-1)
+            & (~self._guide_milestone_hit)
+            & (min_dist.unsqueeze(-1) <= self._guide_thresholds.unsqueeze(0))
+        )
+        milestone = (crossed.to(dtype=torch.float32) * self._guide_rewards.unsqueeze(0)).sum(dim=1)
+
+        new_hit = self._guide_milestone_hit | crossed
+        self._guide_milestone_hit = torch.where(
+            update_mask.unsqueeze(-1),
+            new_hit,
+            self._guide_milestone_hit,
+        )
+
+        new_prev = torch.where(has_target, min_dist, torch.full_like(min_dist, float("nan")))
+        self._prev_min_guide_dist = torch.where(update_mask, new_prev, self._prev_min_guide_dist)
+        return progress, milestone
+
     def _env_origins(self) -> torch.Tensor:
         origins = self.env.unwrapped.scene.env_origins.to(device=self._device, dtype=torch.float32)
         return origins[:, :3]
@@ -419,6 +483,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
             for _ in range(int(base.cfg.num_rerenders_on_reset)):
                 base.sim.render()
         self._prev_obj_dist_3d[env_ids] = float("nan")
+        self._prev_min_guide_dist[env_ids] = float("nan")
+        self._guide_milestone_hit[env_ids] = False
         self._scored[env_ids] = False
         self._time_since_last_touch_s[env_ids] = 0.0
         self._episode_finished[env_ids] = False
@@ -428,6 +494,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         obs, info = self.env.reset(**kwargs)
         self._current_obs = obs
         self._prev_obj_dist_3d.fill_(float("nan"))
+        self._prev_min_guide_dist.fill_(float("nan"))
+        self._guide_milestone_hit.fill_(False)
         self._scored.fill_(False)
         self._time_since_last_touch_s.zero_()
         self._episode_finished.zero_()
@@ -463,6 +531,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
 
         total_reward = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_dense = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_guide_prog = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_guide_mile = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_sparse = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_finished = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_time_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
@@ -509,11 +579,13 @@ class TaskBStudentEnv(TaskDStudentEnv):
             )
 
             if self._dense_enabled:
-                visible_unscored = self._visible_unscored_mask(obj_pos)
-                dense = self._dense_visible_per_object_progress(
-                    dist_3d_all, visible_unscored, active_mask=active_after_base_done
+                guide_prog, guide_mile = self._guide_min_dist_reward(
+                    dist_3d_all, active_mask=active_after_base_done
                 )
+                dense = guide_prog + guide_mile
             else:
+                guide_prog = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+                guide_mile = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
                 dense = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
             time_pen = torch.full_like(dense, -self._time_penalty_per_env_step)
 
@@ -543,6 +615,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
             step_rew = (dense + sparse + time_pen) * alive_f + finished_bonus
             total_reward += step_rew
             total_dense += dense * alive_f
+            total_guide_prog += guide_prog * alive_f
+            total_guide_mile += guide_mile * alive_f
             total_sparse += sparse * alive_f
             total_finished += finished_bonus * alive_f
             total_time_pen += time_pen * alive_f
@@ -562,6 +636,16 @@ class TaskBStudentEnv(TaskDStudentEnv):
                     done_now.unsqueeze(-1),
                     torch.full_like(self._prev_obj_dist_3d, float("nan")),
                     self._prev_obj_dist_3d,
+                )
+                self._prev_min_guide_dist = torch.where(
+                    done_now,
+                    torch.full_like(self._prev_min_guide_dist, float("nan")),
+                    self._prev_min_guide_dist,
+                )
+                self._guide_milestone_hit = torch.where(
+                    done_now.unsqueeze(-1),
+                    torch.zeros_like(self._guide_milestone_hit),
+                    self._guide_milestone_hit,
                 )
                 self._scored = torch.where(
                     done_now.unsqueeze(-1),
@@ -590,21 +674,6 @@ class TaskBStudentEnv(TaskDStudentEnv):
 
         if self._nav_log_interval > 0 and self._nav_step_count % self._nav_log_interval == 0:
             min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
-            if self._dense_enabled:
-                obj_pos_log = self._object_root_pos_w()
-                ee_log = self._ee_pos_w()
-                dist_log = torch.linalg.norm(obj_pos_log - ee_log.unsqueeze(1), dim=-1)
-                vis_log = self._visible_unscored_mask(obj_pos_log)
-                min_vis_3d, visible_count = self._nearest_visible_unscored_3d(dist_log, vis_log)
-                min_vis_3d_mean = (
-                    min_vis_3d[torch.isfinite(min_vis_3d)].mean().item()
-                    if torch.isfinite(min_vis_3d).any()
-                    else float("nan")
-                )
-                visible_mean = visible_count.mean().item()
-            else:
-                min_vis_3d_mean = float("nan")
-                visible_mean = 0.0
             scored = self._scored.sum(dim=1).float().mean().item()
             vel_cmd = self._nav_action_to_vel_cmd(nav_action)
             rx, ry, rz = self._robot_pose()
@@ -613,11 +682,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
-                f"[dense/sparse/finished/time]={total_dense.mean().item():+.3f}/"
+                f"[guide/prog/mile/sparse/finished/time]={total_dense.mean().item():+.3f}/"
+                f"{total_guide_prog.mean().item():+.3f}/{total_guide_mile.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
                 f"{total_time_pen.mean().item():+.3f} "
-                f"min_visible_3d={min_vis_3d_mean:.2f} "
-                f"visible_mean={visible_mean:.1f} "
                 f"min_3d_oracle={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
                 f"min_xy_oracle={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "
