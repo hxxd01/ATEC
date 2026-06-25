@@ -117,20 +117,12 @@ class TaskDStudentActorCriticCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
-class TaskBStudentActorCriticCfg(RslRlPpoActorCriticCfg):
+class TaskBStudentActorCriticCfg(TaskDStudentActorCriticCfg):
+    """Task B nav student: inherits Task D student RNN actor + asymmetric RNN critic."""
+
     class_name: str = "TaskBStudentActorCritic"
-    img_h: int = 24
-    img_w: int = 32
-    img_channels: int = 4
-    proprio_dim: int = 9
-    priv_dim: int = 60
-    scored_mask_dim: int = 18
-    enc_dim: int = 128
-    fuse_dim: int = 256
-    rnn_type: str = "gru"
-    rnn_hidden_dim: int = 256
-    rnn_num_layers: int = 1
     nav_action_dim: int = 3
+    leg_action_dim: int = 12
 
 
 @configclass
@@ -155,11 +147,14 @@ class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
-class TaskBStudentPPORunnerCfg(TaskDStudentPPORunnerCfg):
-    """PPO config for Task B student nav: RNN actor + feedforward privileged critic."""
+class TaskBStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """PPO config for Task B student nav: Task-D-style asymmetric RNN critic."""
 
+    num_steps_per_env = 24
+    max_iterations = 8000
+    save_interval = 100
     experiment_name = "taskb_student_b2piper"
-    obs_groups = {"policy": ["policy"], "critic": ["proprio", "priv", "scored_mask"]}
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
 
     policy = TaskBStudentActorCriticCfg(
         init_noise_std=0.6,
@@ -169,6 +164,7 @@ class TaskBStudentPPORunnerCfg(TaskDStudentPPORunnerCfg):
         critic_hidden_dims=[256, 128],
         activation="elu",
     )
+    algorithm = _PPO_ALG
 
 
 @configclass

@@ -7,13 +7,19 @@ import numpy as np
 import torch
 
 from .taskd_student_env import TaskDStudentEnv
-from .taskd_teacher_env import _LIN_VEL_SLICE, _ANG_VEL_SLICE, _GRAVITY_SLICE, _LEG_DIM
+from .taskd_teacher_env import _LEG_DIM
 from atec_rl_lab.train.locomotion.velocity.mdp.events import DETECT_HOLD_ARM_ACTION
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
-TASK_B_CRITIC_PRIV_DIM = 4 + 2 + TASK_B_NUM_OBJECTS * 3  # robot pose(4) + ee xy(2) + trash xyz
-TASK_B_PROPRIO_DIM = 9
+TASK_B_PROPRIO_DIM = 9  # lin_vel(3) + ang_vel(3) + gravity(3) — embedded in policy flat obs
+TASK_B_SCORED_MASK_DIM = TASK_B_NUM_OBJECTS
+# Task-D student layout: critic = policy flat + priv extras (see _build_critic_obs).
+# priv: robot pose(4) + ee xyz(3) + r_vel(2) + contact(1)
+#       + min_xy_unscored(1) + min_3d_unscored(1) + scored_mask(18) + trash xyz(54)
+TASK_B_CRITIC_EXTRA_DIM = (
+    4 + 3 + 2 + 1 + 1 + 1 + TASK_B_SCORED_MASK_DIM + TASK_B_NUM_OBJECTS * 3
+)
 # Detect-hold arm command baked into the env action so the action manager's PD
 # target keeps the arm at the Task-B DETECT pose every sim step (the interval
 # event alone gets overwritten by the next apply_action). Same values the squat
@@ -30,9 +36,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ll_policy_path: str,
         device: str = "cuda",
         inner_steps: int = 25,
-        vx_min: float = -4.0,
-        vx_max: float = 4.0,
-        vy_max: float = 2.0,
+        vx_min: float = -2.0,
+        vx_max: float = 2.0,
+        vy_max: float = 1.0,
         wz_max: float = 1.0,
         image_h: int = 24,
         image_w: int = 32,
@@ -75,21 +81,16 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._finished_reward = float(finished_reward)
         self._env_step_dt = float(getattr(self.env.unwrapped, "step_dt", 0.02))
 
-        # Critic (feedforward): proprio(9) + priv(60) + scored_mask(18)
-        self._critic_priv_dim = TASK_B_CRITIC_PRIV_DIM
+        # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
+        self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
+        self._critic_dim = self._actor_dim + self._critic_extra_dim
         self.observation_space = gym.spaces.Dict(
             {
                 "policy": gym.spaces.Box(
                     low=-np.inf, high=np.inf, shape=(self._actor_dim,), dtype=np.float32
                 ),
-                "proprio": gym.spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(TASK_B_PROPRIO_DIM,), dtype=np.float32
-                ),
-                "priv": gym.spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(self._critic_priv_dim,), dtype=np.float32
-                ),
-                "scored_mask": gym.spaces.Box(
-                    low=0.0, high=1.0, shape=(TASK_B_NUM_OBJECTS,), dtype=np.float32
+                "critic": gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(self._critic_dim,), dtype=np.float32
                 ),
             }
         )
@@ -121,12 +122,15 @@ class TaskBStudentEnv(TaskDStudentEnv):
         # Per-step termination-type counters (no_touch / finished are wrapper-level
         # truncations not registered in the MDP termination manager, so we surface
         # them through extras["log"] too).
+        self._illegal_at_term_count = 0
+        self._fall_at_term_count = 0
+        self._timeout_at_term_count = 0
         self._no_touch_at_term_count = 0
         self._finished_at_term_count = 0
         self._touch_total = 0
         print(
-            f"[TaskBStudent] actor_dim={self._actor_dim}, critic=[proprio={TASK_B_PROPRIO_DIM}, "
-            f"priv={self._critic_priv_dim}, scored_mask={TASK_B_NUM_OBJECTS}] "
+            f"[TaskBStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
+            f"(+{self._critic_extra_dim} priv: robot/ee/r_vel/contact/min_dist/scored/trash) "
             f"dense_w={self._w_dense_dist} sparse_touch={self._sparse_touch_reward} "
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
@@ -177,9 +181,13 @@ class TaskBStudentEnv(TaskDStudentEnv):
         dist_3d = torch.where(torch.isfinite(min_xy_dist), dist_3d, torch.full_like(dist_3d, float("inf")))
         return min_xy_dist, nearest_idx, dist_3d, dist_xy
 
-    def _touch_score_sparse(self, dist_3d_all: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _touch_score_sparse(
+        self, dist_3d_all: torch.Tensor, active_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One-time sparse reward when EE-object 3D distance <= grasp threshold (platform score)."""
         reached = dist_3d_all <= self._grasp_dist_thresh
+        if active_mask is not None:
+            reached = reached & active_mask.unsqueeze(-1)
         newly = reached & (~self._scored)
         self._scored |= reached
         count = newly.sum(dim=1).to(dtype=torch.float32)
@@ -211,8 +219,12 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         return active & (self._time_since_last_touch_s >= self._no_touch_timeout_s)
 
-    def _dense_xy_progress(self, min_xy_dist: torch.Tensor) -> torch.Tensor:
+    def _dense_xy_progress(
+        self, min_xy_dist: torch.Tensor, active_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         valid = torch.isfinite(min_xy_dist)
+        if active_mask is not None:
+            valid = valid & active_mask
         prev = self._prev_min_xy_dist
         init = torch.isnan(prev) | ~valid
         delta = torch.where(init, torch.zeros_like(min_xy_dist), prev - min_xy_dist)
@@ -259,30 +271,45 @@ class TaskBStudentEnv(TaskDStudentEnv):
     def _object_root_pos_local(self) -> torch.Tensor:
         return self._world_to_env_local(self._object_root_pos_w())
 
-    def _build_proprio_obs(self, env_obs: dict) -> torch.Tensor:
-        proprio = env_obs["proprio"].to(self._device, dtype=torch.float32)
-        lin_vel = proprio[:, _LIN_VEL_SLICE]
-        ang_vel = proprio[:, _ANG_VEL_SLICE]
-        gravity = proprio[:, _GRAVITY_SLICE]
-        return torch.cat([lin_vel, ang_vel, gravity], dim=-1)
+    def _contact_on(self) -> torch.Tensor:
+        cf = self.env.unwrapped.scene["contact_sensor"].data.net_forces_w
+        return (cf.norm(dim=-1).max(dim=1).values > 2.0).to(dtype=torch.float32).unsqueeze(-1)
 
-    def _build_critic_priv(self) -> torch.Tensor:
+    def _build_critic_obs(self, actor_obs: torch.Tensor) -> torch.Tensor:
+        """Asymmetric critic obs aligned with TaskDStudentEnv: policy || priv extras."""
+        robot = self.env.unwrapped.scene["robot"]
+        r_vel = robot.data.root_lin_vel_w.to(device=self._device, dtype=torch.float32)[:, :2]
         rx, ry, rz, robot_yaw = self._robot_pose_local()
         ee_local = self._world_to_env_local(self._ee_pos_w())
-        ee_x, ee_y = ee_local[:, 0:1], ee_local[:, 1:2]
+        ee_x, ee_y, ee_z = ee_local[:, 0:1], ee_local[:, 1:2], ee_local[:, 2:3]
+        min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
+        min_xy = torch.where(torch.isfinite(min_xy), min_xy, torch.zeros_like(min_xy)).unsqueeze(-1)
+        min_3d = torch.where(torch.isfinite(min_3d), min_3d, torch.zeros_like(min_3d)).unsqueeze(-1)
+        scored_mask = self._scored.to(dtype=torch.float32)
         obj_local = self._object_root_pos_local().reshape(self.num_envs, -1)
-        return torch.cat([rx, ry, rz, robot_yaw, ee_x, ee_y, obj_local], dim=-1)
-
-    def _build_scored_mask_obs(self) -> torch.Tensor:
-        return self._scored.to(dtype=torch.float32)
+        priv = torch.cat(
+            [
+                rx,
+                ry,
+                rz,
+                robot_yaw,
+                ee_x,
+                ee_y,
+                ee_z,
+                r_vel,
+                self._contact_on(),
+                min_xy,
+                min_3d,
+                scored_mask,
+                obj_local,
+            ],
+            dim=-1,
+        )
+        return torch.cat([actor_obs, priv], dim=-1)
 
     def _obs_dict(self, env_obs: dict):
-        return {
-            "policy": self._build_actor_obs(env_obs),
-            "proprio": self._build_proprio_obs(env_obs),
-            "priv": self._build_critic_priv(),
-            "scored_mask": self._build_scored_mask_obs(),
-        }
+        actor = self._build_actor_obs(env_obs)
+        return {"policy": actor, "critic": self._build_critic_obs(actor)}
 
     def _partial_reset_envs(self, done_mask: torch.Tensor) -> None:
         """Reset base sim + wrapper state for envs finished by wrapper-level truncation."""
@@ -319,6 +346,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._touch_total = 0
         self._scored_at_term_sum = 0.0
         self._scored_at_term_count = 0
+        self._illegal_at_term_count = 0
+        self._fall_at_term_count = 0
+        self._timeout_at_term_count = 0
         self._no_touch_at_term_count = 0
         self._finished_at_term_count = 0
         self._logged_first_rollout = False
@@ -378,7 +408,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
             obj_pos = self._object_root_pos_w()
             diff_3d = obj_pos - ee_pos.unsqueeze(1)
             dist_3d_all = torch.linalg.norm(diff_3d, dim=-1)
-            sparse, newly_scored = self._touch_score_sparse(dist_3d_all)
+            active_after_base_done = active & (~done_now)
+            sparse, newly_scored = self._touch_score_sparse(
+                dist_3d_all, active_mask=active_after_base_done
+            )
             if bool(newly_scored.any()):
                 self._prev_min_xy_dist = torch.where(
                     newly_scored,
@@ -387,11 +420,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 )
 
             min_xy_dist, _, _, _ = self._nearest_unscored_trash_metrics()
-            dense = self._dense_xy_progress(min_xy_dist)
+            dense = self._dense_xy_progress(min_xy_dist, active_mask=active_after_base_done)
             time_pen = torch.full_like(dense, -self._time_penalty_per_env_step)
 
             all_scored = self._scored.all(dim=1)
-            finished_now = active & all_scored & (~self._episode_finished)
+            finished_now = active_after_base_done & all_scored & (~self._episode_finished)
             finished_bonus = torch.zeros_like(dense)
             if bool(finished_now.any()):
                 self._episode_finished |= finished_now
@@ -401,19 +434,19 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 self._done_finished += int(finished_now.sum().item())
                 self._record_scored_at_termination(finished_now)
                 self._finished_at_term_count += int(finished_now.sum().item())
-                self._partial_reset_envs(finished_now)
 
-            no_touch_done = self._update_no_touch_timer(newly_scored, active & (~finished_now))
+            no_touch_done = self._update_no_touch_timer(
+                newly_scored, active_after_base_done & (~finished_now)
+            )
             if bool(no_touch_done.any()):
                 episode_done |= no_touch_done
                 truncated |= no_touch_done
                 self._done_no_touch += int(no_touch_done.sum().item())
                 self._record_scored_at_termination(no_touch_done)
                 self._no_touch_at_term_count += int(no_touch_done.sum().item())
-                self._partial_reset_envs(no_touch_done)
 
-            alive_f = active.to(dtype=dense.dtype)
-            step_rew = (dense + sparse + finished_bonus + time_pen) * alive_f
+            alive_f = active_after_base_done.to(dtype=dense.dtype)
+            step_rew = (dense + sparse + time_pen) * alive_f + finished_bonus
             total_reward += step_rew
             total_dense += dense * alive_f
             total_sparse += sparse * alive_f
@@ -422,6 +455,15 @@ class TaskBStudentEnv(TaskDStudentEnv):
 
             if bool(done_now.any()):
                 self._record_scored_at_termination(done_now)
+                fall_flags = self._termination_term_flags().get("fall")
+                timeout_flags = done_now & step_trunc_1d
+                if fall_flags is None:
+                    fall_flags = torch.zeros_like(done_now)
+                fall_flags = done_now & (~step_trunc_1d) & fall_flags
+                illegal_flags = done_now & (~step_trunc_1d) & (~fall_flags)
+                self._illegal_at_term_count += int(illegal_flags.sum().item())
+                self._fall_at_term_count += int(fall_flags.sum().item())
+                self._timeout_at_term_count += int(timeout_flags.sum().item())
                 self._prev_min_xy_dist = torch.where(
                     done_now,
                     torch.full_like(self._prev_min_xy_dist, float("nan")),
@@ -444,7 +486,6 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 )
                 self._done_total += int(done_now.sum().item())
                 self._done_timeout += int((done_now & step_trunc_1d).sum().item())
-                fall_flags = self._termination_term_flags().get("fall")
                 if fall_flags is not None:
                     self._done_fall += int((done_now & fall_flags).sum().item())
                 illegal = done_now
@@ -489,12 +530,26 @@ class TaskBStudentEnv(TaskDStudentEnv):
             mean_scored = self._scored_at_term_sum / total_term
             last_info = dict(last_info) if last_info is not None else {}
             log_dict = last_info.setdefault("log", {})
+            # Keep all Episode_Termination/* ratios on one denominator so metrics
+            # are directly comparable in the training table.
+            log_dict["Episode_Termination/illegal_contact"] = self._illegal_at_term_count / total_term
+            log_dict["Episode_Termination/fall"] = self._fall_at_term_count / total_term
+            log_dict["Episode_Termination/time_out"] = self._timeout_at_term_count / total_term
             log_dict["Episode_Termination/scored_objects"] = mean_scored
             log_dict["Episode_Termination/no_touch"] = self._no_touch_at_term_count / total_term
             log_dict["Episode_Termination/finished"] = self._finished_at_term_count / total_term
             self._scored_at_term_sum = 0.0
             self._scored_at_term_count = 0
+            self._illegal_at_term_count = 0
+            self._fall_at_term_count = 0
+            self._timeout_at_term_count = 0
             self._no_touch_at_term_count = 0
             self._finished_at_term_count = 0
+
+        # Envs that terminated at any inner step were auto-reset by the base env.
+        # Remaining inner steps may still advance them, so re-reset once at the end
+        # so the next nav step starts from a clean initial state.
+        if bool(episode_done.any()):
+            self._partial_reset_envs(episode_done)
 
         return self._obs_dict(self._current_obs), total_reward, terminated, truncated, last_info

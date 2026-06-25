@@ -22,9 +22,9 @@ parser.add_argument("--inner_steps", type=int, default=5, help="Low-level sim st
 parser.add_argument("--max_iter", type=int, default=8000)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--steps_per_env", type=int, default=24)
-parser.add_argument("--vx_min", type=float, default=-4.0)
-parser.add_argument("--vx_max", type=float, default=4.0)
-parser.add_argument("--vy_max", type=float, default=2.0)
+parser.add_argument("--vx_min", type=float, default=-2.0)
+parser.add_argument("--vx_max", type=float, default=2.0)
+parser.add_argument("--vy_max", type=float, default=1.0)
 parser.add_argument("--wz_max", type=float, default=1.0)
 parser.add_argument("--policy_img_h", type=int, default=24)
 parser.add_argument("--policy_img_w", type=int, default=32)
@@ -61,13 +61,13 @@ parser.add_argument("--grasp_dist_thresh", type=float, default=0.20, help="Platf
 parser.add_argument(
     "--time_penalty_per_env_step",
     type=float,
-    default=0.01,
+    default=0.004,
     help="Time penalty each low-level env step.",
 )
 parser.add_argument(
     "--no_touch_timeout_s",
     type=float,
-    default=5.0,
+    default=12.0,
     help="Truncate episode if no new platform touch score for this many sim seconds (0=off).",
 )
 parser.add_argument(
@@ -196,6 +196,16 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool
     for src, dst in gru_map.items():
         if src in bc_sd and dst in model_sd and tuple(model_sd[dst].shape) == tuple(bc_sd[src].shape):
             model_sd[dst] = bc_sd[src]
+            loaded += 1
+    cc_map = {
+        "memory_c.rnn.weight_ih_l0": "memory_a.rnn.weight_ih_l0",
+        "memory_c.rnn.weight_hh_l0": "memory_a.rnn.weight_hh_l0",
+        "memory_c.rnn.bias_ih_l0": "memory_a.rnn.bias_ih_l0",
+        "memory_c.rnn.bias_hh_l0": "memory_a.rnn.bias_hh_l0",
+    }
+    for dst, src in cc_map.items():
+        if dst in model_sd and src in model_sd and tuple(model_sd[dst].shape) == tuple(model_sd[src].shape):
+            model_sd[dst] = model_sd[src].clone()
             loaded += 1
     head_map = {
         "head.0.weight": "actor.0.weight",
