@@ -18,8 +18,13 @@ TASK_B_OTHER_Z = 0.10
 def randomize_task_b_objects(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
-    x_range: tuple[float, float] = (-15.0, -5.0),
-    y_range: tuple[float, float] = (-15.0, -5.0),
+    # Object local xy relative to env_origin. In the reference eval env
+    # (num_envs=1, env_origin=(-10,-10)) objects spawn at world xy in [-15,-5],
+    # i.e. local [-5,+5] centred on the 20x20 playable area. The nav terrain
+    # also centres the playable area on env_origin, so the same local range
+    # keeps objects on the ground across all tiles.
+    x_range: tuple[float, float] = (-5.0, 5.0),
+    y_range: tuple[float, float] = (-5.0, 5.0),
     pocket_radius: float = 1.0,
     pocket_shift: float = 2.0,
 ) -> None:

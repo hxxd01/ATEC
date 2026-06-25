@@ -76,9 +76,24 @@ parser.add_argument(
     default=100.0,
     help="One-time reward when all 18 objects are platform-scored in one episode.",
 )
+parser.add_argument("--video", action="store_true", default=False, help="Record rollout video(s) during training.")
+parser.add_argument(
+    "--video_length",
+    type=int,
+    default=300,
+    help="Recorded clip length in low-level physics steps (per RecordVideo trigger).",
+)
+parser.add_argument(
+    "--video_interval",
+    type=int,
+    default=0,
+    help="Re-record every N physics steps; 0 = only once at physics step 0.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
+if args_cli.video:
+    args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -216,6 +231,21 @@ def main():
         env_cfg.scene.env_spacing = float(args_cli.env_spacing)
     refresh_task_b_terrain_cfg(env_cfg)
 
+    # When recording video, point the viewport camera at env 0 from an elevated
+    # side angle so the whole playable area (robot at centre, trash in +/-5,
+    # bin at +7) is visible. Default viewer looks at the world origin, which is
+    # far from env 0 in multi-tile training -> it ends up pointing at the sky.
+    if args_cli.video:
+        env_cfg.viewer.origin_type = "env"
+        env_cfg.viewer.env_index = 0
+        env_cfg.viewer.eye = (8.0, -8.0, 9.0)
+        env_cfg.viewer.lookat = (0.0, 0.0, 0.0)
+        env_cfg.viewer.resolution = (1280, 720)
+        print(
+            "[INFO] Video viewer camera -> env0 local eye=(8,-8,9) lookat=(0,0,0)",
+            flush=True,
+        )
+
     if env_cfg.observations is not None:
         env_cfg.observations.image = None
         env_cfg.observations.extero = None
@@ -262,7 +292,23 @@ def main():
         flush=True,
     )
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.video:
+        video_dir = os.path.join(log_dir, "videos", "train")
+        os.makedirs(video_dir, exist_ok=True)
+        interval = int(args_cli.video_interval)
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=video_dir,
+            step_trigger=(lambda step: step == 0) if interval <= 0 else (lambda step: step % interval == 0),
+            video_length=int(args_cli.video_length),
+            disable_logger=True,
+        )
+        print(
+            f"[INFO] Recording video to: {video_dir} "
+            f"(length={int(args_cli.video_length)} physics steps, interval={interval or 'once'})",
+            flush=True,
+        )
     nav_env = TaskBStudentEnv(
         env=env,
         ll_policy_path=ll_policy_path,

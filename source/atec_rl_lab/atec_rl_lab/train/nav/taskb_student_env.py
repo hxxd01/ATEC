@@ -108,6 +108,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._done_illegal = 0
         self._done_no_touch = 0
         self._done_finished = 0
+        # Accumulators for "scored objects at episode termination" metric, flushed
+        # into extras["log"] each nav step so rsl_rl logs it to the table.
+        self._scored_at_term_sum = 0.0
+        self._scored_at_term_count = 0
         self._touch_total = 0
         print(
             f"[TaskBStudent] actor_dim={self._actor_dim}, critic=[proprio={TASK_B_PROPRIO_DIM}, "
@@ -171,6 +175,17 @@ class TaskBStudentEnv(TaskDStudentEnv):
         if bool(newly.any()):
             self._touch_total += int(newly.sum().item())
         return count * self._sparse_touch_reward, newly.any(dim=1)
+
+    def _record_scored_at_termination(self, done_mask: torch.Tensor) -> None:
+        """Accumulate scored-object counts for envs terminating this step.
+
+        Called before any reset clears ``self._scored``. Each nav step the running
+        mean is flushed into ``extras["log"]["Episode_Termination/scored_objects"]``.
+        """
+        if not bool(done_mask.any()):
+            return
+        self._scored_at_term_sum += float(self._scored[done_mask].sum(dim=1).sum().item())
+        self._scored_at_term_count += int(done_mask.sum().item())
 
     def _update_no_touch_timer(self, newly_scored: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """Return per-env truncated flags when sim time since last new touch exceeds threshold."""
@@ -248,10 +263,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
             return
         env_ids = done_mask.nonzero(as_tuple=False).flatten()
         base = self.env.unwrapped
-        env_id_list = env_ids.detach().cpu().tolist()
-        if isinstance(env_id_list, int):
-            env_id_list = [env_id_list]
-        base._reset_idx(env_id_list)
+        # _reset_idx -> event_manager -> reset_root_state_at_env_origin needs a tensor
+        # (PhysX set_root_transforms casts indices via .to(int32)); a python list crashes.
+        base._reset_idx(env_ids)
         if base.sim.has_rtx_sensors() and int(getattr(base.cfg, "num_rerenders_on_reset", 0)) > 0:
             for _ in range(int(base.cfg.num_rerenders_on_reset)):
                 base.sim.render()
@@ -276,6 +290,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._done_no_touch = 0
         self._done_finished = 0
         self._touch_total = 0
+        self._scored_at_term_sum = 0.0
+        self._scored_at_term_count = 0
         self._logged_first_rollout = False
         return self._obs_dict(obs), info
 
@@ -354,6 +370,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 episode_done |= finished_now
                 terminated |= finished_now
                 self._done_finished += int(finished_now.sum().item())
+                self._record_scored_at_termination(finished_now)
                 self._partial_reset_envs(finished_now)
 
             no_touch_done = self._update_no_touch_timer(newly_scored, active & (~finished_now))
@@ -361,6 +378,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 episode_done |= no_touch_done
                 truncated |= no_touch_done
                 self._done_no_touch += int(no_touch_done.sum().item())
+                self._record_scored_at_termination(no_touch_done)
                 self._partial_reset_envs(no_touch_done)
 
             alive_f = active.to(dtype=dense.dtype)
@@ -372,6 +390,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
             total_time_pen += time_pen * alive_f
 
             if bool(done_now.any()):
+                self._record_scored_at_termination(done_now)
                 self._prev_min_xy_dist = torch.where(
                     done_now,
                     torch.full_like(self._prev_min_xy_dist, float("nan")),
@@ -428,5 +447,15 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 f"{self._done_finished/denom:.2f}",
                 flush=True,
             )
+
+        # Log mean scored objects over envs that terminated this nav step.
+        # Injected into extras["log"] so rsl_rl prints it in the training table.
+        if self._scored_at_term_count > 0:
+            mean_scored = self._scored_at_term_sum / float(self._scored_at_term_count)
+            last_info = dict(last_info) if last_info is not None else {}
+            log_dict = last_info.setdefault("log", {})
+            log_dict["Episode_Termination/scored_objects"] = mean_scored
+            self._scored_at_term_sum = 0.0
+            self._scored_at_term_count = 0
 
         return self._obs_dict(self._current_obs), total_reward, terminated, truncated, last_info

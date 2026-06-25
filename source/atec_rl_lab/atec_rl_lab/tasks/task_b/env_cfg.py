@@ -32,7 +32,11 @@ import atec_rl_lab.tasks.task_b.mdp as atec_mdp
 
 TARGET_CENTER = (-3.0, -10.0)
 TARGET_MARKER_Z = 0.06
-TASK_B_ROBOT_SPAWN_LOCAL = (-10.0, -10.0, 0.68)
+# Robot spawns at the terrain center (env_origin). In the reference eval env
+# (TaskBEnvB2Cfg, num_envs=1) env_origin == (-10,-10) and the robot sits at
+# world (-10,-10) == local (0,0), i.e. exactly on the playable-area center.
+# init_state.pos is overwritten per-cfg, but reset uses local_pos=env_origin+this.
+TASK_B_ROBOT_SPAWN_LOCAL = (0.0, 0.0, 0.68)
 TASK_B_NAV_DEPTH_MAX = 5.0
 TASK_B_PLATFORM_CAMERA_FAR = 50.0
 
@@ -244,18 +248,25 @@ class TaskBNavEnvB2Cfg(TaskBEnvB2Cfg):
     def __post_init__(self):
         from atec_rl_lab.assets.robots import UNITREE_B2_PIPER_CFG
 
-        self.scene.robot = UNITREE_B2_PIPER_CFG.replace(
-            prim_path="{ENV_REGEX_NS}/Robot",
+        super().__post_init__()
+
+        # Override the robot init_state *after* super() (TaskBEnvB2Cfg sets it to
+        # the eval world pos (-10,-10)). For nav training the robot must spawn at
+        # the terrain centre (env_origin), i.e. local (0,0). reset_robot_root
+        # below places it via env_origin + local_pos on every reset regardless.
+        self.scene.robot = self.scene.robot.replace(
             init_state=UNITREE_B2_PIPER_CFG.init_state.replace(
                 pos=TASK_B_ROBOT_SPAWN_LOCAL,
             ),
         )
-        super().__post_init__()
 
         apply_task_b_nav_train_overrides(self)
         apply_task_d_camera_depth_clip(self.scene, TASK_B_PLATFORM_CAMERA_FAR)
 
-        self.events.reset_robot_joints = None
+        # NOTE: keep reset_robot_joints enabled — it drives the legs to the B2
+        # standing pose on reset. Disabling it leaves joints wherever the
+        # previous (fallen) episode ended, so the robot collapses from spawn
+        # height and trips `fall` within ~0.5s.
         self.events.reset_robot_root = EventTerm(
             func=reset_root_state_at_env_origin,
             mode="reset",
