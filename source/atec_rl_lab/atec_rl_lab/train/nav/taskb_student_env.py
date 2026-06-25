@@ -7,12 +7,18 @@ import numpy as np
 import torch
 
 from .taskd_student_env import TaskDStudentEnv
-from .taskd_teacher_env import _LIN_VEL_SLICE, _ANG_VEL_SLICE, _GRAVITY_SLICE
+from .taskd_teacher_env import _LIN_VEL_SLICE, _ANG_VEL_SLICE, _GRAVITY_SLICE, _LEG_DIM
+from atec_rl_lab.train.locomotion.velocity.mdp.events import DETECT_HOLD_ARM_ACTION
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
 TASK_B_CRITIC_PRIV_DIM = 4 + 2 + TASK_B_NUM_OBJECTS * 3  # robot pose(4) + ee xy(2) + trash xyz
 TASK_B_PROPRIO_DIM = 9
+# Detect-hold arm command baked into the env action so the action manager's PD
+# target keeps the arm at the Task-B DETECT pose every sim step (the interval
+# event alone gets overwritten by the next apply_action). Same values the squat
+# flat training (ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0) drives via policy.
+_TASK_B_DETECT_ARM_ACTION = torch.tensor(DETECT_HOLD_ARM_ACTION, dtype=torch.float32)
 
 
 class TaskBStudentEnv(TaskDStudentEnv):
@@ -225,6 +231,22 @@ class TaskBStudentEnv(TaskDStudentEnv):
         if pos_w.ndim == 2:
             return pos_w - origins
         return pos_w - origins.unsqueeze(1)
+
+    def _build_env_action(self, ll_action_train: torch.Tensor) -> torch.Tensor:
+        """Legs from the low-level policy + arm frozen at the DETECT hold pose.
+
+        The base env action layout is [leg(12), arm(8)]. The locomotion policy only
+        outputs leg targets; we fill the arm slots with ``DETECT_HOLD_ARM_ACTION`` so
+        the action manager's PD target is ``default + 0.5 * DETECT_HOLD_ARM_ACTION``
+        every sim step — identical to the squat-flat training. Without this the arm
+        slots are 0 and the arm drifts back to its USD default instead of locking
+        to the DETECT pose.
+        """
+        batch = ll_action_train.shape[0]
+        action = torch.zeros(batch, _LEG_DIM + _TASK_B_DETECT_ARM_ACTION.shape[0], device=self._device, dtype=torch.float32)
+        action[:, :_LEG_DIM] = ll_action_train * self._t2e
+        action[:, _LEG_DIM:] = _TASK_B_DETECT_ARM_ACTION.to(self._device).expand(batch, -1)
+        return action
 
     def _robot_pose_local(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         robot = self.env.unwrapped.scene["robot"]
