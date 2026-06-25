@@ -268,3 +268,50 @@ def reset_root_state_uniform(
         # set into the physics simulation
         asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=non_pit_env_ids)
         asset.write_root_velocity_to_sim(velocities, env_ids=non_pit_env_ids)
+
+
+# solution.py _detect_hold_arm_cmd() after _PICK_SCRIPTED_PRE_STEPS (34).
+DETECT_HOLD_ARM_ACTION = (0.0, 5.28, -2.38, 0.0, 0.0, 0.0, 0.0, 0.0)
+DETECT_HOLD_ARM_ACTION_SCALE = 0.5
+
+
+def hold_detect_arm_pose(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    arm_joint_names: tuple[str, ...] = (
+        "arm_joint1",
+        "arm_joint2",
+        "arm_joint3",
+        "arm_joint4",
+        "arm_joint5",
+        "arm_joint6",
+        "arm_joint7",
+        "arm_joint8",
+    ),
+    arm_action: tuple[float, ...] = DETECT_HOLD_ARM_ACTION,
+    action_scale: float = DETECT_HOLD_ARM_ACTION_SCALE,
+    reset_state: bool = False,
+) -> None:
+    """Hold Piper arm at the Task-B DETECT terminal action (legs trained separately).
+
+    Matches ``demo/solution.py`` ``_detect_hold_arm_cmd()`` terminal pose
+    (``DETECT_HOLD_ARM_ACTION * action_scale`` added to default joint offsets).
+    When ``reset_state`` is True, also writes arm joint positions/velocities into sim.
+    Task-B default reset does **not** use this; arm starts at USD defaults and detect
+    hold is applied only during rollout (action or interval PD target).
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+    arm_ids, _ = asset.find_joints(list(arm_joint_names), preserve_order=True)
+    arm_action_t = torch.tensor(arm_action, device=asset.device, dtype=torch.float32).view(1, -1)
+    default = asset.data.default_joint_pos[env_ids][:, arm_ids]
+    target = default + float(action_scale) * arm_action_t
+    asset.set_joint_position_target(target, joint_ids=arm_ids, env_ids=env_ids)
+    if reset_state:
+        joint_pos = asset.data.joint_pos[env_ids].clone()
+        joint_vel = asset.data.joint_vel[env_ids].clone()
+        joint_pos[:, arm_ids] = target
+        joint_vel[:, arm_ids] = 0.0
+        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)

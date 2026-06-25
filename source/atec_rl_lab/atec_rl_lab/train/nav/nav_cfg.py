@@ -138,6 +138,13 @@ class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class TaskBStudentPPORunnerCfg(TaskDStudentPPORunnerCfg):
+    """PPO config for Task B student nav (same network as Task D student)."""
+
+    experiment_name = "taskb_student_b2piper"
+
+
+@configclass
 class TaskDStudentPitE2EPPORunnerCfg(TaskDStudentPPORunnerCfg):
     """Legacy student GRU pit head (deprecated; use TaskDMargDepthPitE2EPPORunnerCfg)."""
 

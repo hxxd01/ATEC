@@ -30,14 +30,18 @@ def command_levels_lin_vel(
     if env.common_step_counter == 0:
         env._original_vel_x = torch.tensor(base_velocity_ranges.lin_vel_x, device=env.device)
         env._original_vel_y = torch.tensor(base_velocity_ranges.lin_vel_y, device=env.device)
-        env._initial_vel_x = torch.tensor(
-            [env._original_vel_x[0], env._original_vel_x[1] * range_multiplier[0]],
-            device=env.device,
-        )
-        env._final_vel_x = torch.tensor(
-            [env._original_vel_x[0], env._original_vel_x[1] * range_multiplier[1]],
-            device=env.device,
-        )
+        ox0, ox1 = float(env._original_vel_x[0].item()), float(env._original_vel_x[1].item())
+        if ox0 < 0.0 and ox1 > 0.0:
+            # Bidirectional vx: shrink both limits symmetrically (avoid leaving full reverse
+            # speed while capping forward — old init was [min, max*0.1] e.g. (-4, 0.4)).
+            env._initial_vel_x = env._original_vel_x * float(range_multiplier[0])
+            env._final_vel_x = env._original_vel_x * float(range_multiplier[1])
+        elif ox0 >= 0.0:
+            env._initial_vel_x = torch.tensor([ox0, ox1 * range_multiplier[0]], device=env.device)
+            env._final_vel_x = torch.tensor([ox0, ox1 * range_multiplier[1]], device=env.device)
+        else:
+            env._initial_vel_x = env._original_vel_x * float(range_multiplier[0])
+            env._final_vel_x = env._original_vel_x * float(range_multiplier[1])
         env._initial_vel_y = env._original_vel_y * range_multiplier[0]
         env._final_vel_y = env._original_vel_y * range_multiplier[1]
 

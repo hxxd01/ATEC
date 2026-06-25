@@ -39,7 +39,7 @@ python scripts/play_atec_task.py --task ATEC-TaskA-B2Piper --headless --debug  -
 
 
 #看tensorboard
-source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && tensorboard --logdir=/home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-19_05-40-34 --host 127.0.0.1 --port 6010
+source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && conda activate env_isaaclab && tensorboard --logdir=/home/ubuntu/ATEC/logs/rsl_rl/unitree_b2_piper_flat_squat_transition --host 127.0.0.1 --port 6010
 source /home/zhongyuan/anaconda3/etc/profile.d/conda.sh && conda activate xxd && tensorboard --logdir=/home/zhongyuan/ATEC/logs/rsl_rl/taskd_student_b2piper_depth --host 127.0.0.1 --port 6010
 python scripts/train_taskd_pit_locomotion.py \
   --marg \
@@ -399,15 +399,19 @@ export ATEC_SEARCH_BANANA_Z_MAX=0.4
 
 
 python scripts/rsl_rl/play.py \
-  --task ATEC-Isaac-Stand-Flat-Unitree-B2Piper-v0 \
-  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/unitree_b2_piper_flat_stand_transition/2026-06-25_06-02-13/model_200.pt \
+  --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0 \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/unitree_b2_piper_flat_squat_transition/2026-06-25_20-43-13/model_1900.pt \
   --num_envs 1 \
   --headless \
   --video \
-  --video_length 50
+  --video_length 100
 
-
+python scripts/train_nav_taskb_student.py \
+  --ll_policy demo/down.pt \
+  --num_envs 32 \
+  --inner_steps 5 \
+  --headless
 OMNI_KIT_ACCEPT_EULA=Y ATEC_ENABLE_GRASPNET=1 ATEC_ENABLE_ANYGRASP=0 ATEC_GRASP_USE_TASKE_IK=0 ATEC_GRASPNET_TARGET_OBJECT=banana ATEC_SEARCH_USE_HEAD_ROTATED_POINTS=1 python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --device cuda:0 --depth-lidar  --debug --headless --platform_deploy
 
 
-python scripts/rsl_rl/train.py   --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0   --headless   --resume   --load_run 2026-06-25_03-38-17   --checkpoint model_1700.pt
+python scripts/rsl_rl/train.py   --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0   --headless   --resume   --load_run 2026-06-25_20-33-47   --checkpoint model_1100.pt

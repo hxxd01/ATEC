@@ -612,6 +612,24 @@ def upward(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("r
     return reward
 
 
+def ee_height_exp(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    std: float,
+    ee_body_name: str = "gripper_base",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward end-effector world-frame height tracking (exponential kernel)."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_ids, _ = asset.find_bodies(ee_body_name)
+    if len(body_ids) == 0:
+        raise ValueError(f"Cannot find EE body '{ee_body_name}'.")
+    ee_z = asset.data.body_pos_w[:, int(body_ids[0]), 2]
+    err = torch.square(ee_z - float(target_height))
+    upright = torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    return torch.exp(-err / (float(std) ** 2)) * upright
+
+
 def base_height_l2(
     env: ManagerBasedRLEnv,
     target_height: float,

@@ -40,7 +40,7 @@ class UnitreeB2PiperFlatPPORunnerCfg(UnitreeB2PiperRoughPPORunnerCfg):
 
 @configclass
 class UnitreeB2PiperSquatFlatPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
-    max_iterations = 2000
+    max_iterations = 10000
     experiment_name = "unitree_b2_piper_flat_squat_transition"
 
 

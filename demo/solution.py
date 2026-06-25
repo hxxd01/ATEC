@@ -111,6 +111,10 @@ class AlgSolution:
     _PICK_ARM_STEPS = 25
     _PICK_SCRIPTED_PRE_STEPS = 34
     _PICK_SCRIPTED_HOLD_STEPS = 18
+    _SEARCH_DETECT_ARM_HOLD = os.environ.get("ATEC_SEARCH_DETECT_ARM_HOLD", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    _DETECT_ARM_HOLD_STATUSES = frozenset({Status.SEARCH, Status.LOCK, Status.STAND, Status.GO_BIN})
     _STAND_STEPS = 40
     _BIN_ARRIVE_DIST = 0.4
     _GO_BIN_ALIGN_RAD = 0.3
@@ -172,12 +176,13 @@ class AlgSolution:
     _SEARCH_BIN_RGB_V1 = int(os.environ.get("ATEC_SEARCH_BIN_RGB_V1", "420"))
     _SEARCH_BIN_RGB_MAX_YELLOW_RATIO = float(os.environ.get("ATEC_SEARCH_BIN_RGB_MAX_YELLOW_RATIO", "0.25"))
     _SEARCH_DEBUG_PRINT_EVERY = int(os.environ.get("ATEC_SEARCH_DEBUG_PRINT_EVERY", "20"))
+    # Z-pattern grid covering the ~8×8 m garbage spawn zone.
+    # Row direction alternates to minimise travel distance.
     _SEARCH_WAYPOINTS = (
-        (-14.0, -14.0),
-        (-14.0, -6.0),
-        (-10.0, -10.0),
-        (-6.0, -14.0),
-        (-6.0, -6.0),
+        (-6.0,  -6.0),  (-9.0,  -6.0),  (-12.0,  -6.0),  (-14.0,  -6.0),
+        (-14.0, -9.0),  (-12.0, -9.0),  (-9.0,   -9.0),  (-6.0,   -9.0),
+        (-6.0, -12.0),  (-9.0, -12.0),  (-12.0, -12.0),  (-14.0, -12.0),
+        (-14.0,-15.0),  (-12.0,-15.0),  (-9.0,  -15.0),  (-6.0,  -15.0),
     )
     _LEG_JOINT_NAMES = (
         "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
@@ -363,6 +368,61 @@ class AlgSolution:
         ["arm_joint1", "arm_joint2", "arm_joint3", "arm_joint4", "arm_joint5", "arm_joint6"],
     )
 
+    @classmethod
+    def _detect_hold_arm_cmd(cls) -> list[float]:
+        """Arm action after DETECT pre-lower (_PICK_SCRIPTED_PRE_STEPS)."""
+        v = [0.0 for _ in range(8)]
+        for pick_elapsed in range(cls._PICK_SCRIPTED_PRE_STEPS):
+            if pick_elapsed < 10:
+                v[1] += 0.12
+            v[1] += 0.12
+            v[2] -= 0.07
+        return v
+
+    def _keep_detect_arm_hold(self) -> bool:
+        return bool(self._SEARCH_DETECT_ARM_HOLD)
+
+    def _status_keeps_detect_arm(self) -> bool:
+        return self._keep_detect_arm_hold() and self.status in self._DETECT_ARM_HOLD_STATUSES
+
+    def _apply_detect_arm_hold(self) -> None:
+        if not self._status_keeps_detect_arm():
+            return
+        self.v_list = [float(x) for x in self._detect_hold_arm_cmd()]
+
+    def _apply_search_detect_arm_hold(self) -> None:
+        self._apply_detect_arm_hold()
+
+    def _arm_action_output(self) -> list[float]:
+        if self.status in (Status.DETECT, Status.GRASP):
+            return [float(x) for x in self.v_list]
+        if self._status_keeps_detect_arm():
+            return [float(x) for x in self._detect_hold_arm_cmd()]
+        return [0.0 for _ in range(8)]
+
+    def _enter_detect_from_squat(self) -> None:
+        self.status = Status.DETECT
+        if self._keep_detect_arm_hold():
+            # Arm already at detect hold: skip scripted pre-lower.
+            self.start_pick_idx = self.cur_idx - self._PICK_SCRIPTED_PRE_STEPS
+            self.v_list = [float(x) for x in self._detect_hold_arm_cmd()]
+            self._pick_arm_hold_cmd = [float(x) for x in self.v_list]
+        else:
+            self.start_pick_idx = self.cur_idx
+            self.v_list = [0.0 for _ in range(8)]
+            self._pick_arm_hold_cmd = None
+        self._squat_start_leg_action = None
+        self._ik_phase = None
+        self._ik_phase_start = None
+        self._ik_target_pos_b = None
+        self._ik_lift_pos_b = None
+        self._ik_acquire_pos_b = None
+        self._ik_no_target_count = 0
+        self._ik_pick_active = False
+        self._grasp_target_cam = None
+        self._grasp_axis_cam = None
+        print("[TaskB] squat done -> DETECT", flush=True)
+
     def calculate_velocity(
         self, target_x, target_y, max_vx, max_vy, max_wz, k_v=0.5, k_w=1.0, *, lock_on_arrive=True
     ):
@@ -399,8 +459,9 @@ class AlgSolution:
                     return 0.0, 0.0, 0.0
             else:
                 self._lock_arrive_confirm_count = 0
-        # 与 SEARCH 相同：写死 cmd，供策略 obs 里的 velocity_commands 使用
+        # 写死 cmd，供策略 obs 里的 velocity_commands 使用
         self.cmd_max_vy = 0.0
+        bearing = float(np.arctan2(target_y, target_x))
         wz_cmd = float(1.4 * -target_x)
         if dist < self._SEARCH_DECEL_START_DIST:
             t = float(np.clip(dist / self._SEARCH_DECEL_START_DIST, 0.0, 1.0))
@@ -408,6 +469,9 @@ class AlgSolution:
             wz_cmd *= t
         else:
             vx_cmd = self._SEARCH_CRUISE_VX
+        # Bearing gate: if target is far to the side, turn in place before charging forward.
+        if abs(bearing) > 0.70:
+            vx_cmd = 0.0
         self.cmd_max_wz = float(np.clip(wz_cmd, -1.0, 1.0))
         self.cmd_max_vx = vx_cmd
         return vx, vy, wz
@@ -422,6 +486,7 @@ class AlgSolution:
         self.cmd_max_vy = 0.0
         self.cmd_max_wz = 0.0
         self._lock_prezero_settle_count = 0
+        self._apply_detect_arm_hold()
         print(
             f"[TaskB] -> LOCK pre-zero ({self._LOCK_PRE_ZERO_STEPS} steps, {reason}): "
             "vx/vy/wz=0 hold",
@@ -608,6 +673,7 @@ class AlgSolution:
         self.start_pick_idx = None
         self.start_stand_idx = None
         self.v_list = [0.0 for _ in range(8)]
+        self._apply_search_detect_arm_hold()
         self.cmd_max_vx = 1.0
         self.cmd_max_vy = 0.0
         self.cmd_max_wz = 1.0
@@ -744,18 +810,38 @@ class AlgSolution:
         if pose is None:
             return False
         rx, ry, ryaw = pose
-        idx = int(self._search_wp_idx) % len(self._SEARCH_WAYPOINTS)
+        n = len(self._SEARCH_WAYPOINTS)
+        if not hasattr(self, "_search_wp_visited"):
+            self._search_wp_visited: set = set()
+
+        idx = int(self._search_wp_idx) % n
         tx, ty = self._SEARCH_WAYPOINTS[idx]
         dx = float(tx - rx)
         dy = float(ty - ry)
         dist = float(np.hypot(dx, dy))
+
         if dist < self._SEARCH_WP_REACHED_DIST:
-            self._search_wp_idx = (idx + 1) % len(self._SEARCH_WAYPOINTS)
-            idx = int(self._search_wp_idx) % len(self._SEARCH_WAYPOINTS)
+            # Mark this waypoint visited, then pick nearest unvisited.
+            self._search_wp_visited.add(idx)
+            unvisited = [i for i in range(n) if i not in self._search_wp_visited]
+            if not unvisited:
+                # All visited — reset and start over.
+                self._search_wp_visited = set()
+                unvisited = list(range(n))
+            best = min(
+                unvisited,
+                key=lambda i: np.hypot(
+                    self._SEARCH_WAYPOINTS[i][0] - rx,
+                    self._SEARCH_WAYPOINTS[i][1] - ry,
+                ),
+            )
+            self._search_wp_idx = best
+            idx = best
             tx, ty = self._SEARCH_WAYPOINTS[idx]
             dx = float(tx - rx)
             dy = float(ty - ry)
             dist = float(np.hypot(dx, dy))
+
         target_yaw = float(np.arctan2(dy, dx))
         yaw_err = self._wrap_angle(target_yaw - ryaw)
         vx = min(self._SEARCH_WP_VX_CAP, max(0.2, 0.5 * dist))
@@ -766,7 +852,8 @@ class AlgSolution:
         self.cmd_max_vy = 0.0
         self.cmd_max_wz = wz
         self._set_video_hud(
-            f"status=SEARCH phase=coverage wp={idx}/{len(self._SEARCH_WAYPOINTS)} dist={dist:.2f}",
+            f"status=SEARCH phase=coverage wp={idx}/{n} "
+            f"visited={len(self._search_wp_visited)} dist={dist:.2f}",
             f"cmd_vx={self.cmd_max_vx:.2f} cmd_wz={self.cmd_max_wz:.2f}",
         )
         return True
@@ -1242,6 +1329,7 @@ class AlgSolution:
         self._search_last_cloud_src = None
         self._search_no_target_steps = 0
         self._search_wp_idx = 0
+        self._search_wp_visited: set = set()
         self._grasp_sm = None
         self._grasp_obj_idx = None
         self._grasp_ik_active = False
@@ -1613,6 +1701,7 @@ class AlgSolution:
         self.start_pick_idx = None
         self.start_stand_idx = None
         self.v_list = [0.0 for _ in range(8)]
+        self._apply_search_detect_arm_hold()
         self.cmd_max_vx = 1.0
         self.cmd_max_vy = 0.0
         self.cmd_max_wz = 1.0
@@ -1654,6 +1743,7 @@ class AlgSolution:
         self._search_last_cloud_src = None
         self._search_no_target_steps = 0
         self._search_wp_idx = 0
+        self._search_wp_visited: set = set()
         self._grasp_sm = None
         self._grasp_obj_idx = None
         self._grasp_ik_active = False
@@ -2585,7 +2675,8 @@ class AlgSolution:
         if not increased:
             return False
         if self.status not in (Status.LOCK, Status.DETECT, Status.GRASP):
-            return False
+            if not self._status_keeps_detect_arm():
+                return False
         print(
             f"[TaskB][TouchScore] platform_score +{score - prev:.2f} "
             f"({prev:.2f}->{score:.2f}) status={self.status.name} -> STAND",
@@ -2661,7 +2752,7 @@ class AlgSolution:
         self.status = Status.STAND
         self.get_down = False
         self.start_stand_idx = self.cur_idx
-        self.v_list = [0.0 for _ in range(8)]
+        self._apply_detect_arm_hold()
         self.cmd_max_vx = 0.0
         self.cmd_max_vy = 0.0
         self.cmd_max_wz = 0.0
@@ -3534,6 +3625,7 @@ class AlgSolution:
         self._check_platform_score_touch(current_score)
 
         if self.status == Status.SEARCH:
+            self._apply_detect_arm_hold()
             if self._DIRECT_SQUAT_IK and self.start_get_down_idx is None:
                 self.status = Status.LOCK
                 self.get_down = True
@@ -3674,9 +3766,15 @@ class AlgSolution:
                 pre_steps = self.cur_idx - self._lock_prepare_start_idx
             self._set_video_hud(
                 f"status=SEARCH cmd_vx={self.cmd_max_vx:.2f} cmd_wz={self.cmd_max_wz:.2f}",
+                (
+                    f"arm_hold={self.v_list[0]:.2f},{self.v_list[1]:.2f},{self.v_list[2]:.2f}"
+                    if self._keep_detect_arm_hold()
+                    else "arm=zero"
+                ),
             )
 
         elif self.status == Status.LOCK:
+            self._apply_detect_arm_hold()
             if not self.get_down:
                 if self._lock_prepare_start_idx is None:
                     self._lock_prepare_start_idx = self.cur_idx
@@ -3715,6 +3813,7 @@ class AlgSolution:
             self._run_pick_grasp_stage(obs)
 
         elif self.status == Status.STAND and self.start_stand_idx is not None:
+            self._apply_detect_arm_hold()
             stand_elapsed = self.cur_idx - self.start_stand_idx
             self._set_video_hud(
                 f"status=STAND step={stand_elapsed}/{self._STAND_STEPS}",
@@ -3728,6 +3827,7 @@ class AlgSolution:
                     print("[TaskB] STAND done -> GO_BIN (LiDAR yaw + depth range)", flush=True)
 
         elif self.status == Status.GO_BIN:
+            self._apply_detect_arm_hold()
             if self.cur_idx % 4 == 0:
                 self._update_go_bin_cmd(obs)
                 print(
@@ -3795,21 +3895,7 @@ class AlgSolution:
                 )
             )
         ):
-            self.status = Status.DETECT
-            self.start_pick_idx = self.cur_idx
-            self._squat_start_leg_action = None
-            self._ik_phase = None
-            self._ik_phase_start = None
-            self._ik_target_pos_b = None
-            self._ik_lift_pos_b = None
-            self._ik_acquire_pos_b = None
-            self._ik_no_target_count = 0
-            self._ik_pick_active = False
-            self._pick_arm_hold_cmd = None
-            self._grasp_target_cam = None
-            self._grasp_axis_cam = None
-            self.v_list = [0.0 for _ in range(8)]
-            print("[TaskB] squat done -> DETECT", flush=True)
+            self._enter_detect_from_squat()
         hold_legs_at_current = False
         use_policy_legs = self.status in (Status.SEARCH, Status.STAND, Status.GO_BIN) or (
             self.status == Status.LOCK and not self.get_down
@@ -3846,24 +3932,8 @@ class AlgSolution:
                     )
                 )
             ):
-                self.status = Status.DETECT
-                self.start_pick_idx = self.cur_idx
-                self._squat_start_leg_action = None
-                self._ik_phase = None
-                self._ik_phase_start = None
-                self._ik_target_pos_b = None
-                self._ik_lift_pos_b = None
-                self._ik_acquire_pos_b = None
-                self._ik_no_target_count = 0
-                self._ik_pick_active = False
-                self._pick_arm_hold_cmd = None
-                self._grasp_target_cam = None
-                self._grasp_axis_cam = None
-                self.v_list = [0.0 for _ in range(8)]
-                print("[TaskB] squat done -> DETECT", flush=True)
+                self._enter_detect_from_squat()
             action[:12] = squat_pose
-        if self.status in (Status.DETECT, Status.GRASP):
-            action[12:20] = self.v_list
-        else:
-            action[12:20] = [0.0 for _ in range(8)]
+        self._apply_detect_arm_hold()
+        action[12:20] = self._arm_action_output()
         return {'action': [float(x) for x in action], 'giveup': False}

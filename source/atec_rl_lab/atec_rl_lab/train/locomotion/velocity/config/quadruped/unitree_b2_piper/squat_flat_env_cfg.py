@@ -1,6 +1,5 @@
-"""Backward-compatible aliases for squat transition env config."""
+"""Backward-compatible aliases for squat / low-EE locomotion env config."""
 
-from .squat_env_cfg import UnitreeB2PiperSquatFlatEnvCfg, squat_target_pose_exp
+from .squat_env_cfg import UnitreeB2PiperSquatFlatEnvCfg
 
-# Keep old class name import paths working.
 UnitreeB2PiperFlatSquatEnvCfg = UnitreeB2PiperSquatFlatEnvCfg
