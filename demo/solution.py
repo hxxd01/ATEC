@@ -155,15 +155,15 @@ class AlgSolution:
     _SEARCH_BIN_FILTER_ENABLE = os.environ.get("ATEC_SEARCH_BIN_FILTER_ENABLE", "0").strip().lower() in (
         "1", "true", "yes", "on"
     )
-    _SEARCH_BIN_FILTER_MIN_HEIGHT = float(os.environ.get("ATEC_SEARCH_BIN_FILTER_MIN_HEIGHT", "0.3"))
+    _SEARCH_BIN_FILTER_MIN_HEIGHT = float(os.environ.get("ATEC_SEARCH_BIN_FILTER_MIN_HEIGHT", "0.4"))
     _SEARCH_BIN_AVOID_ENABLE = os.environ.get("ATEC_SEARCH_BIN_AVOID_ENABLE", "1").strip().lower() in (
         "1", "true", "yes", "on"
     )
-    _SEARCH_BIN_AVOID_TARGET_ZMAX = float(os.environ.get("ATEC_SEARCH_BIN_AVOID_TARGET_ZMAX", "0.3"))
+    _SEARCH_BIN_AVOID_TARGET_ZMAX = float(os.environ.get("ATEC_SEARCH_BIN_AVOID_TARGET_ZMAX", "0.4"))
     _SEARCH_BIN_AVOID_REVERSE_VX = float(os.environ.get("ATEC_SEARCH_BIN_AVOID_REVERSE_VX", "-0.22"))
     _SEARCH_BIN_AVOID_WZ_GAIN = float(os.environ.get("ATEC_SEARCH_BIN_AVOID_WZ_GAIN", "1.2"))
     _SEARCH_BIN_AVOID_MAX_WZ = float(os.environ.get("ATEC_SEARCH_BIN_AVOID_MAX_WZ", "0.7"))
-    _SEARCH_BIN_RGB_ENABLE = os.environ.get("ATEC_SEARCH_BIN_RGB_ENABLE", "1").strip().lower() in (
+    _SEARCH_BIN_RGB_ENABLE = os.environ.get("ATEC_SEARCH_BIN_RGB_ENABLE", "0").strip().lower() in (
         "1", "true", "yes", "on"
     )
     _SEARCH_BIN_RGB_BEARING_TOL = float(os.environ.get("ATEC_SEARCH_BIN_RGB_BEARING_TOL", "0.75"))
@@ -1231,6 +1231,7 @@ class AlgSolution:
         self._lock_prepare_start_idx = None
         self._lock_prezero_settle_count = 0
         self._lock_arrive_confirm_count = 0
+        self._lock_commit_confirm_count = 0
         self._squat_start_leg_action = None
         self._search_track_target = None
         self._search_last_seen_dist = None
@@ -3565,26 +3566,26 @@ class AlgSolution:
                     and (not memory_target_used)
                     and self._SEARCH_BIN_AVOID_ENABLE
                 ):
-                    rgb_lidar_hit, rgb_lidar_info = self._search_target_bin_rgb_lidar(obs, target)
+                    zmax_hit = (
+                        self._search_last_target_zmax is not None
+                        and float(self._search_last_target_zmax) > self._SEARCH_BIN_AVOID_TARGET_ZMAX
+                    )
                     if self.cur_idx % max(self._SEARCH_DEBUG_PRINT_EVERY, 1) == 0:
                         print(
                             "[TaskB][SEARCH][bin-check] "
-                            f"hit={rgb_lidar_hit} "
-                            f"bearing_err={rgb_lidar_info.get('bearing_err')} "
-                            f"yellow={rgb_lidar_info.get('yellow_ratio')} "
-                            f"bin_bearing={rgb_lidar_info.get('bin_bearing')} "
-                            f"target_bearing={rgb_lidar_info.get('target_bearing')}",
+                            f"hit={zmax_hit} "
+                            f"target_zmax={self._search_last_target_zmax} "
+                            f"th={self._SEARCH_BIN_AVOID_TARGET_ZMAX}",
                             flush=True,
                         )
-                    if not rgb_lidar_hit:
-                        rgb_lidar_info = {}
-                    else:
+                    if zmax_hit:
                         self._lock_commit_confirm_count = 0
                         self._search_memory_age = None
                         tx = float(target[0])
                         ty = float(target[1])
                         target_bearing = float(np.arctan2(ty, tx))
-                        self.cmd_max_vx = self._SEARCH_BIN_AVOID_REVERSE_VX
+                        # Bin detected in SEARCH: rotate in place only (yaw), no forward/backward motion.
+                        self.cmd_max_vx = 0.0
                         self.cmd_max_vy = 0.0
                         self.cmd_max_wz = float(np.clip(
                             -self._SEARCH_BIN_AVOID_WZ_GAIN * target_bearing,
@@ -3592,19 +3593,20 @@ class AlgSolution:
                             self._SEARCH_BIN_AVOID_MAX_WZ,
                         ))
                         self._set_video_hud(
-                            "status=SEARCH phase=bin-avoid rgb+lidar",
-                            f"rgb_lidar={rgb_lidar_hit} yellow={rgb_lidar_info.get('yellow_ratio')}",
+                            "status=SEARCH phase=bin-avoid zmax",
+                            f"target_zmax={self._search_last_target_zmax}",
                             f"cmd_vx={self.cmd_max_vx:.2f} cmd_wz={self.cmd_max_wz:.2f}",
                         )
                         print(
-                            f"[TaskB][SEARCH] bin-avoid rgb_lidar_hit={rgb_lidar_hit} "
-                            f"yellow={rgb_lidar_info.get('yellow_ratio')} "
-                            f"bearing_err={rgb_lidar_info.get('bearing_err')} target=({tx:.2f},{ty:.2f}) "
+                            f"[TaskB][SEARCH] bin-avoid zmax_hit={zmax_hit} "
+                            f"target_zmax={self._search_last_target_zmax} target=({tx:.2f},{ty:.2f}) "
                             f"cmd=({self.cmd_max_vx:.2f},{self.cmd_max_wz:.2f})",
                             flush=True,
                         )
                         bin_avoid_active = True
                 # Separate confirmation gate for commit-lock branch to avoid single-frame false locks.
+                if not hasattr(self, "_lock_commit_confirm_count"):
+                    self._lock_commit_confirm_count = 0
                 if (not bin_avoid_active) and (
                     target is not None
                     and min_dist is not None
