@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import gymnasium as gym
+import isaaclab.utils.math as math_utils
 import numpy as np
 import torch
 
 from .taskd_student_env import TaskDStudentEnv
 from .taskd_teacher_env import _LEG_DIM
-from atec_rl_lab.train.locomotion.velocity.mdp.events import DETECT_HOLD_ARM_ACTION
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
@@ -20,11 +20,11 @@ TASK_B_SCORED_MASK_DIM = TASK_B_NUM_OBJECTS
 TASK_B_CRITIC_EXTRA_DIM = (
     4 + 3 + 2 + 1 + 1 + 1 + TASK_B_SCORED_MASK_DIM + TASK_B_NUM_OBJECTS * 3
 )
-# Detect-hold arm command baked into the env action so the action manager's PD
-# target keeps the arm at the Task-B DETECT pose every sim step (the interval
-# event alone gets overwritten by the next apply_action). Same values the squat
-# flat training (ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0) drives via policy.
-_TASK_B_DETECT_ARM_ACTION = torch.tensor(DETECT_HOLD_ARM_ACTION, dtype=torch.float32)
+# Low-clear arm hold: keep EE relatively low while pulling shoulder/elbow aside
+# to reduce head-camera occlusion during nav training.
+_TASK_B_LOW_CLEAR_ARM_ACTION = torch.tensor(
+    (-1.2, 4.4, -2.6, 1.0, 0.0, 0.0, 0.0, 0.0), dtype=torch.float32
+)
 
 
 class TaskBStudentEnv(TaskDStudentEnv):
@@ -36,9 +36,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ll_policy_path: str,
         device: str = "cuda",
         inner_steps: int = 25,
-        vx_min: float = -2.0,
-        vx_max: float = 2.0,
-        vy_max: float = 1.0,
+        vx_min: float = -4.0,
+        vx_max: float = 4.0,
+        vy_max: float = 2.0,
         wz_max: float = 1.0,
         image_h: int = 24,
         image_w: int = 32,
@@ -46,13 +46,15 @@ class TaskBStudentEnv(TaskDStudentEnv):
         depth_max: float = 5.0,
         depth_only: bool = False,
         nav_log_interval: int = 10,
-        w_dense_dist: float = 1.0,
+        w_dense_dist: float = 0.3,
         sparse_touch_reward: float = 10.0,
         grasp_dist_thresh: float = TASK_B_GRASP_DIST,
-        time_penalty_per_env_step: float = 0.01,
+        time_penalty_per_env_step: float = 0.004,
         ee_body_name: str = "gripper_base",
-        no_touch_timeout_s: float = 5.0,
+        no_touch_timeout_s: float = 12.0,
         finished_reward: float = 100.0,
+        visible_depth_tol: float = 0.25,
+        visible_check_depth: bool = False,
     ):
         super().__init__(
             env=env,
@@ -72,6 +74,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         self._nav_log_tag = "TaskBStudent"
         self._w_dense_dist = float(w_dense_dist)
+        self._dense_enabled = self._w_dense_dist > 0.0
         self._sparse_touch_reward = float(sparse_touch_reward)
         self._grasp_dist_thresh = float(grasp_dist_thresh)
         self._grasp_dist_sq = self._grasp_dist_thresh * self._grasp_dist_thresh
@@ -79,6 +82,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._ee_body_name = str(ee_body_name)
         self._no_touch_timeout_s = float(no_touch_timeout_s)
         self._finished_reward = float(finished_reward)
+        self._visible_depth_tol = float(visible_depth_tol)
+        self._visible_check_depth = bool(visible_check_depth)
         self._env_step_dt = float(getattr(self.env.unwrapped, "step_dt", 0.02))
 
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
@@ -96,8 +101,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
 
         self._ee_body_idx: int | None = None
-        self._prev_min_xy_dist = torch.full(
-            (self.num_envs,), float("nan"), device=self._device, dtype=torch.float32
+        self._prev_obj_dist_3d = torch.full(
+            (self.num_envs, TASK_B_NUM_OBJECTS),
+            float("nan"),
+            device=self._device,
+            dtype=torch.float32,
         )
         self._scored = torch.zeros(
             (self.num_envs, TASK_B_NUM_OBJECTS), device=self._device, dtype=torch.bool
@@ -131,7 +139,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         print(
             f"[TaskBStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
             f"(+{self._critic_extra_dim} priv: robot/ee/r_vel/contact/min_dist/scored/trash) "
-            f"dense_w={self._w_dense_dist} sparse_touch={self._sparse_touch_reward} "
+            f"dense_w={self._w_dense_dist} dense={'visible_per_object_3d' if self._dense_enabled else 'off(sparse_only)'} "
+            f"depth_check={self._visible_check_depth} depth_tol={self._visible_depth_tol} "
+            f"sparse_touch={self._sparse_touch_reward} "
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
@@ -181,6 +191,73 @@ class TaskBStudentEnv(TaskDStudentEnv):
         dist_3d = torch.where(torch.isfinite(min_xy_dist), dist_3d, torch.full_like(dist_3d, float("inf")))
         return min_xy_dist, nearest_idx, dist_3d, dist_xy
 
+    def _camera_depth_map(self, cam_name: str) -> torch.Tensor | None:
+        if not self._visible_check_depth:
+            return None
+        try:
+            cam = self.env.unwrapped.scene[cam_name]
+            out = cam.data.output
+            if out is None or "depth" not in out:
+                return None
+            depth = out["depth"].to(device=self._device, dtype=torch.float32)
+            if depth.ndim == 4 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            elif depth.ndim == 4 and depth.shape[1] == 1:
+                depth = depth[:, 0]
+            return depth
+        except Exception:
+            return None
+
+    def _objects_in_camera_frustum(self, obj_pos_w: torch.Tensor, cam_name: str) -> torch.Tensor:
+        """Fast frustum test: in front of cam and inside image bounds (no depth read)."""
+        try:
+            cam = self.env.unwrapped.scene[cam_name]
+            cam_pos = cam.data.pos_w[:, :3].to(device=self._device, dtype=torch.float32)
+            cam_quat = cam.data.quat_w_world.to(device=self._device, dtype=torch.float32)
+            intrinsics = cam.data.intrinsic_matrices.to(device=self._device, dtype=torch.float32)
+            height, width = cam.data.image_shape
+        except Exception:
+            return torch.zeros(obj_pos_w.shape[:2], device=self._device, dtype=torch.bool)
+
+        batch, num_obj, _ = obj_pos_w.shape
+        obj_flat = obj_pos_w.reshape(batch * num_obj, 3)
+        cam_pos_rep = cam_pos.unsqueeze(1).expand(batch, num_obj, 3).reshape(batch * num_obj, 3)
+        cam_quat_rep = cam_quat.unsqueeze(1).expand(batch, num_obj, 4).reshape(batch * num_obj, 4)
+        obj_cam, _ = math_utils.subtract_frame_transforms(cam_pos_rep, cam_quat_rep, obj_flat)
+        obj_cam = obj_cam.reshape(batch, num_obj, 3)
+        proj = math_utils.project_points(obj_cam, intrinsics)
+        u, v, obj_depth = proj[..., 0], proj[..., 1], proj[..., 2]
+        in_front = obj_depth > 0.05
+        in_bounds = (u >= 0.0) & (u <= float(width - 1)) & (v >= 0.0) & (v <= float(height - 1))
+        visible = in_front & in_bounds
+
+        if self._visible_check_depth:
+            depth_map = self._camera_depth_map(cam_name)
+            if depth_map is not None:
+                ui = u.round().long().clamp(0, width - 1)
+                vi = v.round().long().clamp(0, height - 1)
+                env_ids = torch.arange(batch, device=self._device).unsqueeze(1).expand(batch, num_obj)
+                sampled = depth_map[env_ids, vi, ui]
+                sampled = torch.nan_to_num(sampled, nan=0.0, posinf=0.0, neginf=0.0)
+                depth_ok = (sampled > 0.05) & (sampled + self._visible_depth_tol >= obj_depth)
+                visible = visible & depth_ok
+        return visible
+
+    def _visible_unscored_mask(self, obj_pos_w: torch.Tensor) -> torch.Tensor:
+        """Unscored trash visible in head or ee camera frustum (optional depth occlusion)."""
+        visible = self._objects_in_camera_frustum(obj_pos_w, "head_camera")
+        visible = visible | self._objects_in_camera_frustum(obj_pos_w, "ee_camera")
+        return visible & (~self._scored)
+
+    def _nearest_visible_unscored_3d(
+        self, dist_3d_all: torch.Tensor, visible_unscored: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Min EE-3D among visible unscored trash (logging / critic-style oracle)."""
+        masked = dist_3d_all.masked_fill(~visible_unscored, float("inf"))
+        min_dist, _ = masked.min(dim=1)
+        visible_count = visible_unscored.sum(dim=1).to(dtype=torch.float32)
+        return min_dist, visible_count
+
     def _touch_score_sparse(
         self, dist_3d_all: torch.Tensor, active_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -219,18 +296,34 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         return active & (self._time_since_last_touch_s >= self._no_touch_timeout_s)
 
-    def _dense_xy_progress(
-        self, min_xy_dist: torch.Tensor, active_mask: torch.Tensor | None = None
+    def _dense_visible_per_object_progress(
+        self,
+        dist_3d_all: torch.Tensor,
+        visible_unscored: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        valid = torch.isfinite(min_xy_dist)
+        """Dense on visible unscored trash with per-object prev (no argmin jitter).
+
+        Reward = ``w * sum_i max(0, prev_i - dist_i)`` over visible unscored objects.
+        Each object keeps its own ``prev_i``; after touch only that object's prev clears.
+        This matches "approach visible targets" without spiking when the nearest id switches.
+        """
+        valid = visible_unscored
         if active_mask is not None:
-            valid = valid & active_mask
-        prev = self._prev_min_xy_dist
+            valid = valid & active_mask.unsqueeze(-1)
+
+        prev = self._prev_obj_dist_3d
         init = torch.isnan(prev) | ~valid
-        delta = torch.where(init, torch.zeros_like(min_xy_dist), prev - min_xy_dist)
-        delta = torch.where(valid, delta, torch.zeros_like(delta))
-        dense = self._w_dense_dist * delta
-        self._prev_min_xy_dist = torch.where(valid, min_xy_dist.clone(), prev)
+        delta = torch.clamp(prev - dist_3d_all, min=0.0)
+        delta = torch.where(init | ~valid, torch.zeros_like(delta), delta)
+        dense = self._w_dense_dist * delta.sum(dim=1)
+
+        nan_fill = torch.full_like(self._prev_obj_dist_3d, float("nan"))
+        self._prev_obj_dist_3d = torch.where(
+            self._scored,
+            nan_fill,
+            torch.where(valid, dist_3d_all, nan_fill),
+        )
         return dense
 
     def _env_origins(self) -> torch.Tensor:
@@ -255,9 +348,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
         to the DETECT pose.
         """
         batch = ll_action_train.shape[0]
-        action = torch.zeros(batch, _LEG_DIM + _TASK_B_DETECT_ARM_ACTION.shape[0], device=self._device, dtype=torch.float32)
+        action = torch.zeros(
+            batch, _LEG_DIM + _TASK_B_LOW_CLEAR_ARM_ACTION.shape[0], device=self._device, dtype=torch.float32
+        )
         action[:, :_LEG_DIM] = ll_action_train * self._t2e
-        action[:, _LEG_DIM:] = _TASK_B_DETECT_ARM_ACTION.to(self._device).expand(batch, -1)
+        action[:, _LEG_DIM:] = _TASK_B_LOW_CLEAR_ARM_ACTION.to(self._device).expand(batch, -1)
         return action
 
     def _robot_pose_local(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -323,7 +418,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         if base.sim.has_rtx_sensors() and int(getattr(base.cfg, "num_rerenders_on_reset", 0)) > 0:
             for _ in range(int(base.cfg.num_rerenders_on_reset)):
                 base.sim.render()
-        self._prev_min_xy_dist[env_ids] = float("nan")
+        self._prev_obj_dist_3d[env_ids] = float("nan")
         self._scored[env_ids] = False
         self._time_since_last_touch_s[env_ids] = 0.0
         self._episode_finished[env_ids] = False
@@ -332,7 +427,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self._current_obs = obs
-        self._prev_min_xy_dist.fill_(float("nan"))
+        self._prev_obj_dist_3d.fill_(float("nan"))
         self._scored.fill_(False)
         self._time_since_last_touch_s.zero_()
         self._episode_finished.zero_()
@@ -412,15 +507,14 @@ class TaskBStudentEnv(TaskDStudentEnv):
             sparse, newly_scored = self._touch_score_sparse(
                 dist_3d_all, active_mask=active_after_base_done
             )
-            if bool(newly_scored.any()):
-                self._prev_min_xy_dist = torch.where(
-                    newly_scored,
-                    torch.full_like(self._prev_min_xy_dist, float("nan")),
-                    self._prev_min_xy_dist,
-                )
 
-            min_xy_dist, _, _, _ = self._nearest_unscored_trash_metrics()
-            dense = self._dense_xy_progress(min_xy_dist, active_mask=active_after_base_done)
+            if self._dense_enabled:
+                visible_unscored = self._visible_unscored_mask(obj_pos)
+                dense = self._dense_visible_per_object_progress(
+                    dist_3d_all, visible_unscored, active_mask=active_after_base_done
+                )
+            else:
+                dense = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
             time_pen = torch.full_like(dense, -self._time_penalty_per_env_step)
 
             all_scored = self._scored.all(dim=1)
@@ -464,10 +558,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 self._illegal_at_term_count += int(illegal_flags.sum().item())
                 self._fall_at_term_count += int(fall_flags.sum().item())
                 self._timeout_at_term_count += int(timeout_flags.sum().item())
-                self._prev_min_xy_dist = torch.where(
-                    done_now,
-                    torch.full_like(self._prev_min_xy_dist, float("nan")),
-                    self._prev_min_xy_dist,
+                self._prev_obj_dist_3d = torch.where(
+                    done_now.unsqueeze(-1),
+                    torch.full_like(self._prev_obj_dist_3d, float("nan")),
+                    self._prev_obj_dist_3d,
                 )
                 self._scored = torch.where(
                     done_now.unsqueeze(-1),
@@ -496,27 +590,45 @@ class TaskBStudentEnv(TaskDStudentEnv):
 
         if self._nav_log_interval > 0 and self._nav_step_count % self._nav_log_interval == 0:
             min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
+            if self._dense_enabled:
+                obj_pos_log = self._object_root_pos_w()
+                ee_log = self._ee_pos_w()
+                dist_log = torch.linalg.norm(obj_pos_log - ee_log.unsqueeze(1), dim=-1)
+                vis_log = self._visible_unscored_mask(obj_pos_log)
+                min_vis_3d, visible_count = self._nearest_visible_unscored_3d(dist_log, vis_log)
+                min_vis_3d_mean = (
+                    min_vis_3d[torch.isfinite(min_vis_3d)].mean().item()
+                    if torch.isfinite(min_vis_3d).any()
+                    else float("nan")
+                )
+                visible_mean = visible_count.mean().item()
+            else:
+                min_vis_3d_mean = float("nan")
+                visible_mean = 0.0
             scored = self._scored.sum(dim=1).float().mean().item()
             vel_cmd = self._nav_action_to_vel_cmd(nav_action)
             rx, ry, rz = self._robot_pose()
-            denom = max(1, self._done_total)
+            base_denom = max(1, self._done_total)
+            term_denom = max(1, self._scored_at_term_count)
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
                 f"[dense/sparse/finished/time]={total_dense.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
                 f"{total_time_pen.mean().item():+.3f} "
-                f"min_xy_unscored={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
-                f"min_3d_unscored={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
+                f"min_visible_3d={min_vis_3d_mean:.2f} "
+                f"visible_mean={visible_mean:.1f} "
+                f"min_3d_oracle={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
+                f"min_xy_oracle={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "
                 f"dones={int((terminated | truncated).sum())}/{self.num_envs} "
                 f"pos0=({rx[0,0].item():+.1f},{ry[0,0].item():+.1f},{rz[0,0].item():+.2f}) "
                 f"cmd0=({vel_cmd[0,0].item():+.2f},{vel_cmd[0,1].item():+.2f},{vel_cmd[0,2].item():+.2f}) "
                 f"done[illegal/fall/timeout/no_touch/finished]={self._done_illegal}/{self._done_fall}/"
                 f"{self._done_timeout}/{self._done_no_touch}/{self._done_finished} "
-                f"ratio={self._done_illegal/denom:.2f}/{self._done_fall/denom:.2f}/"
-                f"{self._done_timeout/denom:.2f}/{self._done_no_touch/denom:.2f}/"
-                f"{self._done_finished/denom:.2f}",
+                f"ratio_base={self._done_illegal/base_denom:.2f}/{self._done_fall/base_denom:.2f}/"
+                f"{self._done_timeout/base_denom:.2f} "
+                f"ratio_wrap={self._done_no_touch/term_denom:.2f}/{self._done_finished/term_denom:.2f}",
                 flush=True,
             )
 

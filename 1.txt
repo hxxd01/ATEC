@@ -416,6 +416,8 @@ python scripts/train_nav_taskb_student.py \
   --policy_img_h 24 \
   --policy_img_w 32 \
   --max_iter 10000 \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskb_student_b2piper/2026-06-26_01-58-05/model_200.pt \
+  --sparse_only \
   --headless
 OMNI_KIT_ACCEPT_EULA=Y ATEC_ENABLE_GRASPNET=1 ATEC_ENABLE_ANYGRASP=0 ATEC_GRASP_USE_TASKE_IK=0 ATEC_GRASPNET_TARGET_OBJECT=banana ATEC_SEARCH_USE_HEAD_ROTATED_POINTS=1 python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --device cuda:0 --depth-lidar  --debug --headless --platform_deploy
 

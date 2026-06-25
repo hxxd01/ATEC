@@ -20,10 +20,12 @@ _HOLD_ARM_JOINT_NAMES = (
     "arm_joint7",
     "arm_joint8",
 )
+# Keep EE relatively low while pulling shoulder/elbow aside to reduce head-camera occlusion.
+_LOW_CLEAR_HOLD_ARM_ACTION = (-1.2, 4.4, -2.6, 1.0, 0.0, 0.0, 0.0, 0.0)
 _HOLD_ARM_PARAMS = {
     "asset_cfg": SceneEntityCfg("robot"),
     "arm_joint_names": _HOLD_ARM_JOINT_NAMES,
-    "arm_action": atec_mdp.DETECT_HOLD_ARM_ACTION,
+    "arm_action": _LOW_CLEAR_HOLD_ARM_ACTION,
     "action_scale": atec_mdp.DETECT_HOLD_ARM_ACTION_SCALE,
 }
 
@@ -105,7 +107,7 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
             func=atec_mdp.ee_height_exp,
             weight=3.0,
             params={
-                "target_height": 0.20,
+                "target_height": 0.24,
                 "std": 0.05,
                 "ee_body_name": "gripper_base",
             },

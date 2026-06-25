@@ -50,7 +50,12 @@ parser.add_argument(
 parser.add_argument("--tiled_cameras", action="store_true", help="Use TiledCameraCfg for head/ee.")
 parser.add_argument("--camera_far_clip", type=float, default=50.0)
 parser.add_argument("--nav_log_interval", type=int, default=10)
-parser.add_argument("--w_dense_dist", type=float, default=1.0, help="Dense reward scale for EE-trash XY progress.")
+parser.add_argument("--w_dense_dist", type=float, default=0.3, help="Dense reward scale for visible unscored EE-3D progress.")
+parser.add_argument(
+    "--sparse_only",
+    action="store_true",
+    help="Disable dense shaping (force w_dense_dist=0, skip visibility/depth dense logic).",
+)
 parser.add_argument(
     "--sparse_touch_reward",
     type=float,
@@ -67,7 +72,7 @@ parser.add_argument(
 parser.add_argument(
     "--no_touch_timeout_s",
     type=float,
-    default=12.0,
+    default=5.0,
     help="Truncate episode if no new platform touch score for this many sim seconds (0=off).",
 )
 parser.add_argument(
@@ -75,6 +80,17 @@ parser.add_argument(
     type=float,
     default=100.0,
     help="One-time reward when all 18 objects are platform-scored in one episode.",
+)
+parser.add_argument(
+    "--visible_depth_tol",
+    type=float,
+    default=0.25,
+    help="Depth occlusion tolerance (m) when --visible_check_depth is set.",
+)
+parser.add_argument(
+    "--visible_check_depth",
+    action="store_true",
+    help="Enable depth-buffer occlusion for dense visible target (slower; default is frustum-only).",
 )
 parser.add_argument("--video", action="store_true", default=False, help="Record rollout video(s) during training.")
 parser.add_argument(
@@ -227,6 +243,9 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool
 
 def main():
     device = args_cli.device if args_cli.device else "cuda"
+    if args_cli.sparse_only:
+        args_cli.w_dense_dist = 0.0
+        args_cli.visible_check_depth = False
 
     policy_h = int(args_cli.policy_img_h)
     policy_w = int(args_cli.policy_img_w)
@@ -339,6 +358,8 @@ def main():
         time_penalty_per_env_step=args_cli.time_penalty_per_env_step,
         no_touch_timeout_s=args_cli.no_touch_timeout_s,
         finished_reward=args_cli.finished_reward,
+        visible_depth_tol=args_cli.visible_depth_tol,
+        visible_check_depth=args_cli.visible_check_depth,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
 
@@ -362,6 +383,8 @@ def main():
         f"sim_cam={cam_h}x{cam_w} policy={policy_h}x{policy_w} "
         f"cams=head+ee img={img_ch}ch depth_only={args_cli.depth_only} "
         f"rewards dense={args_cli.w_dense_dist} sparse={args_cli.sparse_touch_reward} "
+        f"sparse_only={args_cli.sparse_only} "
+        f"visible_depth={args_cli.visible_check_depth} depth_tol={args_cli.visible_depth_tol} "
         f"time_pen={args_cli.time_penalty_per_env_step} no_touch_timeout_s={args_cli.no_touch_timeout_s} "
         f"finished_reward={args_cli.finished_reward}",
         flush=True,
