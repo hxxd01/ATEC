@@ -112,6 +112,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
         # into extras["log"] each nav step so rsl_rl logs it to the table.
         self._scored_at_term_sum = 0.0
         self._scored_at_term_count = 0
+        # Per-step termination-type counters (no_touch / finished are wrapper-level
+        # truncations not registered in the MDP termination manager, so we surface
+        # them through extras["log"] too).
+        self._no_touch_at_term_count = 0
+        self._finished_at_term_count = 0
         self._touch_total = 0
         print(
             f"[TaskBStudent] actor_dim={self._actor_dim}, critic=[proprio={TASK_B_PROPRIO_DIM}, "
@@ -292,6 +297,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._touch_total = 0
         self._scored_at_term_sum = 0.0
         self._scored_at_term_count = 0
+        self._no_touch_at_term_count = 0
+        self._finished_at_term_count = 0
         self._logged_first_rollout = False
         return self._obs_dict(obs), info
 
@@ -371,6 +378,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 terminated |= finished_now
                 self._done_finished += int(finished_now.sum().item())
                 self._record_scored_at_termination(finished_now)
+                self._finished_at_term_count += int(finished_now.sum().item())
                 self._partial_reset_envs(finished_now)
 
             no_touch_done = self._update_no_touch_timer(newly_scored, active & (~finished_now))
@@ -379,6 +387,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 truncated |= no_touch_done
                 self._done_no_touch += int(no_touch_done.sum().item())
                 self._record_scored_at_termination(no_touch_done)
+                self._no_touch_at_term_count += int(no_touch_done.sum().item())
                 self._partial_reset_envs(no_touch_done)
 
             alive_f = active.to(dtype=dense.dtype)
@@ -449,13 +458,21 @@ class TaskBStudentEnv(TaskDStudentEnv):
             )
 
         # Log mean scored objects over envs that terminated this nav step.
-        # Injected into extras["log"] so rsl_rl prints it in the training table.
+        # Inject termination metrics into extras["log"] so rsl_rl prints them in
+        # the training table. scored_objects = mean #scored at termination;
+        # no_touch / finished = fraction of terminations of each wrapper-level
+        # type (these aren't in the MDP termination manager, unlike fall/time_out).
         if self._scored_at_term_count > 0:
-            mean_scored = self._scored_at_term_sum / float(self._scored_at_term_count)
+            total_term = float(self._scored_at_term_count)
+            mean_scored = self._scored_at_term_sum / total_term
             last_info = dict(last_info) if last_info is not None else {}
             log_dict = last_info.setdefault("log", {})
             log_dict["Episode_Termination/scored_objects"] = mean_scored
+            log_dict["Episode_Termination/no_touch"] = self._no_touch_at_term_count / total_term
+            log_dict["Episode_Termination/finished"] = self._finished_at_term_count / total_term
             self._scored_at_term_sum = 0.0
             self._scored_at_term_count = 0
+            self._no_touch_at_term_count = 0
+            self._finished_at_term_count = 0
 
         return self._obs_dict(self._current_obs), total_reward, terminated, truncated, last_info

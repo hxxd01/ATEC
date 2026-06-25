@@ -263,10 +263,11 @@ class TaskBNavEnvB2Cfg(TaskBEnvB2Cfg):
         apply_task_b_nav_train_overrides(self)
         apply_task_d_camera_depth_clip(self.scene, TASK_B_PLATFORM_CAMERA_FAR)
 
-        # NOTE: keep reset_robot_joints enabled — it drives the legs to the B2
-        # standing pose on reset. Disabling it leaves joints wherever the
-        # previous (fallen) episode ended, so the robot collapses from spawn
-        # height and trips `fall` within ~0.5s.
+        # reset_robot_joints stays None (inherited from TaskBEnvCfg): on reset the
+        # joints keep the USD defaults, so the legs start at the B2 standing pose
+        # AND the arm starts at its USD default — matching the squat-flat training
+        # (ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0). The arm is then driven to the
+        # DETECT pose during rollout by hold_detect_arm_interval below.
         self.events.reset_robot_root = EventTerm(
             func=reset_root_state_at_env_origin,
             mode="reset",
