@@ -42,7 +42,11 @@ parser.add_argument(
     help="Native sim head/ee camera width.",
 )
 parser.add_argument("--depth_max", type=float, default=5.0)
-parser.add_argument("--depth_only", action="store_true", help="Cameras output depth only (1ch per cam).")
+parser.add_argument(
+    "--depth_only",
+    action="store_true",
+    help="Depth-only (1ch/cam). Default without this flag: head+ee dual cam, rgb+depth (4ch/cam).",
+)
 parser.add_argument("--tiled_cameras", action="store_true", help="Use TiledCameraCfg for head/ee.")
 parser.add_argument("--camera_far_clip", type=float, default=50.0)
 parser.add_argument("--nav_log_interval", type=int, default=10)
@@ -59,6 +63,18 @@ parser.add_argument(
     type=float,
     default=0.01,
     help="Time penalty each low-level env step.",
+)
+parser.add_argument(
+    "--no_touch_timeout_s",
+    type=float,
+    default=5.0,
+    help="Truncate episode if no new platform touch score for this many sim seconds (0=off).",
+)
+parser.add_argument(
+    "--finished_reward",
+    type=float,
+    default=100.0,
+    help="One-time reward when all 18 objects are platform-scored in one episode.",
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -247,6 +263,14 @@ def main():
 
     ll_policy_path = _resolve_policy_path(args_cli.ll_policy)
 
+    img_ch = 1 if args_cli.depth_only else 4
+    cam_mode = "depth-only 1ch" if args_cli.depth_only else "rgb+depth 4ch"
+    print(
+        f"[INFO] TaskB cameras: head+ee dual cam, {cam_mode}/cam, "
+        f"sim={cam_h}x{cam_w} -> policy={policy_h}x{policy_w}",
+        flush=True,
+    )
+
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     nav_env = TaskBStudentEnv(
         env=env,
@@ -266,6 +290,8 @@ def main():
         sparse_touch_reward=args_cli.sparse_touch_reward,
         grasp_dist_thresh=args_cli.grasp_dist_thresh,
         time_penalty_per_env_step=args_cli.time_penalty_per_env_step,
+        no_touch_timeout_s=args_cli.no_touch_timeout_s,
+        finished_reward=args_cli.finished_reward,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
 
@@ -286,9 +312,11 @@ def main():
     print(f"[INFO] Logging to: {log_dir}", flush=True)
     print(
         f"[INFO] TaskB nav train: num_envs={args_cli.num_envs} inner_steps={args_cli.inner_steps} "
-        f"sim_cam={cam_h}x{cam_w} policy={policy_h}x{policy_w} depth_only={args_cli.depth_only} "
+        f"sim_cam={cam_h}x{cam_w} policy={policy_h}x{policy_w} "
+        f"cams=head+ee img={img_ch}ch depth_only={args_cli.depth_only} "
         f"rewards dense={args_cli.w_dense_dist} sparse={args_cli.sparse_touch_reward} "
-        f"time_pen={args_cli.time_penalty_per_env_step}",
+        f"time_pen={args_cli.time_penalty_per_env_step} no_touch_timeout_s={args_cli.no_touch_timeout_s} "
+        f"finished_reward={args_cli.finished_reward}",
         flush=True,
     )
     print("[INFO] Start Task B student training...", flush=True)
