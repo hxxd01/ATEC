@@ -370,6 +370,44 @@ python scripts/train_nav_taskd_student.py \
 python scripts/play_taskd_pit_student_platform.py \
   --headless --video --debug --video_length 150 \
   --pit_ckpt /home/ubuntu/ATEC/logs/rsl_rl/taskd_marg_depth_pit_dagger_b2piper/2026-06-20_00-28-28/model_200.pt
-
+export ATEC_ENABLE_GRASPNET=1
+export ATEC_GRASP_USE_TASKE_IK=0
+export ATEC_ENABLE_ANYGRASP=0
+export ATEC_GRASPNET_TARGET_OBJECT=mustard
 DISABLE_O3D_VIS=1 python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper \
-  --depth-lidar --headless --debug --video --video_length 300
+  --depth-lidar --headless --debug --video --video_length 800
+
+OMNI_KIT_ACCEPT_EULA=Y \
+ATEC_ENABLE_GRASPNET=1 \
+ATEC_GRASP_USE_TASKE_IK=0 \
+ATEC_ENABLE_ANYGRASP=0 \
+ATEC_GRASPNET_MULTIVIEW=0 \
+ATEC_GRASPNET_TARGET_OBJECT=banana \
+python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --device cuda:0 --depth-lidar --video --video_length 800 --debug --headless
+
+OMNI_KIT_ACCEPT_EULA=Y \
+ATEC_ENABLE_GRASPNET=1 \
+ATEC_ENABLE_ANYGRASP=0 \
+ATEC_GRASP_USE_TASKE_IK=0 \
+ATEC_GRASPNET_TARGET_OBJECT=banana \
+ATEC_SEARCH_USE_HEAD_ROTATED_POINTS=1 \
+python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --device cuda:0 --depth-lidar  --debug --headless --video --video_length 800
+
+export ATEC_SEARCH_USE_HEAD_ROTATED_POINTS=1(1是香蕉)
+export ATEC_SEARCH_BANANA_Z_MAX=0.4
+
+
+
+python scripts/rsl_rl/play.py \
+  --task ATEC-Isaac-Stand-Flat-Unitree-B2Piper-v0 \
+  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/unitree_b2_piper_flat_stand_transition/2026-06-25_06-02-13/model_200.pt \
+  --num_envs 1 \
+  --headless \
+  --video \
+  --video_length 50
+
+
+OMNI_KIT_ACCEPT_EULA=Y ATEC_ENABLE_GRASPNET=1 ATEC_ENABLE_ANYGRASP=0 ATEC_GRASP_USE_TASKE_IK=0 ATEC_GRASPNET_TARGET_OBJECT=banana ATEC_SEARCH_USE_HEAD_ROTATED_POINTS=1 python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --device cuda:0 --depth-lidar  --debug --headless --platform_deploy
+
+
+python scripts/rsl_rl/train.py   --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0   --headless   --resume   --load_run 2026-06-25_03-38-17   --checkpoint model_1700.pt

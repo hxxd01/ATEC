@@ -39,6 +39,18 @@ class UnitreeB2PiperFlatPPORunnerCfg(UnitreeB2PiperRoughPPORunnerCfg):
 
 
 @configclass
+class UnitreeB2PiperSquatFlatPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
+    max_iterations = 2000
+    experiment_name = "unitree_b2_piper_flat_squat_transition"
+
+
+@configclass
+class UnitreeB2PiperStandFlatPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
+    max_iterations = 2000
+    experiment_name = "unitree_b2_piper_flat_stand_transition"
+
+
+@configclass
 class UnitreeB2PiperTaskDPitLocomotionPPORunnerCfg(UnitreeB2PiperFlatPPORunnerCfg):
     max_iterations = 15000
     experiment_name = "taskd_pit_locomotion_b2piper"

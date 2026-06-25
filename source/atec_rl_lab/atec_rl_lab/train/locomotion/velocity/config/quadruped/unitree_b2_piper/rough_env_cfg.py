@@ -63,6 +63,10 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "yaw": (-0.5, 0.5),
             },
         }
+        # Include low-posture (squat-like) starts by widening joint reset scale.
+        # This keeps base policy stable when episodes begin from crouched legs.
+        self.events.randomize_reset_joints.params["position_range"] = (0.5, 1.5)
+        self.events.randomize_reset_joints.params["velocity_range"] = (-0.5, 0.5)
         self.events.randomize_rigid_body_mass_base.params["asset_cfg"].body_names = [self.base_link_name]
         self.events.randomize_rigid_body_mass_others.params["asset_cfg"].body_names = [
             f"^(?!.*{self.base_link_name}).*"
@@ -133,10 +137,8 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         self.terminations.illegal_contact = None
 
-        # Commands: train directly on full range (no velocity curriculum)
-        self.commands.base_velocity.ranges.lin_vel_x = (-1, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-1, 1)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1, 1)
-
-        self.curriculum.command_levels_lin_vel = None
-        self.curriculum.command_levels_ang_vel = None
+        # Commands for new base-policy retraining target.
+        self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        # Enable velocity curriculum (do not disable command-level curricula).

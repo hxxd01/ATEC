@@ -108,8 +108,8 @@ def command_levels_ang_vel(
         reward_term_cfg = env.reward_manager.get_term_cfg(reward_term_name)
         delta_command = torch.tensor([-0.1, 0.1], device=env.device)
 
-        # If the tracking reward is above 80% of the maximum, increase the range of commands
-        if torch.mean(episode_sums[env_ids]) / env.max_episode_length_s > 0.8 * reward_term_cfg.weight:
+        # If the tracking reward is above 60% of the maximum, increase the range of commands
+        if torch.mean(episode_sums[env_ids]) / env.max_episode_length_s > 0.6 * reward_term_cfg.weight:
             new_ang_vel_z = torch.tensor(base_velocity_ranges.ang_vel_z, device=env.device) + delta_command
 
             # Clamp to ensure we don't exceed final ranges

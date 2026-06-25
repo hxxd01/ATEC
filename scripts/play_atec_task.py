@@ -203,7 +203,7 @@ parser.add_argument(
 parser.add_argument(
     "--platform_deploy",
     action="store_true",
-    help="Task D: mimic server.py deploy (no bind_env, obs proprio+image depth, _marg_proprio_from_platform).",
+    help="Mimic demo/server.py: no bind_env, proprio+image obs only (Task B / Task D).",
 )
 parser.add_argument(
     "--camera_far_clip",
@@ -1181,7 +1181,10 @@ def play() -> tuple[float, float]:
             and not bool(getattr(args_cli, "no_bind_env", False))
             and not bool(getattr(args_cli, "platform_deploy", False))
         )
-        or _is_task_b_play
+        or (
+            _is_task_b_play
+            and not bool(getattr(args_cli, "platform_deploy", False))
+        )
     ):
         solution.bind_env(env)
         if _is_task_b_play:
@@ -1190,7 +1193,7 @@ def play() -> tuple[float, float]:
             print("[play] Task D: bind_env() — nav handoff uses sim root_lin_vel_w.", flush=True)
     elif bool(getattr(args_cli, "platform_deploy", False)):
         print(
-            "[play] Task D: platform_deploy — no bind_env, pit uses _marg_proprio_from_platform + image depth.",
+            "[play] platform_deploy — no bind_env (same as competition server.py).",
             flush=True,
         )
     elif bool(getattr(args_cli, "no_bind_env", False)):
