@@ -20,10 +20,10 @@ TASK_B_SCORED_MASK_DIM = TASK_B_NUM_OBJECTS
 TASK_B_CRITIC_EXTRA_DIM = (
     4 + 3 + 2 + 1 + 1 + 1 + TASK_B_SCORED_MASK_DIM + TASK_B_NUM_OBJECTS * 3
 )
-# Low-clear arm hold: keep EE relatively low while pulling shoulder/elbow aside
-# to reduce head-camera occlusion during nav training.
+# Lower-profile arm hold keeps EE lower while pulling shoulder/elbow aside to
+# reduce head-camera occlusion during nav training.
 _TASK_B_LOW_CLEAR_ARM_ACTION = torch.tensor(
-    (-1.2, 4.4, -2.6, 1.0, 0.0, 0.0, 0.0, 0.0), dtype=torch.float32
+    (0.0, 5.4, -3.6, 0.0, -1.2, 0.0, 0.0, 0.0), dtype=torch.float32
 )
 
 
@@ -36,9 +36,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ll_policy_path: str,
         device: str = "cuda",
         inner_steps: int = 25,
-        vx_min: float = -4.0,
-        vx_max: float = 4.0,
-        vy_max: float = 2.0,
+        vx_min: float = -2.0,
+        vx_max: float = 2.0,
+        vy_max: float = 1.0,
         wz_max: float = 1.0,
         image_h: int = 24,
         image_w: int = 32,

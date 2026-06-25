@@ -270,8 +270,9 @@ def reset_root_state_uniform(
         asset.write_root_velocity_to_sim(velocities, env_ids=non_pit_env_ids)
 
 
-# solution.py _detect_hold_arm_cmd() after _PICK_SCRIPTED_PRE_STEPS (34).
-DETECT_HOLD_ARM_ACTION = (0.0, 5.28, -2.38, 0.0, 0.0, 0.0, 0.0, 0.0)
+# Lower-profile hold used in locomotion/nav training: keep EE lower while
+# pulling shoulder/elbow aside to reduce head-camera occlusion.
+DETECT_HOLD_ARM_ACTION = (0.0, 5.4, -3.6, 0.0, -1.2, 0.0, 0.0, 0.0)
 DETECT_HOLD_ARM_ACTION_SCALE = 0.5
 
 
