@@ -11,10 +11,12 @@ from .taskd_teacher_env import _LIN_VEL_SLICE, _ANG_VEL_SLICE, _GRAVITY_SLICE
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
+TASK_B_CRITIC_PRIV_DIM = 4 + 2 + TASK_B_NUM_OBJECTS * 3  # robot pose(4) + ee xy(2) + trash xyz
+TASK_B_PROPRIO_DIM = 9
 
 
 class TaskBStudentEnv(TaskDStudentEnv):
-    """Nav student for Task B: dense EE-to-trash approach, sparse platform touch score, time penalty."""
+    """Nav student for Task B: dense EE-to-unscored-trash approach, sparse platform touch score."""
 
     def __init__(
         self,
@@ -67,16 +69,21 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._finished_reward = float(finished_reward)
         self._env_step_dt = float(getattr(self.env.unwrapped, "step_dt", 0.02))
 
-        # Privileged critic: robot env-local pose(4) + all trash env-local xyz(18*3) + scored frac(1)
-        self._critic_extra_dim = 4 + TASK_B_NUM_OBJECTS * 3 + 1
-        self._critic_dim = self._actor_dim + self._critic_extra_dim
+        # Critic (feedforward): proprio(9) + priv(60) + scored_mask(18)
+        self._critic_priv_dim = TASK_B_CRITIC_PRIV_DIM
         self.observation_space = gym.spaces.Dict(
             {
                 "policy": gym.spaces.Box(
                     low=-np.inf, high=np.inf, shape=(self._actor_dim,), dtype=np.float32
                 ),
-                "critic": gym.spaces.Box(
-                    low=-np.inf, high=np.inf, shape=(self._critic_dim,), dtype=np.float32
+                "proprio": gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(TASK_B_PROPRIO_DIM,), dtype=np.float32
+                ),
+                "priv": gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(self._critic_priv_dim,), dtype=np.float32
+                ),
+                "scored_mask": gym.spaces.Box(
+                    low=0.0, high=1.0, shape=(TASK_B_NUM_OBJECTS,), dtype=np.float32
                 ),
             }
         )
@@ -103,7 +110,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._done_finished = 0
         self._touch_total = 0
         print(
-            f"[TaskBStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
+            f"[TaskBStudent] actor_dim={self._actor_dim}, critic=[proprio={TASK_B_PROPRIO_DIM}, "
+            f"priv={self._critic_priv_dim}, scored_mask={TASK_B_NUM_OBJECTS}] "
             f"dense_w={self._w_dense_dist} sparse_touch={self._sparse_touch_reward} "
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
@@ -134,22 +142,24 @@ class TaskBStudentEnv(TaskDStudentEnv):
             objs.append(obj.data.root_pos_w[:, :3])
         return torch.stack(objs, dim=1).to(device=self._device, dtype=torch.float32)
 
-    def _nearest_trash_metrics(
+    def _nearest_unscored_trash_metrics(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return min XY proj dist, argmin idx, nearest 3D dist, nearest XY dist per env."""
+        """Return min XY dist to nearest not-yet-scored trash, argmin idx, 3D dist, all XY dists."""
         ee_pos = self._ee_pos_w()
         obj_pos = self._object_root_pos_w()
         ee_xy = ee_pos[:, :2].unsqueeze(1)
         obj_xy = obj_pos[:, :, :2]
         diff_xy = obj_xy - ee_xy
         dist_xy = torch.linalg.norm(diff_xy, dim=-1)
-        min_xy_dist, nearest_idx = dist_xy.min(dim=1)
+        dist_xy_masked = dist_xy.masked_fill(self._scored, float("inf"))
+        min_xy_dist, nearest_idx = dist_xy_masked.min(dim=1)
 
         nearest_obj = obj_pos.gather(
             1, nearest_idx.view(-1, 1, 1).expand(-1, 1, 3)
         ).squeeze(1)
         dist_3d = torch.linalg.norm(nearest_obj - ee_pos, dim=-1)
+        dist_3d = torch.where(torch.isfinite(min_xy_dist), dist_3d, torch.full_like(dist_3d, float("inf")))
         return min_xy_dist, nearest_idx, dist_3d, dist_xy
 
     def _touch_score_sparse(self, dist_3d_all: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,11 +186,13 @@ class TaskBStudentEnv(TaskDStudentEnv):
         return active & (self._time_since_last_touch_s >= self._no_touch_timeout_s)
 
     def _dense_xy_progress(self, min_xy_dist: torch.Tensor) -> torch.Tensor:
+        valid = torch.isfinite(min_xy_dist)
         prev = self._prev_min_xy_dist
-        init = torch.isnan(prev)
+        init = torch.isnan(prev) | ~valid
         delta = torch.where(init, torch.zeros_like(min_xy_dist), prev - min_xy_dist)
+        delta = torch.where(valid, delta, torch.zeros_like(delta))
         dense = self._w_dense_dist * delta
-        self._prev_min_xy_dist = min_xy_dist.clone()
+        self._prev_min_xy_dist = torch.where(valid, min_xy_dist.clone(), prev)
         return dense
 
     def _env_origins(self) -> torch.Tensor:
@@ -205,24 +217,30 @@ class TaskBStudentEnv(TaskDStudentEnv):
     def _object_root_pos_local(self) -> torch.Tensor:
         return self._world_to_env_local(self._object_root_pos_w())
 
-    def _build_critic_obs(self, actor_obs: torch.Tensor):
+    def _build_proprio_obs(self, env_obs: dict) -> torch.Tensor:
+        proprio = env_obs["proprio"].to(self._device, dtype=torch.float32)
+        lin_vel = proprio[:, _LIN_VEL_SLICE]
+        ang_vel = proprio[:, _ANG_VEL_SLICE]
+        gravity = proprio[:, _GRAVITY_SLICE]
+        return torch.cat([lin_vel, ang_vel, gravity], dim=-1)
+
+    def _build_critic_priv(self) -> torch.Tensor:
         rx, ry, rz, robot_yaw = self._robot_pose_local()
-        obj_local = self._object_root_pos_local().reshape(actor_obs.shape[0], -1)
-        scored_frac = self._scored.sum(dim=1, keepdim=True).to(dtype=torch.float32) / float(
-            TASK_B_NUM_OBJECTS
-        )
-        priv = torch.cat(
-            [
-                rx,
-                ry,
-                rz,
-                robot_yaw,
-                obj_local,
-                scored_frac,
-            ],
-            dim=-1,
-        )
-        return torch.cat([actor_obs, priv], dim=-1)
+        ee_local = self._world_to_env_local(self._ee_pos_w())
+        ee_x, ee_y = ee_local[:, 0:1], ee_local[:, 1:2]
+        obj_local = self._object_root_pos_local().reshape(self.num_envs, -1)
+        return torch.cat([rx, ry, rz, robot_yaw, ee_x, ee_y, obj_local], dim=-1)
+
+    def _build_scored_mask_obs(self) -> torch.Tensor:
+        return self._scored.to(dtype=torch.float32)
+
+    def _obs_dict(self, env_obs: dict):
+        return {
+            "policy": self._build_actor_obs(env_obs),
+            "proprio": self._build_proprio_obs(env_obs),
+            "priv": self._build_critic_priv(),
+            "scored_mask": self._build_scored_mask_obs(),
+        }
 
     def _partial_reset_envs(self, done_mask: torch.Tensor) -> None:
         """Reset base sim + wrapper state for envs finished by wrapper-level truncation."""
@@ -315,10 +333,16 @@ class TaskBStudentEnv(TaskDStudentEnv):
             obj_pos = self._object_root_pos_w()
             diff_3d = obj_pos - ee_pos.unsqueeze(1)
             dist_3d_all = torch.linalg.norm(diff_3d, dim=-1)
-            min_xy_dist, _, _, _ = self._nearest_trash_metrics()
-
-            dense = self._dense_xy_progress(min_xy_dist)
             sparse, newly_scored = self._touch_score_sparse(dist_3d_all)
+            if bool(newly_scored.any()):
+                self._prev_min_xy_dist = torch.where(
+                    newly_scored,
+                    torch.full_like(self._prev_min_xy_dist, float("nan")),
+                    self._prev_min_xy_dist,
+                )
+
+            min_xy_dist, _, _, _ = self._nearest_unscored_trash_metrics()
+            dense = self._dense_xy_progress(min_xy_dist)
             time_pen = torch.full_like(dense, -self._time_penalty_per_env_step)
 
             all_scored = self._scored.all(dim=1)
@@ -380,7 +404,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 self._done_illegal += int(illegal.sum().item())
 
         if self._nav_log_interval > 0 and self._nav_step_count % self._nav_log_interval == 0:
-            min_xy, _, min_3d, _ = self._nearest_trash_metrics()
+            min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
             scored = self._scored.sum(dim=1).float().mean().item()
             vel_cmd = self._nav_action_to_vel_cmd(nav_action)
             rx, ry, rz = self._robot_pose()
@@ -391,7 +415,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 f"[dense/sparse/finished/time]={total_dense.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
                 f"{total_time_pen.mean().item():+.3f} "
-                f"min_xy={min_xy.mean().item():.2f} min_3d={min_3d.min().item():.2f} "
+                f"min_xy_unscored={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
+                f"min_3d_unscored={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "
                 f"dones={int((terminated | truncated).sum())}/{self.num_envs} "
                 f"pos0=({rx[0,0].item():+.1f},{ry[0,0].item():+.1f},{rz[0,0].item():+.2f}) "

@@ -99,11 +99,11 @@ from atec_rl_lab.tasks.task_b.env_cfg import (
 from atec_rl_lab.train.nav.taskb_student_env import TaskBStudentEnv
 from atec_rl_lab.train.nav.nav_cfg import TaskBStudentPPORunnerCfg
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
-from atec_rl_lab.train.nav.taskd_student_actor_critic import TaskDStudentActorCritic
+from atec_rl_lab.train.nav.taskb_student_actor_critic import TaskBStudentActorCritic
 
 import rsl_rl.runners.on_policy_runner as _runner_mod
 
-_runner_mod.TaskDStudentActorCritic = TaskDStudentActorCritic
+_runner_mod.TaskBStudentActorCritic = TaskBStudentActorCritic
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -182,15 +182,6 @@ def _load_bc_into_actor_critic(actor_critic, ckpt_path: str, *, depth_only: bool
         if src in bc_sd and dst in model_sd and tuple(model_sd[dst].shape) == tuple(bc_sd[src].shape):
             model_sd[dst] = bc_sd[src]
             loaded += 1
-    cc_map = {
-        "memory_c.rnn.weight_ih_l0": "memory_a.rnn.weight_ih_l0",
-        "memory_c.rnn.weight_hh_l0": "memory_a.rnn.weight_hh_l0",
-        "memory_c.rnn.bias_ih_l0": "memory_a.rnn.bias_ih_l0",
-        "memory_c.rnn.bias_hh_l0": "memory_a.rnn.bias_hh_l0",
-    }
-    for dst, src in cc_map.items():
-        if dst in model_sd and src in model_sd:
-            model_sd[dst] = model_sd[src].clone()
     head_map = {
         "head.0.weight": "actor.0.weight",
         "head.0.bias": "actor.0.bias",

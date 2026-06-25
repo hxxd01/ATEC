@@ -117,6 +117,23 @@ class TaskDStudentActorCriticCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
+class TaskBStudentActorCriticCfg(RslRlPpoActorCriticCfg):
+    class_name: str = "TaskBStudentActorCritic"
+    img_h: int = 24
+    img_w: int = 32
+    img_channels: int = 4
+    proprio_dim: int = 9
+    priv_dim: int = 60
+    scored_mask_dim: int = 18
+    enc_dim: int = 128
+    fuse_dim: int = 256
+    rnn_type: str = "gru"
+    rnn_hidden_dim: int = 256
+    rnn_num_layers: int = 1
+    nav_action_dim: int = 3
+
+
+@configclass
 class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO config for Task D student fine-tuning (no privileged critic)."""
 
@@ -139,9 +156,19 @@ class TaskDStudentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class TaskBStudentPPORunnerCfg(TaskDStudentPPORunnerCfg):
-    """PPO config for Task B student nav (same network as Task D student)."""
+    """PPO config for Task B student nav: RNN actor + feedforward privileged critic."""
 
     experiment_name = "taskb_student_b2piper"
+    obs_groups = {"policy": ["policy"], "critic": ["proprio", "priv", "scored_mask"]}
+
+    policy = TaskBStudentActorCriticCfg(
+        init_noise_std=0.6,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256],
+        critic_hidden_dims=[256, 128],
+        activation="elu",
+    )
 
 
 @configclass

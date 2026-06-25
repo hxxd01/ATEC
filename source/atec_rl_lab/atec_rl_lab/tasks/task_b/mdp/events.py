@@ -17,15 +17,13 @@ TASK_B_OTHER_Z = 0.10
 
 def randomize_task_b_objects(
     env: ManagerBasedEnv,
-    env_ids: torch.Tensor | None = None,
+    env_ids: torch.Tensor,
     x_range: tuple[float, float] = (-15.0, -5.0),
     y_range: tuple[float, float] = (-15.0, -5.0),
     pocket_radius: float = 1.0,
     pocket_shift: float = 2.0,
 ) -> None:
     """Randomize trash object poses on reset (same distribution as Task B test cfg)."""
-    if env_ids is None:
-        env_ids = torch.arange(env.scene.num_envs, device=env.device)
     if len(env_ids) == 0:
         return
 

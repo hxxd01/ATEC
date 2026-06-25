@@ -267,6 +267,7 @@ class TaskBNavEnvB2Cfg(TaskBEnvB2Cfg):
         self.events.randomize_task_b_objects = EventTerm(
             func=atec_mdp.randomize_task_b_objects,
             mode="reset",
+            params={},
         )
         hold_arm_params = {
             "asset_cfg": SceneEntityCfg("robot"),
