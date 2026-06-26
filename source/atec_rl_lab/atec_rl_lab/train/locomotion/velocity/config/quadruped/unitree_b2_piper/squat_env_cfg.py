@@ -50,7 +50,7 @@ _TASK_B_MILD_RESET_BASE_PARAMS = {
 }
 
 # Command resampling 0.1–10s uniform (nav step ~0.1s with inner_steps=5).
-_SQUAT_CMD_RESAMPLE_S = (0.08, 3.0)
+_SQUAT_CMD_RESAMPLE_S = (0.08, 10.0)
 
 
 @configclass
@@ -96,9 +96,9 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
         if getattr(self.observations, "critic", None) is not None:
             self.observations.critic.enable_corruption = False
 
-        # Velocity commands: vx/vy/wz full range; resample 0.1–10s (no curriculum).
-        self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
+        # Velocity commands for squat loco: vx in [-1, 1], vy fixed 0, yaw in [-1, 1].
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
         self.commands.base_velocity.heading_command = False

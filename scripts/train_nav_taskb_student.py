@@ -22,9 +22,9 @@ parser.add_argument("--inner_steps", type=int, default=5, help="Low-level sim st
 parser.add_argument("--max_iter", type=int, default=8000)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--steps_per_env", type=int, default=24)
-parser.add_argument("--vx_min", type=float, default=-2.0)
-parser.add_argument("--vx_max", type=float, default=2.0)
-parser.add_argument("--vy_max", type=float, default=1.0)
+parser.add_argument("--vx_min", type=float, default=-1.0)
+parser.add_argument("--vx_max", type=float, default=1.0)
+parser.add_argument("--vy_max", type=float, default=0.0)
 parser.add_argument("--wz_max", type=float, default=1.0)
 parser.add_argument("--policy_img_h", type=int, default=24)
 parser.add_argument("--policy_img_w", type=int, default=32)
@@ -315,6 +315,7 @@ def main():
     agent_cfg.policy.img_h = policy_h
     agent_cfg.policy.img_w = policy_w
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
+    agent_cfg.policy.nav_action_dim = 2
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskb_student_b2piper_depth"
 

@@ -137,7 +137,7 @@ class TaskBStudentActorCritic(nn.Module):
         critic_hidden_dims: list | None = None,
         init_noise_std: float = 0.5,
         noise_std_type: str = "scalar",
-        nav_action_dim: int = 3,
+        nav_action_dim: int = 2,
         leg_action_dim: int = 12,
         **_kwargs,
     ):
@@ -282,9 +282,9 @@ class AlgSolution:
         self.depth_only = self.img_channels == 1
         self.depth_max = float(policy_cfg.get("depth_max", os.environ.get("NAV_DEPTH_MAX", "5.0")))
 
-        self.vx_min = float(os.environ.get("NAV_VX_MIN", policy_cfg.get("vx_min", -2.0)))
-        self.vx_max = float(os.environ.get("NAV_VX_MAX", policy_cfg.get("vx_max", 2.0)))
-        self.vy_max = float(os.environ.get("NAV_VY_MAX", policy_cfg.get("vy_max", 1.0)))
+        self.vx_min = float(os.environ.get("NAV_VX_MIN", policy_cfg.get("vx_min", -1.0)))
+        self.vx_max = float(os.environ.get("NAV_VX_MAX", policy_cfg.get("vx_max", 1.0)))
+        self.vy_max = float(os.environ.get("NAV_VY_MAX", policy_cfg.get("vy_max", 0.0)))
         self.wz_max = float(os.environ.get("NAV_WZ_MAX", policy_cfg.get("wz_max", 1.0)))
 
         inner_steps = int(os.environ.get("NAV_INNER_STEPS", policy_cfg.get("inner_steps", 5)))
@@ -320,7 +320,7 @@ class AlgSolution:
             "init_noise_std": float(policy_cfg.get("init_noise_std", 0.6)),
             "noise_std_type": policy_cfg.get("noise_std_type", "scalar"),
         }
-        self.nav_policy = TaskBStudentActorCritic(obs, obs_groups, num_actions=3, **ac_kwargs).to(self.device)
+        self.nav_policy = TaskBStudentActorCritic(obs, obs_groups, num_actions=2, **ac_kwargs).to(self.device)
         loaded = torch.load(student_ckpt_path, map_location=self.device, weights_only=False)
         state = loaded["model_state_dict"] if isinstance(loaded, dict) and "model_state_dict" in loaded else loaded
         self.nav_policy.load_state_dict(state, strict=True)
@@ -328,7 +328,7 @@ class AlgSolution:
         print(
             f"[TaskBStudentNav] img={self.img_channels}ch@{self.image_h}x{self.image_w} "
             f"depth_only={self.depth_only} nav_hold={self.nav_hold_steps} "
-            f"vx=[{self.vx_min:.1f},{self.vx_max:.1f}] vy=±{self.vy_max:.1f} wz=±{self.wz_max:.1f} "
+            f"vx=[{self.vx_min:.1f},{self.vx_max:.1f}] vy=0 wz=±{self.wz_max:.1f} "
             f"ckpt={os.path.basename(student_ckpt_path)} ll={os.path.basename(ll_policy_path)}",
             flush=True,
         )
@@ -453,7 +453,9 @@ class AlgSolution:
     def _nav_action_to_vel_cmd(self, nav_action: torch.Tensor) -> torch.Tensor:
         a = nav_action.clamp(-1.0, 1.0)
         vx = (a[:, 0] + 1.0) * 0.5 * (self.vx_max - self.vx_min) + self.vx_min
-        return torch.stack([vx, a[:, 1] * self.vy_max, a[:, 2] * self.wz_max], dim=-1)
+        vy = torch.zeros_like(vx)
+        wz = a[:, 1] * self.wz_max
+        return torch.stack([vx, vy, wz], dim=-1)
 
     def _predict_velocity_command(self, obs: dict) -> torch.Tensor:
         refresh = self._cached_vel_cmd is None or (self._nav_step_counter % self.nav_hold_steps == 0)

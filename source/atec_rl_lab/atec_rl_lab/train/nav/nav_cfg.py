@@ -121,7 +121,7 @@ class TaskBStudentActorCriticCfg(TaskDStudentActorCriticCfg):
     """Task B nav student: inherits Task D student RNN actor + asymmetric RNN critic."""
 
     class_name: str = "TaskBStudentActorCritic"
-    nav_action_dim: int = 3
+    nav_action_dim: int = 2
     leg_action_dim: int = 12
 
 

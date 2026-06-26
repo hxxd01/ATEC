@@ -6,9 +6,9 @@ policy:
   platform_depth_h: 480
   platform_depth_w: 640
   depth_max: 5.0
-  vx_min: -2.0
-  vx_max: 2.0
-  vy_max: 1.0
+  vx_min: -1.0
+  vx_max: 1.0
+  vy_max: 0.0
   wz_max: 1.0
   inner_steps: 10
   proprio_dim: 9

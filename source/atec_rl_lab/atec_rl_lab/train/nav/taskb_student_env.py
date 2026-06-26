@@ -12,6 +12,7 @@ from .taskd_teacher_env import _LEG_DIM
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
+TASK_B_NAV_ACTION_DIM = 2  # [vx_cmd, wz_cmd] in [-1, 1], vy fixed to 0
 TASK_B_PROPRIO_DIM = 9  # lin_vel(3) + ang_vel(3) + gravity(3) — embedded in policy flat obs
 TASK_B_SCORED_MASK_DIM = TASK_B_NUM_OBJECTS
 # Task-D student layout: critic = policy flat + priv extras (see _build_critic_obs).
@@ -36,9 +37,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ll_policy_path: str,
         device: str = "cuda",
         inner_steps: int = 25,
-        vx_min: float = -2.0,
-        vx_max: float = 2.0,
-        vy_max: float = 1.0,
+        vx_min: float = -1.0,
+        vx_max: float = 1.0,
+        vy_max: float = 0.0,
         wz_max: float = 1.0,
         image_h: int = 24,
         image_w: int = 32,
@@ -96,6 +97,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         self._guide_rewards = torch.tensor(
             guide_milestone_rewards, device=self._device, dtype=torch.float32
+        )
+        self.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(TASK_B_NAV_ACTION_DIM,), dtype=np.float32
         )
 
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
@@ -167,6 +171,14 @@ class TaskBStudentEnv(TaskDStudentEnv):
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
             flush=True,
         )
+
+    def _nav_action_to_vel_cmd(self, nav_action: torch.Tensor) -> torch.Tensor:
+        """Map 2D nav action [vx_a, wz_a] in [-1, 1] -> physical [vx, vy=0, wz]."""
+        a = nav_action.clamp(-1.0, 1.0)
+        vx = (a[:, 0] + 1.0) * 0.5 * (self._vx_max - self._vx_min) + self._vx_min
+        wz = a[:, 1] * self._wz_max
+        vy = torch.zeros_like(vx)
+        return torch.stack([vx, vy, wz], dim=-1)
 
     def _ensure_ee_body_idx(self) -> int:
         if self._ee_body_idx is not None:
