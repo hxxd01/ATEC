@@ -81,6 +81,18 @@ parser.add_argument(
     help="Truncate episode if no new platform touch score for this many sim seconds (0=off).",
 )
 parser.add_argument(
+    "--max_vel_cmd_delta",
+    type=float,
+    default=0.15,
+    help="Max change in physical vel_cmd [vx,vy,wz] per nav step (m/s, rad/s). 0=disable rate limit.",
+)
+parser.add_argument(
+    "--w_action_rate",
+    type=float,
+    default=0.5,
+    help="Soft penalty weight on ||vel_cmd_t - vel_cmd_{t-1}||^2 per nav step (0=off).",
+)
+parser.add_argument(
     "--finished_reward",
     type=float,
     default=100.0,
@@ -363,6 +375,8 @@ def main():
         time_penalty_per_env_step=args_cli.time_penalty_per_env_step,
         no_touch_timeout_s=args_cli.no_touch_timeout_s,
         finished_reward=args_cli.finished_reward,
+        max_vel_cmd_delta=args_cli.max_vel_cmd_delta,
+        w_action_rate=args_cli.w_action_rate,
         visible_depth_tol=args_cli.visible_depth_tol,
         visible_check_depth=args_cli.visible_check_depth,
     )
@@ -390,6 +404,7 @@ def main():
         f"rewards guide_prog={args_cli.w_dense_dist} sparse={args_cli.sparse_touch_reward} "
         f"sparse_only={args_cli.sparse_only} "
         f"time_pen={args_cli.time_penalty_per_env_step} no_touch_timeout_s={args_cli.no_touch_timeout_s} "
+        f"max_vel_cmd_delta={args_cli.max_vel_cmd_delta} w_action_rate={args_cli.w_action_rate} "
         f"finished_reward={args_cli.finished_reward}",
         flush=True,
     )

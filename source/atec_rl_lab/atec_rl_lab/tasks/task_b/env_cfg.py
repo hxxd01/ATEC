@@ -32,10 +32,8 @@ import atec_rl_lab.tasks.task_b.mdp as atec_mdp
 
 TARGET_CENTER = (-3.0, -10.0)
 TARGET_MARKER_Z = 0.06
-# Robot spawns at the terrain center (env_origin). In the reference eval env
-# (TaskBEnvB2Cfg, num_envs=1) env_origin == (-10,-10) and the robot sits at
-# world (-10,-10) == local (0,0), i.e. exactly on the playable-area center.
-# init_state.pos is overwritten per-cfg, but reset uses local_pos=env_origin+this.
+# Robot spawns at the terrain tile centre: world = env_origin + TASK_B_ROBOT_SPAWN_LOCAL.
+# Playable trash xy is env-local in [-5, 5] (see randomize_task_b_objects).
 TASK_B_ROBOT_SPAWN_LOCAL = (0.0, 0.0, 0.68)
 TASK_B_NAV_DEPTH_MAX = 5.0
 TASK_B_PLATFORM_CAMERA_FAR = 50.0
@@ -44,6 +42,54 @@ TASK_B_PLATFORM_CAMERA_FAR = 50.0
 def refresh_task_b_terrain_cfg(env_cfg: "TaskBEnvCfg") -> None:
     """Rebuild terrain grid after ``scene.num_envs`` is set. Call before ``gym.make``."""
     env_cfg.scene.terrain = env_cfg._build_terrain_cfg()
+
+
+def apply_task_b_nav_spawn_overrides(env_cfg: "TaskBEnvB2Cfg") -> None:
+    """Robot + trash spawn relative to each env's terrain tile centre (matches nav training)."""
+    from atec_rl_lab.assets.robots import UNITREE_B2_PIPER_CFG
+
+    env_cfg.scene.robot = env_cfg.scene.robot.replace(
+        init_state=UNITREE_B2_PIPER_CFG.init_state.replace(pos=TASK_B_ROBOT_SPAWN_LOCAL),
+    )
+    env_cfg.scene.env_spacing = float(TASK_B_CELL_SIZE[0])
+    env_cfg.events.reset_robot_root = EventTerm(
+        func=reset_root_state_at_env_origin,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "local_pos": TASK_B_ROBOT_SPAWN_LOCAL,
+        },
+    )
+    env_cfg.events.randomize_task_b_objects = EventTerm(
+        func=atec_mdp.randomize_task_b_objects,
+        mode="reset",
+        params={},
+    )
+
+
+def apply_task_b_detect_arm_hold(env_cfg: "TaskBEnvB2Cfg") -> None:
+    """Interval PD hold for detect arm (squat nav / student deploy)."""
+    hold_arm_params = {
+        "asset_cfg": SceneEntityCfg("robot"),
+        "arm_joint_names": (
+            "arm_joint1",
+            "arm_joint2",
+            "arm_joint3",
+            "arm_joint4",
+            "arm_joint5",
+            "arm_joint6",
+            "arm_joint7",
+            "arm_joint8",
+        ),
+        "arm_action": DETECT_HOLD_ARM_ACTION,
+        "action_scale": DETECT_HOLD_ARM_ACTION_SCALE,
+    }
+    env_cfg.events.hold_detect_arm_interval = EventTerm(
+        func=hold_detect_arm_pose,
+        mode="interval",
+        interval_range_s=(0.02, 0.02),
+        params=hold_arm_params,
+    )
 
 
 def apply_task_b_nav_train_overrides(env_cfg: "TaskBEnvCfg") -> None:
@@ -57,6 +103,7 @@ def apply_task_b_nav_train_overrides(env_cfg: "TaskBEnvCfg") -> None:
         env_cfg.terminations.objects_in_circle_done = None
         if getattr(env_cfg.terminations, "fall", None) is not None:
             env_cfg.terminations.fall.params["minimum_height"] = 0.0
+
 
 @configclass
 class RewardsCfg:
@@ -114,8 +161,9 @@ class TaskBEnvCfg(BaseEnvCfg):
         OTHER_QUAT = [0.0, 0.0, -0.707, 0.707]
 
         for i in range(18):
-            x = rng.uniform(-15.0, -5.0)
-            y = rng.uniform(-15.0, -5.0)
+            # Env-local xy on the 20x20 playable patch (same range as randomize_task_b_objects).
+            x = float(rng.uniform(-5.0, 5.0))
+            y = float(rng.uniform(-5.0, 5.0))
             if abs(x) < 1.0 and abs(y) < 1.0:
                 x += 2.0
             name = f"Object{i + 1}"
@@ -216,10 +264,12 @@ class TaskBEnvB2Cfg(TaskBEnvCfg):
         self.scene.robot = UNITREE_B2_PIPER_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state=UNITREE_B2_PIPER_CFG.init_state.replace(
-                pos=(-10, -10, 0.68),
+                pos=TASK_B_ROBOT_SPAWN_LOCAL,
             )
         )
         super().__post_init__()
+
+        apply_task_b_nav_spawn_overrides(self)
 
         self.terminations.illegal_contact.params["sensor_cfg"].body_names = [
             UNITREE_B2_PIPER_CFG.base_link_name,
@@ -246,62 +296,11 @@ class TaskBNavEnvB2Cfg(TaskBEnvB2Cfg):
     scene: BaseSceneCfg = BaseSceneCfg(num_envs=512, env_spacing=float(TASK_B_CELL_SIZE[0]))
 
     def __post_init__(self):
-        from atec_rl_lab.assets.robots import UNITREE_B2_PIPER_CFG
-
         super().__post_init__()
-
-        # Override the robot init_state *after* super() (TaskBEnvB2Cfg sets it to
-        # the eval world pos (-10,-10)). For nav training the robot must spawn at
-        # the terrain centre (env_origin), i.e. local (0,0). reset_robot_root
-        # below places it via env_origin + local_pos on every reset regardless.
-        self.scene.robot = self.scene.robot.replace(
-            init_state=UNITREE_B2_PIPER_CFG.init_state.replace(
-                pos=TASK_B_ROBOT_SPAWN_LOCAL,
-            ),
-        )
 
         apply_task_b_nav_train_overrides(self)
         apply_task_d_camera_depth_clip(self.scene, TASK_B_PLATFORM_CAMERA_FAR)
-
-        # reset_robot_joints stays None (inherited from TaskBEnvCfg): on reset the
-        # joints keep the USD defaults, so the legs start at the B2 standing pose
-        # AND the arm starts at its USD default — matching the squat-flat training
-        # (ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0). The arm is then driven to the
-        # DETECT pose during rollout by hold_detect_arm_interval below.
-        self.events.reset_robot_root = EventTerm(
-            func=reset_root_state_at_env_origin,
-            mode="reset",
-            params={
-                "asset_cfg": SceneEntityCfg("robot"),
-                "local_pos": TASK_B_ROBOT_SPAWN_LOCAL,
-            },
-        )
-        self.events.randomize_task_b_objects = EventTerm(
-            func=atec_mdp.randomize_task_b_objects,
-            mode="reset",
-            params={},
-        )
-        hold_arm_params = {
-            "asset_cfg": SceneEntityCfg("robot"),
-            "arm_joint_names": (
-                "arm_joint1",
-                "arm_joint2",
-                "arm_joint3",
-                "arm_joint4",
-                "arm_joint5",
-                "arm_joint6",
-                "arm_joint7",
-                "arm_joint8",
-            ),
-            "arm_action": DETECT_HOLD_ARM_ACTION,
-            "action_scale": DETECT_HOLD_ARM_ACTION_SCALE,
-        }
-        self.events.hold_detect_arm_interval = EventTerm(
-            func=hold_detect_arm_pose,
-            mode="interval",
-            interval_range_s=(0.02, 0.02),
-            params=hold_arm_params,
-        )
+        apply_task_b_detect_arm_hold(self)
 
 
 @configclass

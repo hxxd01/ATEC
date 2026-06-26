@@ -29,23 +29,23 @@ _HOLD_ARM_PARAMS = {
     "action_scale": atec_mdp.DETECT_HOLD_ARM_ACTION_SCALE,
 }
 
-# Task-B B2Piper: fixed root on reset (no xy/yaw/z jitter).
-_TASK_B_FIXED_RESET_BASE_PARAMS = {
+# Mild reset DR for Task-B-aligned squat locomotion (nav deploy robustness).
+_TASK_B_MILD_RESET_BASE_PARAMS = {
     "pose_range": {
-        "x": (0.0, 0.0),
-        "y": (0.0, 0.0),
-        "z": (0.0, 0.0),
-        "roll": (0.0, 0.0),
-        "pitch": (0.0, 0.0),
-        "yaw": (0.0, 0.0),
+        "x": (-0.2, 0.2),
+        "y": (-0.2, 0.2),
+        "z": (0.0, 0.03),
+        "roll": (-0.1, 0.1),
+        "pitch": (-0.1, 0.1),
+        "yaw": (-3.14159265, 3.14159265),
     },
     "velocity_range": {
-        "x": (0.0, 0.0),
-        "y": (0.0, 0.0),
-        "z": (0.0, 0.0),
-        "roll": (0.0, 0.0),
-        "pitch": (0.0, 0.0),
-        "yaw": (0.0, 0.0),
+        "x": (-0.2, 0.2),
+        "y": (-0.2, 0.2),
+        "z": (-0.2, 0.2),
+        "roll": (-0.2, 0.2),
+        "pitch": (-0.2, 0.2),
+        "yaw": (-0.2, 0.2),
     },
 }
 
@@ -71,25 +71,34 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
         self.viewer.eye = (4.0, -4.0, 2.5)
         self.viewer.lookat = (0.0, 0.0, 0.4)
 
-        # Randomization aligned with Task-B B2Piper (no DR / no joint reset jitter).
-        self.events.randomize_rigid_body_material = None
+        # Mild DR for nav deploy (keep mass/com/push off for low-posture stability).
         self.events.randomize_rigid_body_mass_base = None
         self.events.randomize_rigid_body_mass_others = None
         self.events.randomize_com_positions = None
         self.events.randomize_apply_external_force_torque = None
-        self.events.randomize_reset_joints = None
         self.events.randomize_actuator_gains = None
         self.events.randomize_push_robot = None
-        self.events.randomize_reset_base.params = _TASK_B_FIXED_RESET_BASE_PARAMS
+        self.events.randomize_reset_base.params = _TASK_B_MILD_RESET_BASE_PARAMS
+        self.events.randomize_reset_joints.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=self.joint_names
+        )
+        self.events.randomize_reset_joints.params["position_range"] = (0.85, 1.15)
+        self.events.randomize_reset_joints.params["velocity_range"] = (-0.2, 0.2)
+        # ~0.8–1.2× nominal foot friction (startup, all robot bodies).
+        self.events.randomize_rigid_body_material.params["static_friction_range"] = (0.8, 1.2)
+        self.events.randomize_rigid_body_material.params["dynamic_friction_range"] = (0.64, 0.96)
+        self.events.randomize_rigid_body_material.params["restitution_range"] = (0.0, 0.0)
 
         self.observations.policy.enable_corruption = False
         if getattr(self.observations, "critic", None) is not None:
             self.observations.critic.enable_corruption = False
 
-        # Velocity commands (final curriculum targets).
-        self.commands.base_velocity.ranges.lin_vel_x = (-4.0, 4.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-2.0, 2.0)
+        # Velocity commands: use full range from step 0 (no command curriculum).
+        self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.curriculum.command_levels_lin_vel = None
+        self.curriculum.command_levels_ang_vel = None
 
         # Detect hold during rollout only (interval PD target). Reset instant stays at USD
         # default arm joints, same as Task-B before the first detect action step.
@@ -107,8 +116,8 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
             func=atec_mdp.ee_height_exp,
             weight=3.0,
             params={
-                "target_height": 0.18,
-                "std": 0.05,
+                "target_height": 0.27,
+                "std": 0.1,
                 "ee_body_name": "gripper_base",
             },
         )

@@ -1,0 +1,28 @@
+# Task B student nav deploy bundle (upload with solution_taskb_student_nav.py as solution.py)
+policy:
+  img_h: 48
+  img_w: 64
+  img_channels: 4          # head/ee rgb(3)+depth(1) per camera — matches train without --depth_only
+  platform_depth_h: 480
+  platform_depth_w: 640
+  depth_max: 5.0
+  vx_min: -2.0
+  vx_max: 2.0
+  vy_max: 1.0
+  wz_max: 1.0
+  inner_steps: 5
+  proprio_dim: 9
+  enc_dim: 128
+  fuse_dim: 256
+  rnn_type: gru
+  rnn_hidden_dim: 256
+  rnn_num_layers: 1
+  actor_obs_normalization: true
+  critic_obs_normalization: true
+  actor_hidden_dims: [256]
+  critic_hidden_dims: [256, 128]
+  init_noise_std: 0.6
+  noise_std_type: scalar
+  # Rename/copy your checkpoint into demo/ before upload
+  student_ckpt: model_taskb_student.pt
+  ll_policy: policy.pt

@@ -36,8 +36,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ll_policy_path: str,
         device: str = "cuda",
         inner_steps: int = 25,
-        vx_min: float = -2.0,
-        vx_max: float = 2.0,
+        vx_min: float = -1.0,
+        vx_max: float = 1.0,
         vy_max: float = 1.0,
         wz_max: float = 1.0,
         image_h: int = 24,
@@ -57,6 +57,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         visible_check_depth: bool = False,
         guide_milestone_thresholds: tuple[float, ...] = (1.2, 0.8, 0.5, 0.3),
         guide_milestone_rewards: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4),
+        max_vel_cmd_delta: float = 0.15,
+        w_action_rate: float = 0.5,
     ):
         super().__init__(
             env=env,
@@ -95,6 +97,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._guide_rewards = torch.tensor(
             guide_milestone_rewards, device=self._device, dtype=torch.float32
         )
+        self._max_vel_cmd_delta = float(max_vel_cmd_delta)
+        self._w_action_rate = float(w_action_rate)
 
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
         self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
@@ -132,6 +136,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._episode_finished = torch.zeros(
             (self.num_envs,), device=self._device, dtype=torch.bool
         )
+        self._last_vel_cmd = torch.zeros((self.num_envs, 3), device=self._device, dtype=torch.float32)
         self._logged_first_rollout = False
         self._done_total = 0
         self._done_fall = 0
@@ -161,9 +166,41 @@ class TaskBStudentEnv(TaskDStudentEnv):
             f"sparse_touch={self._sparse_touch_reward} "
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
+            f"max_vel_cmd_delta={self._max_vel_cmd_delta} w_action_rate={self._w_action_rate} "
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
             flush=True,
         )
+
+    def _vel_cmd_to_nav_action(self, vel_cmd: torch.Tensor) -> torch.Tensor:
+        """Inverse of ``_nav_action_to_vel_cmd`` (clamped to [-1, 1])."""
+        vx = vel_cmd[:, 0]
+        vy = vel_cmd[:, 1]
+        wz = vel_cmd[:, 2]
+        vx_span = max(self._vx_max - self._vx_min, 1e-6)
+        a0 = (vx - self._vx_min) / vx_span * 2.0 - 1.0
+        a1 = vy / max(self._vy_max, 1e-6)
+        a2 = wz / max(self._wz_max, 1e-6)
+        return torch.stack([a0, a1, a2], dim=-1).clamp(-1.0, 1.0)
+
+    def _limit_nav_action_rate(self, nav_action: torch.Tensor) -> torch.Tensor:
+        """Clamp per-nav-step change in physical vel_cmd (smooth commands for frozen LL)."""
+        if self._max_vel_cmd_delta <= 0.0:
+            return nav_action
+        desired = self._nav_action_to_vel_cmd(nav_action)
+        delta = desired - self._last_vel_cmd
+        max_d = torch.tensor(self._max_vel_cmd_delta, device=self._device, dtype=torch.float32)
+        limited = self._last_vel_cmd + torch.clamp(delta, -max_d, max_d)
+        return self._vel_cmd_to_nav_action(limited)
+
+    def _action_rate_penalty(self, vel_cmd: torch.Tensor) -> torch.Tensor:
+        """Soft penalty on nav vel_cmd change: -w * ||cmd - last_cmd||^2."""
+        if self._w_action_rate <= 0.0:
+            return torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        delta = vel_cmd - self._last_vel_cmd
+        pen = -self._w_action_rate * (delta * delta).sum(dim=1)
+        # Skip first nav step after reset (last_cmd is zero).
+        has_prev = self._last_vel_cmd.abs().sum(dim=1) > 1e-6
+        return torch.where(has_prev, pen, torch.zeros_like(pen))
 
     def _ensure_ee_body_idx(self) -> int:
         if self._ee_body_idx is not None:
@@ -488,6 +525,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._scored[env_ids] = False
         self._time_since_last_touch_s[env_ids] = 0.0
         self._episode_finished[env_ids] = False
+        self._last_vel_cmd[env_ids] = 0.0
         self._current_obs = base.observation_manager.compute(update_history=True)
 
     def reset(self, **kwargs):
@@ -499,6 +537,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._scored.fill_(False)
         self._time_since_last_touch_s.zero_()
         self._episode_finished.zero_()
+        self._last_vel_cmd.zero_()
         self._nav_step_count = 0
         self._done_total = 0
         self._done_fall = 0
@@ -524,6 +563,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
         if nav_action.ndim == 1:
             nav_action = nav_action.unsqueeze(0)
 
+        nav_action = self._limit_nav_action_rate(nav_action)
+        executed_vel = self._nav_action_to_vel_cmd(nav_action)
+        action_rate_pen = self._action_rate_penalty(executed_vel)
+
         self._nav_step_count += 1
         if not self._logged_first_rollout:
             print("[TaskBStudent] rollout started (first nav step).", flush=True)
@@ -536,6 +579,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         total_sparse = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_finished = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_time_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_action_rate_pen = action_rate_pen.clone()
+        total_reward += action_rate_pen
         terminated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         truncated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         last_info = {}
@@ -682,10 +727,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
-                f"[guide/prog/mile/sparse/finished/time]={total_dense.mean().item():+.3f}/"
+                f"[guide/prog/mile/sparse/finished/time/rate]={total_dense.mean().item():+.3f}/"
                 f"{total_guide_prog.mean().item():+.3f}/{total_guide_mile.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
-                f"{total_time_pen.mean().item():+.3f} "
+                f"{total_time_pen.mean().item():+.3f}/{total_action_rate_pen.mean().item():+.3f} "
                 f"min_3d_oracle={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
                 f"min_xy_oracle={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "
@@ -725,6 +770,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
             self._timeout_at_term_count = 0
             self._no_touch_at_term_count = 0
             self._finished_at_term_count = 0
+
+        self._last_vel_cmd = executed_vel
 
         # Envs that terminated at any inner step were auto-reset by the base env.
         # Remaining inner steps may still advance them, so re-reset once at the end

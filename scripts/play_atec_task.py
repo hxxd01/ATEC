@@ -724,8 +724,22 @@ def _disable_taskd_terminations(env_cfg) -> None:
 
 
 def _configure_taskb_play(env_cfg) -> None:
-    """Task B local play: strip Task-D-only terms if this cfg inherits them."""
+    """Task B play: nav-aligned spawn (env_origin + local) and terrain grid for num_envs."""
+    from atec_rl_lab.tasks.task_b.env_cfg import (
+        apply_task_b_detect_arm_hold,
+        apply_task_b_nav_spawn_overrides,
+        refresh_task_b_terrain_cfg,
+    )
+
     _disable_taskd_terminations(env_cfg)
+    refresh_task_b_terrain_cfg(env_cfg)
+    apply_task_b_nav_spawn_overrides(env_cfg)
+    apply_task_b_detect_arm_hold(env_cfg)
+    print(
+        "[play] Task B: nav spawn (robot local (0,0,0.68), trash local [-5,5], "
+        "reset events on)",
+        flush=True,
+    )
 
 
 def _enable_ground_view_camera(env_cfg) -> None:
