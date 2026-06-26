@@ -173,6 +173,13 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._no_touch_at_term_count = 0
         self._finished_at_term_count = 0
         self._touch_total = 0
+        # Counters since last [TaskBStudent] nav log line (interval stats).
+        self._log_illegal = 0
+        self._log_fall = 0
+        self._log_timeout = 0
+        self._log_no_touch = 0
+        self._log_finished = 0
+        self._log_term_total = 0
         print(
             f"[TaskBStudent] actor_dim={self._actor_dim}, critic_dim={self._critic_dim} "
             f"(+{self._critic_extra_dim} priv: robot/ee/r_vel/contact/min_dist/scored/trash) "
@@ -195,19 +202,27 @@ class TaskBStudentEnv(TaskDStudentEnv):
         vy = torch.zeros_like(vx)
         return torch.stack([vx, vy, wz], dim=-1)
 
+    def _isaac_env(self):
+        """Reach the underlying Isaac Lab env through gym wrappers."""
+        env = self.env
+        while hasattr(env, "env"):
+            env = env.env
+        return env
+
     def _termination_term_flags(self) -> dict[str, torch.Tensor]:
         """Task-B MDP terminations used for metrics and illegal-contact penalty."""
-        tm = getattr(self.env.unwrapped, "termination_manager", None)
+        tm = getattr(self._isaac_env(), "termination_manager", None)
         if tm is None:
             return {}
         out: dict[str, torch.Tensor] = {}
         for name in ("illegal_contact", "fall", "time_out"):
-            try:
-                out[name] = tm.get_term(name).view(-1)[: self.num_envs].to(
-                    device=self._device, dtype=torch.bool
-                )
-            except Exception:
-                pass
+            if name not in tm._term_names:
+                continue
+            idx = tm._term_name_to_term_idx[name]
+            # Use last-episode term snapshot (set in compute() before auto-reset).
+            out[name] = tm._last_episode_dones[: self.num_envs, idx].to(
+                device=self._device, dtype=torch.bool
+            )
         return out
 
     def _ensure_ee_body_idx(self) -> int:
@@ -579,6 +594,12 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._no_touch_at_term_count = 0
         self._finished_at_term_count = 0
         self._logged_first_rollout = False
+        self._log_illegal = 0
+        self._log_fall = 0
+        self._log_timeout = 0
+        self._log_no_touch = 0
+        self._log_finished = 0
+        self._log_term_total = 0
         return self._obs_dict(obs), info
 
     def step(self, nav_action: torch.Tensor):
@@ -607,6 +628,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         truncated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         last_info = {}
         episode_done = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
+        episode_log: dict = {}
 
         ee_pos = self._ee_pos_w()
         obj_pos = self._object_root_pos_w()
@@ -614,7 +636,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         dist_3d_all = torch.linalg.norm(diff_3d, dim=-1)
 
         for _ in range(self.inner_steps):
-            was_episode_done = episode_done
+            # Snapshot before in-place updates; otherwise newly_done becomes all-false.
+            was_episode_done = episode_done.clone()
             active = ~episode_done
             if not bool(active.any()):
                 break
@@ -666,6 +689,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 episode_done |= finished_now
                 terminated |= finished_now
                 self._done_finished += int(finished_now.sum().item())
+                self._log_finished += int(finished_now.sum().item())
+                self._log_term_total += int(finished_now.sum().item())
                 self._record_scored_at_termination(finished_now)
                 self._finished_at_term_count += int(finished_now.sum().item())
 
@@ -676,6 +701,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 episode_done |= no_touch_done
                 truncated |= no_touch_done
                 self._done_no_touch += int(no_touch_done.sum().item())
+                self._log_no_touch += int(no_touch_done.sum().item())
+                self._log_term_total += int(no_touch_done.sum().item())
                 self._record_scored_at_termination(no_touch_done)
                 self._no_touch_at_term_count += int(no_touch_done.sum().item())
 
@@ -690,7 +717,6 @@ class TaskBStudentEnv(TaskDStudentEnv):
             total_time_pen += time_pen * alive_f
 
             if bool(done_now.any()):
-                self._record_scored_at_termination(done_now)
                 term_flags = self._termination_term_flags()
                 illegal_contact_flags = term_flags.get("illegal_contact")
                 fall_flags = term_flags.get("fall")
@@ -703,17 +729,26 @@ class TaskBStudentEnv(TaskDStudentEnv):
                     timeout_flags = torch.zeros_like(done_now)
 
                 newly_done = done_now & (~was_episode_done)
+                if bool(newly_done.any()):
+                    self._record_scored_at_termination(newly_done)
                 illegal_flags = newly_done & illegal_contact_flags
                 fall_done = newly_done & fall_flags
                 timeout_done = newly_done & timeout_flags
 
                 self._illegal_at_term_count += int(illegal_flags.sum().item())
+                self._log_illegal += int(illegal_flags.sum().item())
+                self._log_term_total += int(newly_done.sum().item())
                 if self._illegal_contact_penalty > 0.0 and bool(illegal_flags.any()):
                     illegal_pen = illegal_flags.to(dtype=total_reward.dtype) * (-self._illegal_contact_penalty)
                     total_reward += illegal_pen
                     total_illegal_pen += illegal_pen
                 self._fall_at_term_count += int(fall_done.sum().item())
+                self._log_fall += int(fall_done.sum().item())
                 self._timeout_at_term_count += int(timeout_done.sum().item())
+                self._log_timeout += int(timeout_done.sum().item())
+                step_log = info.get("log", {}) if isinstance(info, dict) else {}
+                if step_log:
+                    episode_log.update(step_log)
                 self._prev_obj_dist_3d = torch.where(
                     done_now.unsqueeze(-1),
                     torch.full_like(self._prev_obj_dist_3d, float("nan")),
@@ -760,8 +795,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
             scored = self._scored.sum(dim=1).float().mean().item()
             vel_cmd = executed_vel_cmd
             rx, ry, rz = self._robot_pose()
-            base_denom = max(1, self._done_total)
-            term_denom = max(1, self._scored_at_term_count)
+            log_term_denom = max(1, self._log_term_total)
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
@@ -776,39 +810,51 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 f"dones={int((terminated | truncated).sum())}/{self.num_envs} "
                 f"pos0=({rx[0,0].item():+.1f},{ry[0,0].item():+.1f},{rz[0,0].item():+.2f}) "
                 f"cmd0=({vel_cmd[0,0].item():+.2f},{vel_cmd[0,1].item():+.2f},{vel_cmd[0,2].item():+.2f}) "
-                f"done[illegal/fall/timeout/no_touch/finished]={self._done_illegal}/{self._done_fall}/"
-                f"{self._done_timeout}/{self._done_no_touch}/{self._done_finished} "
-                f"ratio_base={self._done_illegal/base_denom:.2f}/{self._done_fall/base_denom:.2f}/"
-                f"{self._done_timeout/base_denom:.2f} "
-                f"ratio_wrap={self._done_no_touch/term_denom:.2f}/{self._done_finished/term_denom:.2f}",
+                f"term[last_{self._nav_log_interval}nav: illegal/fall/timeout/no_touch/finished="
+                f"{self._log_illegal}/{self._log_fall}/{self._log_timeout}/{self._log_no_touch}/{self._log_finished}] "
+                f"term_ratio={self._log_illegal / log_term_denom:.2f}/"
+                f"{self._log_fall / log_term_denom:.2f}/"
+                f"{self._log_timeout / log_term_denom:.2f}/"
+                f"{self._log_no_touch / log_term_denom:.2f}/"
+                f"{self._log_finished / log_term_denom:.2f} "
+                f"(denom={self._log_term_total})",
                 flush=True,
             )
+            self._log_illegal = 0
+            self._log_fall = 0
+            self._log_timeout = 0
+            self._log_no_touch = 0
+            self._log_finished = 0
+            self._log_term_total = 0
 
         # Log mean scored objects over envs that terminated this nav step.
         # Inject termination metrics into extras["log"] so rsl_rl prints them in
         # the training table. scored_objects = mean #scored at termination;
         # no_touch / finished = fraction of terminations of each wrapper-level
         # type (these aren't in the MDP termination manager, unlike fall/time_out).
-        if self._scored_at_term_count > 0:
-            total_term = float(self._scored_at_term_count)
-            mean_scored = self._scored_at_term_sum / total_term
+        nav_done = terminated | truncated
+        if self._scored_at_term_count > 0 or bool(nav_done.any()):
             last_info = dict(last_info) if last_info is not None else {}
             log_dict = last_info.setdefault("log", {})
-            # Keep all Episode_Termination/* ratios on one denominator so metrics
-            # are directly comparable in the training table.
-            log_dict["Episode_Termination/illegal_contact"] = self._illegal_at_term_count / total_term
-            log_dict["Episode_Termination/fall"] = self._fall_at_term_count / total_term
-            log_dict["Episode_Termination/time_out"] = self._timeout_at_term_count / total_term
-            log_dict["Episode_Termination/scored_objects"] = mean_scored
-            log_dict["Episode_Termination/no_touch"] = self._no_touch_at_term_count / total_term
-            log_dict["Episode_Termination/finished"] = self._finished_at_term_count / total_term
-            self._scored_at_term_sum = 0.0
-            self._scored_at_term_count = 0
-            self._illegal_at_term_count = 0
-            self._fall_at_term_count = 0
-            self._timeout_at_term_count = 0
-            self._no_touch_at_term_count = 0
-            self._finished_at_term_count = 0
+            if episode_log:
+                log_dict.update(episode_log)
+            if self._scored_at_term_count > 0:
+                total_term = float(self._scored_at_term_count)
+                mean_scored = self._scored_at_term_sum / total_term
+                # Wrapper-level termination ratios (same denominator for all types).
+                log_dict["Episode_Termination/illegal_contact"] = self._illegal_at_term_count / total_term
+                log_dict["Episode_Termination/fall"] = self._fall_at_term_count / total_term
+                log_dict["Episode_Termination/time_out"] = self._timeout_at_term_count / total_term
+                log_dict["Episode_Termination/scored_objects"] = mean_scored
+                log_dict["Episode_Termination/no_touch"] = self._no_touch_at_term_count / total_term
+                log_dict["Episode_Termination/finished"] = self._finished_at_term_count / total_term
+                self._scored_at_term_sum = 0.0
+                self._scored_at_term_count = 0
+                self._illegal_at_term_count = 0
+                self._fall_at_term_count = 0
+                self._timeout_at_term_count = 0
+                self._no_touch_at_term_count = 0
+                self._finished_at_term_count = 0
 
         # Envs that terminated at any inner step were auto-reset by the base env.
         # Remaining inner steps may still advance them, so re-reset once at the end
