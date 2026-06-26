@@ -125,7 +125,8 @@ class TaskBStudentActorCritic(nn.Module):
         img_w: int = 64,
         img_hw: int | None = None,
         img_channels: int = 4,
-        proprio_dim: int = 9,
+        proprio_dim: int = 12,
+        actor_bypass_dim: int = 0,
         enc_dim: int = 128,
         fuse_dim: int = 256,
         rnn_type: str = "gru",
@@ -156,6 +157,7 @@ class TaskBStudentActorCritic(nn.Module):
         self.head_flat = self.img_channels * self.img_h * self.img_w
         self.ee_flat = self.img_channels * self.img_h * self.img_w
         self.proprio_dim = int(proprio_dim)
+        self.actor_bypass_dim = int(actor_bypass_dim)
         self.nav_action_dim = int(nav_action_dim)
         self.leg_action_dim = int(leg_action_dim)
 
@@ -172,8 +174,9 @@ class TaskBStudentActorCritic(nn.Module):
             nn.ReLU(inplace=True),
         )
         self._base_obs_dim = self.head_flat + self.ee_flat + self.proprio_dim
+        self._actor_obs_dim = self._base_obs_dim + self.actor_bypass_dim
         raw_critic_dim = sum(obs[g].shape[-1] for g in obs_groups["critic"])
-        self._critic_priv_dim = max(0, int(raw_critic_dim - self._base_obs_dim))
+        self._critic_priv_dim = max(0, int(raw_critic_dim - self._actor_obs_dim))
         self.critic_priv_mlp = (
             nn.Sequential(
                 nn.Linear(self._critic_priv_dim, 128),
@@ -188,8 +191,9 @@ class TaskBStudentActorCritic(nn.Module):
         self.memory_a = Memory(fuse_dim, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
         critic_in = fuse_dim + (64 if self._critic_priv_dim > 0 else 0)
         self.memory_c = Memory(critic_in, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
+        nav_in_dim = rnn_hidden_dim + self.actor_bypass_dim
         self.nav_actor = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, 256),
+            nn.Linear(nav_in_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, self.nav_action_dim),
         )
@@ -218,6 +222,13 @@ class TaskBStudentActorCritic(nn.Module):
     def _get_flat_obs(self, obs: dict, groups: list[str]) -> torch.Tensor:
         return torch.cat([obs[g] for g in groups], dim=-1)
 
+    def _split_actor_flat_obs(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base = flat_obs[..., : self._base_obs_dim]
+        bypass = None
+        if self.actor_bypass_dim > 0:
+            bypass = flat_obs[..., self._base_obs_dim : self._base_obs_dim + self.actor_bypass_dim]
+        return base, bypass
+
     def _encode_base(self, flat_obs: torch.Tensor) -> torch.Tensor:
         lead_shape = flat_obs.shape[:-1]
         x = flat_obs.reshape(-1, flat_obs.shape[-1])
@@ -230,9 +241,14 @@ class TaskBStudentActorCritic(nn.Module):
         return out.view(*lead_shape, -1)
 
     def act_inference(self, obs: dict) -> torch.Tensor:
-        encoded = self._encode_base(self._get_flat_obs(obs, self.obs_groups["policy"]))
+        flat_actor = self._get_flat_obs(obs, self.obs_groups["policy"])
+        base, bypass = self._split_actor_flat_obs(flat_actor)
+        encoded = self._encode_base(base)
         encoded = self.actor_obs_normalizer(encoded)
         out_mem = self.memory_a(encoded).squeeze(0)
+        if bypass is not None:
+            bypass = bypass.reshape(*out_mem.shape[:-1], self.actor_bypass_dim)
+            out_mem = torch.cat([out_mem, bypass], dim=-1)
         return self.nav_actor(out_mem)
 
 
@@ -298,7 +314,7 @@ class AlgSolution:
         ll_name = os.environ.get("ATEC_LL_POLICY", policy_cfg.get("ll_policy", "policy.pt"))
         ll_policy_path = _resolve_path(demo_dir, ll_name)
 
-        actor_dim = 2 * self.img_channels * self.image_h * self.image_w + 9
+        actor_dim = 2 * self.img_channels * self.image_h * self.image_w + 12 + 36
         critic_dim = actor_dim + _TASK_B_CRITIC_EXTRA_DIM
         obs = {"policy": torch.zeros(1, actor_dim), "critic": torch.zeros(1, critic_dim)}
         obs_groups = {"policy": ["policy"], "critic": ["critic"]}
@@ -307,7 +323,8 @@ class AlgSolution:
             "img_h": self.image_h,
             "img_w": self.image_w,
             "img_channels": self.img_channels,
-            "proprio_dim": int(policy_cfg.get("proprio_dim", 9)),
+            "proprio_dim": int(policy_cfg.get("proprio_dim", 12)),
+            "actor_bypass_dim": int(policy_cfg.get("actor_bypass_dim", 36)),
             "enc_dim": int(policy_cfg.get("enc_dim", 128)),
             "fuse_dim": int(policy_cfg.get("fuse_dim", 256)),
             "rnn_type": policy_cfg.get("rnn_type", "gru"),
@@ -440,7 +457,16 @@ class AlgSolution:
         if proprio.ndim == 1:
             proprio = proprio.unsqueeze(0)
         batch = proprio.shape[0]
-        proprio_feat = torch.cat([proprio[:, 0:3], proprio[:, 3:6], proprio[:, 9:12]], dim=-1)
+        prev_cmd = self._last_vel_cmd[:batch]
+        proprio_feat = torch.cat([proprio[:, 0:3], proprio[:, 3:6], proprio[:, 9:12], prev_cmd], dim=-1)
+        action_dim = (int(proprio.shape[-1]) - 12) // 3
+        jpos_leg = proprio[:, 12 : 12 + 12]
+        jvel_leg = proprio[:, 12 + action_dim : 12 + action_dim + 12] * 0.05
+        act_leg = (
+            proprio[:, 12 + 2 * action_dim : 12 + 2 * action_dim + 12]
+            * self.env_to_train_action_scale.to(dtype=proprio.dtype)
+        )
+        joint_bypass = torch.cat([jpos_leg, jvel_leg, act_leg], dim=-1)
 
         image_obs = obs.get("image", {})
         if not isinstance(image_obs, dict):
@@ -448,7 +474,7 @@ class AlgSolution:
 
         head = self._cam_flat(image_obs, "head_rgb", "head_depth", "video_rgb", batch)
         ee = self._cam_flat(image_obs, "ee_rgb", "ee_depth", None, batch)
-        return torch.cat([head, ee, proprio_feat], dim=-1)
+        return torch.cat([head, ee, proprio_feat, joint_bypass], dim=-1)
 
     def _nav_action_to_vel_cmd(self, nav_action: torch.Tensor) -> torch.Tensor:
         a = nav_action.clamp(-1.0, 1.0)

@@ -46,6 +46,7 @@ class TaskDStudentActorCritic(nn.Module):
         img_hw: int | None = None,
         img_channels: int = 4,
         proprio_dim: int = 9,
+        actor_bypass_dim: int = 0,
         enc_dim: int = 128,
         fuse_dim: int = 256,
         rnn_type: str = "gru",
@@ -80,6 +81,7 @@ class TaskDStudentActorCritic(nn.Module):
         self.head_flat = self.img_channels * self.img_h * self.img_w
         self.ee_flat = self.img_channels * self.img_h * self.img_w
         self.proprio_dim = int(proprio_dim)
+        self.actor_bypass_dim = int(actor_bypass_dim)
         self.leg_action_dim = int(leg_action_dim)
         self.nav_action_dim = int(nav_action_dim)
         self.num_actions = int(num_actions)
@@ -103,8 +105,9 @@ class TaskDStudentActorCritic(nn.Module):
             nn.ReLU(inplace=True),
         )
         self._base_obs_dim = self.head_flat + self.ee_flat + self.proprio_dim
+        self._actor_obs_dim = self._base_obs_dim + self.actor_bypass_dim
         raw_critic_dim = sum(obs[g].shape[-1] for g in obs_groups["critic"])
-        self._critic_priv_dim = max(0, int(raw_critic_dim - self._base_obs_dim))
+        self._critic_priv_dim = max(0, int(raw_critic_dim - self._actor_obs_dim))
         self.critic_priv_mlp = (
             nn.Sequential(
                 nn.Linear(self._critic_priv_dim, 128),
@@ -127,8 +130,9 @@ class TaskDStudentActorCritic(nn.Module):
         )
 
         # Nav head (BC checkpoint keys: actor.*) + optional pit e2e leg head (12D actions).
+        nav_in_dim = rnn_hidden_dim + self.actor_bypass_dim
         self.nav_actor = nn.Sequential(
-            nn.Linear(rnn_hidden_dim, 256),
+            nn.Linear(nav_in_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, self.nav_action_dim),
         )
@@ -180,8 +184,15 @@ class TaskDStudentActorCritic(nn.Module):
     def _get_flat_obs(self, obs: dict, groups: list[str]) -> torch.Tensor:
         return torch.cat([obs[g] for g in groups], dim=-1)
 
+    def _split_actor_flat_obs(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base = flat_obs[..., : self._base_obs_dim]
+        bypass = None
+        if self.actor_bypass_dim > 0:
+            bypass = flat_obs[..., self._base_obs_dim : self._base_obs_dim + self.actor_bypass_dim]
+        return base, bypass
+
     def _encode_base(self, flat_obs: torch.Tensor) -> torch.Tensor:
-        # base layout: [head(C*H*W), ee(C*H*W), proprio(9)]
+        # base layout: [head(C*H*W), ee(C*H*W), proprio(gru)]
         lead_shape = flat_obs.shape[:-1]
         x = flat_obs.reshape(-1, flat_obs.shape[-1])
         head = x[:, : self.head_flat].view(-1, self.img_channels, self.img_h, self.img_w)
@@ -199,7 +210,8 @@ class TaskDStudentActorCritic(nn.Module):
         return self.pit_actor if self._use_pit_head else self.nav_actor
 
     def _encode_actor(self, flat_obs: torch.Tensor) -> torch.Tensor:
-        return self._encode_base(flat_obs)
+        base, _ = self._split_actor_flat_obs(flat_obs)
+        return self._encode_base(base)
 
     def _encode_critic(self, flat_obs: torch.Tensor) -> torch.Tensor:
         base = self._encode_base(flat_obs[..., : self._base_obs_dim])
@@ -218,17 +230,60 @@ class TaskDStudentActorCritic(nn.Module):
             std = torch.exp(self.log_std).expand_as(mean)
         self.distribution = Normal(mean, std)
 
+    def _align_bypass_to_out_mem(self, bypass: torch.Tensor, out_mem: torch.Tensor) -> torch.Tensor:
+        """Align bypass tensor to recurrent output leading shape.
+
+        During PPO recurrent mini-batches, leading dims can differ due to sequence packing.
+        We remap bypass along leading dims to match out_mem without touching the last dim.
+        """
+        if bypass.shape[:-1] == out_mem.shape[:-1]:
+            return bypass
+
+        # Common case: [T, Bx, D] -> [T, By, D] (same T, different packed batch)
+        if bypass.ndim == out_mem.ndim == 3 and bypass.shape[0] == out_mem.shape[0]:
+            if bypass.shape[1] == 1:
+                return bypass.expand(-1, out_mem.shape[1], -1)
+            idx = torch.linspace(
+                0,
+                bypass.shape[1] - 1,
+                out_mem.shape[1],
+                device=bypass.device,
+                dtype=torch.float32,
+            ).round().long()
+            return bypass.index_select(1, idx)
+
+        # Fallback: flatten leading dims, then truncate/repeat to match out_mem count.
+        out_n = int(out_mem.reshape(-1, out_mem.shape[-1]).shape[0])
+        b_flat = bypass.reshape(-1, bypass.shape[-1])
+        if b_flat.shape[0] == 0:
+            b_flat = torch.zeros(out_n, self.actor_bypass_dim, device=out_mem.device, dtype=out_mem.dtype)
+        elif b_flat.shape[0] < out_n:
+            reps = (out_n + b_flat.shape[0] - 1) // b_flat.shape[0]
+            b_flat = b_flat.repeat(reps, 1)
+        b_flat = b_flat[:out_n]
+        return b_flat.view(*out_mem.shape[:-1], self.actor_bypass_dim)
+
     def act(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:
-        encoded = self._encode_actor(self._get_flat_obs(obs, self.obs_groups["policy"]))
+        flat_actor = self._get_flat_obs(obs, self.obs_groups["policy"])
+        _, bypass = self._split_actor_flat_obs(flat_actor)
+        encoded = self._encode_actor(flat_actor)
         encoded = self.actor_obs_normalizer(encoded)
         out_mem = self.memory_a(encoded, masks, hidden_states).squeeze(0)
+        if (not self._use_pit_head) and bypass is not None:
+            bypass = self._align_bypass_to_out_mem(bypass, out_mem)
+            out_mem = torch.cat([out_mem, bypass], dim=-1)
         self.update_distribution(out_mem)
         return self.distribution.sample()
 
     def act_inference(self, obs: dict) -> torch.Tensor:
-        encoded = self._encode_actor(self._get_flat_obs(obs, self.obs_groups["policy"]))
+        flat_actor = self._get_flat_obs(obs, self.obs_groups["policy"])
+        _, bypass = self._split_actor_flat_obs(flat_actor)
+        encoded = self._encode_actor(flat_actor)
         encoded = self.actor_obs_normalizer(encoded)
         out_mem = self.memory_a(encoded).squeeze(0)
+        if (not self._use_pit_head) and bypass is not None:
+            bypass = self._align_bypass_to_out_mem(bypass, out_mem)
+            out_mem = torch.cat([out_mem, bypass], dim=-1)
         return self._actor_head()(out_mem)
 
     def evaluate(self, obs: dict, masks=None, hidden_states=None) -> torch.Tensor:

@@ -50,7 +50,7 @@ _TASK_B_MILD_RESET_BASE_PARAMS = {
 }
 
 # Command resampling 0.1–10s uniform (nav step ~0.1s with inner_steps=5).
-_SQUAT_CMD_RESAMPLE_S = (0.08, 10.0)
+_SQUAT_CMD_RESAMPLE_S = (0.15, 10.0)
 
 
 @configclass

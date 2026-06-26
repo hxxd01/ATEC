@@ -122,6 +122,8 @@ class TaskBStudentActorCriticCfg(TaskDStudentActorCriticCfg):
 
     class_name: str = "TaskBStudentActorCritic"
     nav_action_dim: int = 2
+    proprio_dim: int = 12
+    actor_bypass_dim: int = 36
     leg_action_dim: int = 12
 
 

@@ -8,12 +8,21 @@ import numpy as np
 import torch
 
 from .taskd_student_env import TaskDStudentEnv
-from .taskd_teacher_env import _LEG_DIM
+from .taskd_teacher_env import (
+    _ACT_SLICE,
+    _ANG_VEL_SLICE,
+    _GRAVITY_SLICE,
+    _JPOS_SLICE,
+    _JVEL_SLICE,
+    _LEG_DIM,
+    _LIN_VEL_SLICE,
+)
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
 TASK_B_NAV_ACTION_DIM = 2  # [vx_cmd, wz_cmd] in [-1, 1], vy fixed to 0
-TASK_B_PROPRIO_DIM = 9  # lin_vel(3) + ang_vel(3) + gravity(3) — embedded in policy flat obs
+TASK_B_PROPRIO_DIM = 12  # lin_vel(3) + ang_vel(3) + gravity(3) + prev_cmd(3), goes through GRU
+TASK_B_ACTOR_BYPASS_DIM = _LEG_DIM * 3  # jpos_leg(12) + jvel_leg(12) + last_action_leg(12), bypasses GRU
 TASK_B_SCORED_MASK_DIM = TASK_B_NUM_OBJECTS
 # Task-D student layout: critic = policy flat + priv extras (see _build_critic_obs).
 # priv: robot pose(4) + ee xyz(3) + r_vel(2) + contact(1)
@@ -102,6 +111,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
             low=-1.0, high=1.0, shape=(TASK_B_NAV_ACTION_DIM,), dtype=np.float32
         )
 
+        # Task-B actor: [image + proprio(+prev_cmd)] -> GRU, plus joint bypass that skips GRU.
+        self._actor_dim = self._student_img_flat + TASK_B_PROPRIO_DIM + TASK_B_ACTOR_BYPASS_DIM
+
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
         self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
         self._critic_dim = self._actor_dim + self._critic_extra_dim
@@ -138,6 +150,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._episode_finished = torch.zeros(
             (self.num_envs,), device=self._device, dtype=torch.bool
         )
+        self._last_nav_cmd = torch.zeros((self.num_envs, 3), device=self._device, dtype=torch.float32)
         self._logged_first_rollout = False
         self._done_total = 0
         self._done_fall = 0
@@ -481,6 +494,23 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         return torch.cat([actor_obs, priv], dim=-1)
 
+    def _build_actor_obs(self, env_obs: dict):
+        proprio = env_obs["proprio"].to(self._device, dtype=torch.float32)
+        batch = proprio.shape[0]
+        lin_vel = proprio[:, _LIN_VEL_SLICE]
+        ang_vel = proprio[:, _ANG_VEL_SLICE]
+        gravity = proprio[:, _GRAVITY_SLICE]
+        prev_cmd = self._last_nav_cmd[:batch]
+        proprio_feat = torch.cat([lin_vel, ang_vel, gravity, prev_cmd], dim=-1)
+
+        jpos_leg = proprio[:, _JPOS_SLICE][:, :_LEG_DIM]
+        jvel_leg = proprio[:, _JVEL_SLICE][:, :_LEG_DIM] * 0.05
+        act_leg = proprio[:, _ACT_SLICE][:, :_LEG_DIM] * self._e2t
+        joint_bypass = torch.cat([jpos_leg, jvel_leg, act_leg], dim=-1)
+        head = self._camera_tensor("head_camera", batch).reshape(batch, -1)
+        ee = self._camera_tensor("ee_camera", batch).reshape(batch, -1)
+        return torch.cat([head, ee, proprio_feat, joint_bypass], dim=-1)
+
     def _obs_dict(self, env_obs: dict):
         actor = self._build_actor_obs(env_obs)
         return {"policy": actor, "critic": self._build_critic_obs(actor)}
@@ -503,6 +533,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._scored[env_ids] = False
         self._time_since_last_touch_s[env_ids] = 0.0
         self._episode_finished[env_ids] = False
+        self._last_nav_cmd[env_ids] = 0.0
         self._current_obs = base.observation_manager.compute(update_history=True)
 
     def reset(self, **kwargs):
@@ -514,6 +545,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._scored.fill_(False)
         self._time_since_last_touch_s.zero_()
         self._episode_finished.zero_()
+        self._last_nav_cmd.zero_()
         self._nav_step_count = 0
         self._done_total = 0
         self._done_fall = 0
@@ -538,6 +570,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         nav_action = nav_action.to(self._device, dtype=torch.float32)
         if nav_action.ndim == 1:
             nav_action = nav_action.unsqueeze(0)
+        executed_vel_cmd = self._nav_action_to_vel_cmd(nav_action)
 
         self._nav_step_count += 1
         if not self._logged_first_rollout:
@@ -695,7 +728,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         if self._nav_log_interval > 0 and self._nav_step_count % self._nav_log_interval == 0:
             min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
             scored = self._scored.sum(dim=1).float().mean().item()
-            vel_cmd = self._nav_action_to_vel_cmd(nav_action)
+            vel_cmd = executed_vel_cmd
             rx, ry, rz = self._robot_pose()
             base_denom = max(1, self._done_total)
             term_denom = max(1, self._scored_at_term_count)
@@ -749,6 +782,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
         # Envs that terminated at any inner step were auto-reset by the base env.
         # Remaining inner steps may still advance them, so re-reset once at the end
         # so the next nav step starts from a clean initial state.
+        self._last_nav_cmd = torch.where(
+            episode_done.unsqueeze(-1),
+            torch.zeros_like(self._last_nav_cmd),
+            executed_vel_cmd,
+        )
         if bool(episode_done.any()):
             self._partial_reset_envs(episode_done)
 

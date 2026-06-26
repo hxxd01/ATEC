@@ -11,7 +11,8 @@ policy:
   vy_max: 0.0
   wz_max: 1.0
   inner_steps: 10
-  proprio_dim: 9
+  proprio_dim: 12
+  actor_bypass_dim: 36
   enc_dim: 128
   fuse_dim: 256
   rnn_type: gru

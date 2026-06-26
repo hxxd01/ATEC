@@ -316,6 +316,8 @@ def main():
     agent_cfg.policy.img_w = policy_w
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
     agent_cfg.policy.nav_action_dim = 2
+    agent_cfg.policy.proprio_dim = 12
+    agent_cfg.policy.actor_bypass_dim = 36
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskb_student_b2piper_depth"
 
