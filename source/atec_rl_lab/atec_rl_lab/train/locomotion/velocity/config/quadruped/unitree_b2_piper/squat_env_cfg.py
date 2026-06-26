@@ -49,6 +49,9 @@ _TASK_B_MILD_RESET_BASE_PARAMS = {
     },
 }
 
+# Command resampling 0.1–10s uniform (nav step ~0.1s with inner_steps=5).
+_SQUAT_CMD_RESAMPLE_S = (0.1, 3.0)
+
 
 @configclass
 class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
@@ -93,10 +96,14 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
         if getattr(self.observations, "critic", None) is not None:
             self.observations.critic.enable_corruption = False
 
-        # Velocity commands: use full range from step 0 (no command curriculum).
+        # Velocity commands: vx/vy/wz full range; resample 0.1–10s (no curriculum).
         self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
         self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_heading_envs = 0.0
+        self.commands.base_velocity.resampling_time_range = _SQUAT_CMD_RESAMPLE_S
         self.curriculum.command_levels_lin_vel = None
         self.curriculum.command_levels_ang_vel = None
 
@@ -116,7 +123,7 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
             func=atec_mdp.ee_height_exp,
             weight=3.0,
             params={
-                "target_height": 0.27,
+                "target_height": 0.235,
                 "std": 0.1,
                 "ee_body_name": "gripper_base",
             },
