@@ -734,14 +734,26 @@ class TaskBStudentEnv(TaskDStudentEnv):
                 illegal_flags = newly_done & illegal_contact_flags
                 fall_done = newly_done & fall_flags
                 timeout_done = newly_done & timeout_flags
+                newly_done_count = int(newly_done.sum().item())
+                illegal_count = int(illegal_flags.sum().item())
+                assert illegal_count <= newly_done_count, (
+                    f"[TaskBStudent] invariant violated: illegal_count({illegal_count}) "
+                    f"> newly_done_count({newly_done_count})"
+                )
 
-                self._illegal_at_term_count += int(illegal_flags.sum().item())
-                self._log_illegal += int(illegal_flags.sum().item())
-                self._log_term_total += int(newly_done.sum().item())
+                self._illegal_at_term_count += illegal_count
+                self._log_illegal += illegal_count
+                self._log_term_total += newly_done_count
                 if self._illegal_contact_penalty > 0.0 and bool(illegal_flags.any()):
                     illegal_pen = illegal_flags.to(dtype=total_reward.dtype) * (-self._illegal_contact_penalty)
                     total_reward += illegal_pen
                     total_illegal_pen += illegal_pen
+                if illegal_count > 0:
+                    print(
+                        f"[TaskBStudent][debug] illegal={illegal_count} newly_done={newly_done_count} "
+                        f"illegal_pen_mean_step={total_illegal_pen.mean().item():+.6f}",
+                        flush=True,
+                    )
                 self._fall_at_term_count += int(fall_done.sum().item())
                 self._log_fall += int(fall_done.sum().item())
                 self._timeout_at_term_count += int(timeout_done.sum().item())
