@@ -60,6 +60,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         sparse_touch_reward: float = 10.0,
         grasp_dist_thresh: float = TASK_B_GRASP_DIST,
         time_penalty_per_env_step: float = 0.004,
+        w_action_rate: float = 0.0,
         illegal_contact_penalty: float = 0.0,
         ee_body_name: str = "gripper_base",
         no_touch_timeout_s: float = 12.0,
@@ -92,6 +93,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._grasp_dist_thresh = float(grasp_dist_thresh)
         self._grasp_dist_sq = self._grasp_dist_thresh * self._grasp_dist_thresh
         self._time_penalty_per_env_step = float(time_penalty_per_env_step)
+        self._w_action_rate = float(w_action_rate)
         self._illegal_contact_penalty = float(illegal_contact_penalty)
         self._ee_body_name = str(ee_body_name)
         self._no_touch_timeout_s = float(no_touch_timeout_s)
@@ -179,7 +181,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
             f"guide_on={self._dense_enabled} "
             f"sparse_touch={self._sparse_touch_reward} "
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
-            f"illegal_pen={self._illegal_contact_penalty} "
+            f"rate_pen={self._w_action_rate} illegal_pen={self._illegal_contact_penalty} "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
             flush=True,
@@ -192,6 +194,21 @@ class TaskBStudentEnv(TaskDStudentEnv):
         wz = a[:, 1] * self._wz_max
         vy = torch.zeros_like(vx)
         return torch.stack([vx, vy, wz], dim=-1)
+
+    def _termination_term_flags(self) -> dict[str, torch.Tensor]:
+        """Task-B MDP terminations used for metrics and illegal-contact penalty."""
+        tm = getattr(self.env.unwrapped, "termination_manager", None)
+        if tm is None:
+            return {}
+        out: dict[str, torch.Tensor] = {}
+        for name in ("illegal_contact", "fall", "time_out"):
+            try:
+                out[name] = tm.get_term(name).view(-1)[: self.num_envs].to(
+                    device=self._device, dtype=torch.bool
+                )
+            except Exception:
+                pass
+        return out
 
     def _ensure_ee_body_idx(self) -> int:
         if self._ee_body_idx is not None:
@@ -584,6 +601,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         total_sparse = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_finished = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_time_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
+        total_action_rate_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_illegal_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         terminated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         truncated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
@@ -596,6 +614,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         dist_3d_all = torch.linalg.norm(diff_3d, dim=-1)
 
         for _ in range(self.inner_steps):
+            was_episode_done = episode_done
             active = ~episode_done
             if not bool(active.any()):
                 break
@@ -672,19 +691,29 @@ class TaskBStudentEnv(TaskDStudentEnv):
 
             if bool(done_now.any()):
                 self._record_scored_at_termination(done_now)
-                fall_flags = self._termination_term_flags().get("fall")
-                timeout_flags = done_now & step_trunc_1d
+                term_flags = self._termination_term_flags()
+                illegal_contact_flags = term_flags.get("illegal_contact")
+                fall_flags = term_flags.get("fall")
+                timeout_flags = term_flags.get("time_out")
+                if illegal_contact_flags is None:
+                    illegal_contact_flags = torch.zeros_like(done_now)
                 if fall_flags is None:
                     fall_flags = torch.zeros_like(done_now)
-                fall_flags = done_now & (~step_trunc_1d) & fall_flags
-                illegal_flags = done_now & (~step_trunc_1d) & (~fall_flags)
+                if timeout_flags is None:
+                    timeout_flags = torch.zeros_like(done_now)
+
+                newly_done = done_now & (~was_episode_done)
+                illegal_flags = newly_done & illegal_contact_flags
+                fall_done = newly_done & fall_flags
+                timeout_done = newly_done & timeout_flags
+
                 self._illegal_at_term_count += int(illegal_flags.sum().item())
-                if self._illegal_contact_penalty > 0.0:
+                if self._illegal_contact_penalty > 0.0 and bool(illegal_flags.any()):
                     illegal_pen = illegal_flags.to(dtype=total_reward.dtype) * (-self._illegal_contact_penalty)
                     total_reward += illegal_pen
                     total_illegal_pen += illegal_pen
-                self._fall_at_term_count += int(fall_flags.sum().item())
-                self._timeout_at_term_count += int(timeout_flags.sum().item())
+                self._fall_at_term_count += int(fall_done.sum().item())
+                self._timeout_at_term_count += int(timeout_done.sum().item())
                 self._prev_obj_dist_3d = torch.where(
                     done_now.unsqueeze(-1),
                     torch.full_like(self._prev_obj_dist_3d, float("nan")),
@@ -715,15 +744,16 @@ class TaskBStudentEnv(TaskDStudentEnv):
                     torch.zeros_like(self._episode_finished),
                     self._episode_finished,
                 )
-                self._done_total += int(done_now.sum().item())
-                self._done_timeout += int((done_now & step_trunc_1d).sum().item())
-                if fall_flags is not None:
-                    self._done_fall += int((done_now & fall_flags).sum().item())
-                illegal = done_now
-                if fall_flags is not None:
-                    illegal = illegal & (~fall_flags)
-                illegal = illegal & (~step_trunc_1d)
-                self._done_illegal += int(illegal.sum().item())
+                self._done_total += int(newly_done.sum().item())
+                self._done_timeout += int(timeout_done.sum().item())
+                self._done_fall += int(fall_done.sum().item())
+                self._done_illegal += int(illegal_flags.sum().item())
+
+        if self._w_action_rate > 0.0:
+            delta_cmd = executed_vel_cmd - self._last_nav_cmd
+            action_rate_pen = -self._w_action_rate * (delta_cmd * delta_cmd).sum(dim=-1)
+            total_reward += action_rate_pen
+            total_action_rate_pen += action_rate_pen
 
         if self._nav_log_interval > 0 and self._nav_step_count % self._nav_log_interval == 0:
             min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
@@ -735,10 +765,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
-                f"[guide/prog/mile/sparse/finished/time/illegal]={total_dense.mean().item():+.3f}/"
+                f"[guide/prog/mile/sparse/finished/time/rate/illegal]={total_dense.mean().item():+.3f}/"
                 f"{total_guide_prog.mean().item():+.3f}/{total_guide_mile.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
-                f"{total_time_pen.mean().item():+.3f}/{total_illegal_pen.mean().item():+.3f} "
+                f"{total_time_pen.mean().item():+.3f}/{total_action_rate_pen.mean().item():+.3f}/"
+                f"{total_illegal_pen.mean().item():+.3f} "
                 f"min_3d_oracle={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
                 f"min_xy_oracle={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "

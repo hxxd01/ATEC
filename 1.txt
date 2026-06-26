@@ -419,7 +419,7 @@ python scripts/train_nav_taskb_student.py \
   --policy_img_w 64 \
   --max_iter 10000 \
   --headless
-  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskb_student_b2piper/2026-06-26_18-13-03/model_2600.pt \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskb_student_b2piper/2026-06-26_21-58-50/model_200.pt \
 python scripts/play_atec_task.py \
   --task ATEC-TaskB-B2Piper \
   --device cuda:0 \

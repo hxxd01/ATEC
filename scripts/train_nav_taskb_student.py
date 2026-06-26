@@ -75,6 +75,12 @@ parser.add_argument(
     help="Time penalty each low-level env step.",
 )
 parser.add_argument(
+    "--w_action_rate",
+    type=float,
+    default=0.0,
+    help="Penalty weight on ||cmd_t - cmd_{t-1}||^2 per nav step (0=off). Uses clamped vel_cmd.",
+)
+parser.add_argument(
     "--illegal_contact_penalty",
     type=float,
     default=0.0,
@@ -370,6 +376,7 @@ def main():
         sparse_touch_reward=args_cli.sparse_touch_reward,
         grasp_dist_thresh=args_cli.grasp_dist_thresh,
         time_penalty_per_env_step=args_cli.time_penalty_per_env_step,
+        w_action_rate=args_cli.w_action_rate,
         illegal_contact_penalty=args_cli.illegal_contact_penalty,
         no_touch_timeout_s=args_cli.no_touch_timeout_s,
         finished_reward=args_cli.finished_reward,
@@ -399,7 +406,8 @@ def main():
         f"cams=head+ee img={img_ch}ch depth_only={args_cli.depth_only} "
         f"rewards guide_prog={args_cli.w_dense_dist} sparse={args_cli.sparse_touch_reward} "
         f"sparse_only={args_cli.sparse_only} "
-        f"time_pen={args_cli.time_penalty_per_env_step} illegal_pen={args_cli.illegal_contact_penalty} "
+        f"time_pen={args_cli.time_penalty_per_env_step} rate_pen={args_cli.w_action_rate} "
+        f"illegal_pen={args_cli.illegal_contact_penalty} "
         f"no_touch_timeout_s={args_cli.no_touch_timeout_s} "
         f"finished_reward={args_cli.finished_reward}",
         flush=True,
