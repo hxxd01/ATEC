@@ -10,7 +10,7 @@ policy:
   vx_max: 2.0
   vy_max: 1.0
   wz_max: 1.0
-  inner_steps: 5
+  inner_steps: 10
   proprio_dim: 9
   enc_dim: 128
   fuse_dim: 256
@@ -24,5 +24,5 @@ policy:
   init_noise_std: 0.6
   noise_std_type: scalar
   # Rename/copy your checkpoint into demo/ before upload
-  student_ckpt: model_taskb_student.pt
+  student_ckpt: model_2600.pt
   ll_policy: policy.pt

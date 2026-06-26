@@ -208,7 +208,7 @@ class TaskBStudentActorCritic(nn.Module):
         )
         if noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-            else:
+        else:
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
 
     def reset(self, dones=None):
@@ -240,7 +240,7 @@ def _load_deploy_cfg(demo_dir: str) -> dict:
     for name in ("agent_taskb_student.yaml", "agent.yaml"):
         agent_yaml = os.path.join(demo_dir, name)
         if not os.path.isfile(agent_yaml):
-                continue
+            continue
         try:
             import yaml
 
@@ -248,7 +248,7 @@ def _load_deploy_cfg(demo_dir: str) -> dict:
                 data = yaml.safe_load(f) or {}
             return data.get("policy", {})
         except Exception:
-                continue
+            continue
     return {}
 
 
@@ -275,7 +275,7 @@ class AlgSolution:
         if legacy_hw is not None and "img_h" not in policy_cfg:
             self.image_h = int(legacy_hw)
             self.image_w = int(legacy_hw)
-            else:
+        else:
             self.image_h = int(policy_cfg.get("img_h", 48))
             self.image_w = int(policy_cfg.get("img_w", 64))
         self.img_channels = int(policy_cfg.get("img_channels", 4))
@@ -373,7 +373,7 @@ class AlgSolution:
     def _to_batch_tensor(x, device: torch.device) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
             t = x.to(device=device, dtype=torch.float32 if x.is_floating_point() else x.dtype)
-            else:
+        else:
             import numpy as np
 
             arr = np.asarray(x)
@@ -413,7 +413,12 @@ class AlgSolution:
         if depth is None and depth_key == "head_depth":
             depth = image_obs.get("video_depth")
         if depth is None:
-            raise RuntimeError(f"Missing depth key '{depth_key}' in obs['image'].")
+            keys = sorted(image_obs.keys()) if isinstance(image_obs, dict) else []
+            raise RuntimeError(
+                f"Missing depth key '{depth_key}' in obs['image'] (have {keys}). "
+                "Task B student nav play needs head/ee cameras: "
+                "python scripts/play_atec_task.py ... --cameras-only (not --fast)."
+            )
 
         if self.depth_only:
             flat = self._prep_depth(self._to_batch_tensor(depth, self.device)).reshape(batch, -1)
@@ -519,7 +524,7 @@ class AlgSolution:
         with torch.inference_mode():
             action_train = self.ll_policy(ll_obs)
         if not isinstance(action_train, torch.Tensor):
-        action_train = torch.as_tensor(action_train, device=self.device, dtype=torch.float32)
+            action_train = torch.as_tensor(action_train, device=self.device, dtype=torch.float32)
         if action_train.ndim == 1:
             action_train = action_train.unsqueeze(0)
 

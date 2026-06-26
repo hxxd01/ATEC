@@ -400,7 +400,7 @@ export ATEC_SEARCH_BANANA_Z_MAX=0.4
 
 python scripts/rsl_rl/play.py \
   --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0 \
-  --checkpoint /home/ubuntu/ATEC/logs/rsl_rl/unitree_b2_piper_flat_squat_transition/2026-06-26_08-39-18/model_11100.pt \
+  --checkpoint  /home/ubuntu/ATEC/logs/rsl_rl/unitree_b2_piper_flat_squat_transition/2026-06-26_17-55-51/model_12100.pt \
   --num_envs 1 \
   --headless \
   --video \
@@ -413,8 +413,9 @@ python scripts/train_nav_taskb_student.py \
   --inner_steps 5 \
   --sim_camera_h 48 \
   --sim_camera_w 64 \
-  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskb_student_b2piper/2026-06-26_16-46-41/model_2200.pt \
-  --no_touch_timeout_s 5 \
+  --illegal_contact_penalty 6.0 \
+  --resume /home/ubuntu/ATEC/logs/rsl_rl/taskb_student_b2piper/2026-06-26_18-13-03/model_2600.pt \
+  --no_touch_timeout_s 6 \
   --policy_img_h 48 \
   --policy_img_w 64 \
   --max_iter 10000 \
@@ -430,4 +431,4 @@ python scripts/play_atec_task.py \
 OMNI_KIT_ACCEPT_EULA=Y ATEC_ENABLE_GRASPNET=1 ATEC_ENABLE_ANYGRASP=0 ATEC_GRASP_USE_TASKE_IK=0 ATEC_GRASPNET_TARGET_OBJECT=banana ATEC_SEARCH_USE_HEAD_ROTATED_POINTS=1 python scripts/play_atec_task.py --task ATEC-TaskB-B2Piper --device cuda:0 --depth-lidar  --debug --headless --platform_deploy
 
 
-python scripts/rsl_rl/train.py   --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0   --headless   --resume   --load_run 2026-06-26_08-39-18   --checkpoint model_11100.pt
+python scripts/rsl_rl/train.py   --task ATEC-Isaac-Squat-Flat-Unitree-B2Piper-v0   --headless   --resume   --load_run 2026-06-26_17-12-04  --checkpoint model_11900.pt

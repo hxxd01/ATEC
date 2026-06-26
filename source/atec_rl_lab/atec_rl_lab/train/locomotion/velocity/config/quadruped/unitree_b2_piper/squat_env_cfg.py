@@ -50,7 +50,7 @@ _TASK_B_MILD_RESET_BASE_PARAMS = {
 }
 
 # Command resampling 0.1–10s uniform (nav step ~0.1s with inner_steps=5).
-_SQUAT_CMD_RESAMPLE_S = (0.1, 3.0)
+_SQUAT_CMD_RESAMPLE_S = (0.08, 3.0)
 
 
 @configclass
@@ -123,7 +123,7 @@ class UnitreeB2PiperSquatFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
             func=atec_mdp.ee_height_exp,
             weight=3.0,
             params={
-                "target_height": 0.235,
+                "target_height": 0.22,
                 "std": 0.1,
                 "ee_body_name": "gripper_base",
             },
