@@ -524,8 +524,6 @@ class TaskBStudentEnv(TaskDStudentEnv):
         if nav_action.ndim == 1:
             nav_action = nav_action.unsqueeze(0)
 
-        executed_vel = self._nav_action_to_vel_cmd(nav_action)
-
         self._nav_step_count += 1
         if not self._logged_first_rollout:
             print("[TaskBStudent] rollout started (first nav step).", flush=True)
@@ -538,8 +536,6 @@ class TaskBStudentEnv(TaskDStudentEnv):
         total_sparse = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_finished = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_time_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
-        total_action_rate_pen = action_rate_pen.clone()
-        total_reward += action_rate_pen
         terminated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         truncated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         last_info = {}
@@ -686,10 +682,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
-                f"[guide/prog/mile/sparse/finished/time/rate]={total_dense.mean().item():+.3f}/"
+                f"[guide/prog/mile/sparse/finished/time]={total_dense.mean().item():+.3f}/"
                 f"{total_guide_prog.mean().item():+.3f}/{total_guide_mile.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
-                f"{total_time_pen.mean().item():+.3f}/{total_action_rate_pen.mean().item():+.3f} "
+                f"{total_time_pen.mean().item():+.3f} "
                 f"min_3d_oracle={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
                 f"min_xy_oracle={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "
@@ -729,8 +725,6 @@ class TaskBStudentEnv(TaskDStudentEnv):
             self._timeout_at_term_count = 0
             self._no_touch_at_term_count = 0
             self._finished_at_term_count = 0
-
-        self._last_vel_cmd = executed_vel
 
         # Envs that terminated at any inner step were auto-reset by the base env.
         # Remaining inner steps may still advance them, so re-reset once at the end
