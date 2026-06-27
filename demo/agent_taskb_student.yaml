@@ -11,7 +11,10 @@ policy:
   vy_max: 1.0
   wz_max: 1.0
   inner_steps: 5
-  proprio_dim: 9
+  physics_step_dt: 0.02
+  no_touch_timeout_s: 40.0
+  max_episode_length_s: 1200.0
+  proprio_dim: 15        # base(9) + last_vel(3) + touch_t(1) + scored(1) + elapsed(1)
   enc_dim: 128
   fuse_dim: 256
   rnn_type: gru

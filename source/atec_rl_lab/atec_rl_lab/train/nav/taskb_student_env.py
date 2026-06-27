@@ -8,11 +8,19 @@ import numpy as np
 import torch
 
 from .taskd_student_env import TaskDStudentEnv
-from .taskd_teacher_env import _LEG_DIM
+from .taskd_teacher_env import (
+    _ANG_VEL_SLICE,
+    _GRAVITY_SLICE,
+    _LEG_DIM,
+    _LIN_VEL_SLICE,
+)
 
 TASK_B_NUM_OBJECTS = 18
 TASK_B_GRASP_DIST = 0.20
-TASK_B_PROPRIO_DIM = 9  # lin_vel(3) + ang_vel(3) + gravity(3) — embedded in policy flat obs
+TASK_B_BASE_PROPRIO_DIM = 9  # lin_vel(3) + ang_vel(3) + gravity(3)
+# last_vel_cmd(3) + time_since_touch_norm(1) + scored_ratio(1) + elapsed_norm(1)
+TASK_B_TASK_CTX_DIM = 6
+TASK_B_PROPRIO_DIM = TASK_B_BASE_PROPRIO_DIM + TASK_B_TASK_CTX_DIM
 TASK_B_SCORED_MASK_DIM = TASK_B_NUM_OBJECTS
 # Task-D student layout: critic = policy flat + priv extras (see _build_critic_obs).
 # priv: robot pose(4) + ee xyz(3) + r_vel(2) + contact(1)
@@ -102,6 +110,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._w_action_rate = float(w_action_rate)
         self._illegal_contact_penalty = float(illegal_contact_penalty)
 
+        # Task-B actor proprio: base(9) + task context(6); parent init used proprio_dim=9.
+        self._actor_dim = self._student_img_flat + TASK_B_PROPRIO_DIM
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
         self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
         self._critic_dim = self._actor_dim + self._critic_extra_dim
@@ -170,9 +180,50 @@ class TaskBStudentEnv(TaskDStudentEnv):
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
             f"max_vel_cmd_delta={self._max_vel_cmd_delta} w_action_rate={self._w_action_rate} "
             f"illegal_pen={self._illegal_contact_penalty} "
+            f"proprio_dim={TASK_B_PROPRIO_DIM} "
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
             flush=True,
         )
+
+    def _max_episode_length_s(self) -> float:
+        return float(getattr(self.env.unwrapped, "max_episode_length_s", 1200.0))
+
+    def _touch_time_norm_denom(self) -> float:
+        if self._no_touch_timeout_s > 0.0:
+            return self._no_touch_timeout_s
+        return max(self._max_episode_length_s(), 1e-6)
+
+    def _build_task_ctx_obs(self) -> torch.Tensor:
+        """Task context for actor: last cmd, touch timer, progress, elapsed (all normalized)."""
+        last_vel_nav = self._vel_cmd_to_nav_action(self._last_vel_cmd)
+        touch_norm = (self._time_since_last_touch_s / self._touch_time_norm_denom()).clamp(0.0, 1.0)
+        scored_ratio = self._scored.sum(dim=1).to(dtype=torch.float32) / float(TASK_B_NUM_OBJECTS)
+        base = self.env.unwrapped
+        elapsed_s = base.episode_length_buf[: self.num_envs].to(
+            device=self._device, dtype=torch.float32
+        ) * self._env_step_dt
+        elapsed_norm = (elapsed_s / max(self._max_episode_length_s(), 1e-6)).clamp(0.0, 1.0)
+        return torch.cat(
+            [
+                last_vel_nav,
+                touch_norm.unsqueeze(-1),
+                scored_ratio.unsqueeze(-1),
+                elapsed_norm.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+
+    def _build_actor_obs(self, env_obs: dict):
+        proprio = env_obs["proprio"].to(self._device, dtype=torch.float32)
+        batch = proprio.shape[0]
+        lin_vel = proprio[:, _LIN_VEL_SLICE]
+        ang_vel = proprio[:, _ANG_VEL_SLICE]
+        gravity = proprio[:, _GRAVITY_SLICE]
+        proprio_feat = torch.cat([lin_vel, ang_vel, gravity], dim=-1)
+        task_ctx = self._build_task_ctx_obs()
+        head = self._camera_tensor("head_camera", batch).reshape(batch, -1)
+        ee = self._camera_tensor("ee_camera", batch).reshape(batch, -1)
+        return torch.cat([head, ee, proprio_feat, task_ctx], dim=-1)
 
     def _vel_cmd_to_nav_action(self, vel_cmd: torch.Tensor) -> torch.Tensor:
         """Inverse of ``_nav_action_to_vel_cmd`` (clamped to [-1, 1])."""

@@ -108,6 +108,8 @@ class ConvEncoder(nn.Module):
 
 # Task B critic priv: pose(4)+ee(3)+r_vel(2)+contact(1)+min_xy(1)+min_3d(1)+scored(18)+trash(54)
 _TASK_B_CRITIC_EXTRA_DIM = 84
+_TASK_B_NUM_OBJECTS = 18
+_TASK_B_PROPRIO_DIM = 15  # base(9) + last_vel(3) + touch_t(1) + scored(1) + elapsed(1)
 
 
 class TaskBStudentActorCritic(nn.Module):
@@ -289,6 +291,13 @@ class AlgSolution:
 
         inner_steps = int(os.environ.get("NAV_INNER_STEPS", policy_cfg.get("inner_steps", 5)))
         self.nav_hold_steps = max(1, inner_steps)
+        self.physics_step_dt = float(policy_cfg.get("physics_step_dt", 0.02))
+        self.no_touch_timeout_s = float(
+            os.environ.get("NAV_NO_TOUCH_TIMEOUT_S", policy_cfg.get("no_touch_timeout_s", 40.0))
+        )
+        self.max_episode_length_s = float(
+            os.environ.get("NAV_MAX_EPISODE_S", policy_cfg.get("max_episode_length_s", 1200.0))
+        )
 
         student_ckpt = os.environ.get(
             "ATEC_TASKB_STUDENT_CKPT",
@@ -298,7 +307,7 @@ class AlgSolution:
         ll_name = os.environ.get("ATEC_LL_POLICY", policy_cfg.get("ll_policy", "policy.pt"))
         ll_policy_path = _resolve_path(demo_dir, ll_name)
 
-        actor_dim = 2 * self.img_channels * self.image_h * self.image_w + 9
+        actor_dim = 2 * self.img_channels * self.image_h * self.image_w + _TASK_B_PROPRIO_DIM
         critic_dim = actor_dim + _TASK_B_CRITIC_EXTRA_DIM
         obs = {"policy": torch.zeros(1, actor_dim), "critic": torch.zeros(1, critic_dim)}
         obs_groups = {"policy": ["policy"], "critic": ["critic"]}
@@ -307,7 +316,7 @@ class AlgSolution:
             "img_h": self.image_h,
             "img_w": self.image_w,
             "img_channels": self.img_channels,
-            "proprio_dim": int(policy_cfg.get("proprio_dim", 9)),
+            "proprio_dim": int(policy_cfg.get("proprio_dim", _TASK_B_PROPRIO_DIM)),
             "enc_dim": int(policy_cfg.get("enc_dim", 128)),
             "fuse_dim": int(policy_cfg.get("fuse_dim", 256)),
             "rnn_type": policy_cfg.get("rnn_type", "gru"),
@@ -349,6 +358,9 @@ class AlgSolution:
         self._nav_step_counter = 0
         self._cached_vel_cmd: torch.Tensor | None = None
         self._last_vel_cmd = torch.zeros((1, 3), device=self.device, dtype=torch.float32)
+        self._time_since_last_touch_s = 0.0
+        self._last_platform_score = 0.0
+        self._scored_count = 0.0
 
     def set_device(self, device: str) -> None:
         self.device = device
@@ -368,6 +380,42 @@ class AlgSolution:
         self._nav_step_counter = 0
         self._cached_vel_cmd = None
         self._last_vel_cmd = torch.zeros((1, 3), device=self.device, dtype=torch.float32)
+        self._time_since_last_touch_s = 0.0
+        self._last_platform_score = 0.0
+        self._scored_count = 0.0
+
+    def _touch_time_norm_denom(self) -> float:
+        if self.no_touch_timeout_s > 0.0:
+            return self.no_touch_timeout_s
+        return max(self.max_episode_length_s, 1e-6)
+
+    def _vel_cmd_to_nav_action(self, vel_cmd: torch.Tensor) -> torch.Tensor:
+        vx = vel_cmd[:, 0]
+        vy = vel_cmd[:, 1]
+        wz = vel_cmd[:, 2]
+        vx_span = max(self.vx_max - self.vx_min, 1e-6)
+        a0 = (vx - self.vx_min) / vx_span * 2.0 - 1.0
+        a1 = vy / max(self.vy_max, 1e-6)
+        a2 = wz / max(self.wz_max, 1e-6)
+        return torch.stack([a0, a1, a2], dim=-1).clamp(-1.0, 1.0)
+
+    def _update_platform_score(self, current_score) -> None:
+        score = float(current_score) if current_score is not None else self._last_platform_score
+        if score > self._last_platform_score:
+            self._time_since_last_touch_s = 0.0
+            self._last_platform_score = score
+        self._scored_count = min(max(score, 0.0), float(_TASK_B_NUM_OBJECTS))
+
+    def _build_task_ctx_obs(self, batch: int) -> torch.Tensor:
+        last_vel_nav = self._vel_cmd_to_nav_action(self._last_vel_cmd)
+        touch_norm = min(self._time_since_last_touch_s / self._touch_time_norm_denom(), 1.0)
+        scored_ratio = self._scored_count / float(_TASK_B_NUM_OBJECTS)
+        elapsed_s = self._nav_step_counter * self.physics_step_dt
+        elapsed_norm = min(elapsed_s / max(self.max_episode_length_s, 1e-6), 1.0)
+        touch_t = torch.full((batch, 1), touch_norm, device=self.device, dtype=torch.float32)
+        scored_t = torch.full((batch, 1), scored_ratio, device=self.device, dtype=torch.float32)
+        elapsed_t = torch.full((batch, 1), elapsed_norm, device=self.device, dtype=torch.float32)
+        return torch.cat([last_vel_nav, touch_t, scored_t, elapsed_t], dim=-1)
 
     @staticmethod
     def _to_batch_tensor(x, device: torch.device) -> torch.Tensor:
@@ -436,6 +484,7 @@ class AlgSolution:
             proprio = proprio.unsqueeze(0)
         batch = proprio.shape[0]
         proprio_feat = torch.cat([proprio[:, 0:3], proprio[:, 3:6], proprio[:, 9:12]], dim=-1)
+        task_ctx = self._build_task_ctx_obs(batch)
 
         image_obs = obs.get("image", {})
         if not isinstance(image_obs, dict):
@@ -443,7 +492,7 @@ class AlgSolution:
 
         head = self._cam_flat(image_obs, "head_rgb", "head_depth", "video_rgb", batch)
         ee = self._cam_flat(image_obs, "ee_rgb", "ee_depth", None, batch)
-        return torch.cat([head, ee, proprio_feat], dim=-1)
+        return torch.cat([head, ee, proprio_feat, task_ctx], dim=-1)
 
     def _nav_action_to_vel_cmd(self, nav_action: torch.Tensor) -> torch.Tensor:
         a = nav_action.clamp(-1.0, 1.0)
@@ -508,7 +557,8 @@ class AlgSolution:
         return action_env
 
     def predicts(self, obs, current_score):
-        del current_score
+        self._update_platform_score(current_score)
+        self._time_since_last_touch_s += self.physics_step_dt
         proprio = self._to_batch_tensor(obs["proprio"], self.device)
         if proprio.ndim == 1:
             proprio = proprio.unsqueeze(0)
@@ -533,4 +583,7 @@ class AlgSolution:
             f"hl_cmd=({float(cmd[0]):+.2f},{float(cmd[1]):+.2f},{float(cmd[2]):+.2f})",
             f"img={self.img_channels}ch@{self.image_h}x{self.image_w}",
             f"nav_hold={self.nav_hold_steps}",
+            f"scored={self._scored_count:.0f}/{_TASK_B_NUM_OBJECTS} "
+            f"touch_t={self._time_since_last_touch_s:.1f}s "
+            f"elapsed={self._nav_step_counter * self.physics_step_dt:.1f}s",
         ]

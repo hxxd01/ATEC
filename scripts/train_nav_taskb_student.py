@@ -150,7 +150,7 @@ from atec_rl_lab.tasks.task_b.env_cfg import (
     apply_task_d_camera_depth_clip,
     refresh_task_b_terrain_cfg,
 )
-from atec_rl_lab.train.nav.taskb_student_env import TaskBStudentEnv
+from atec_rl_lab.train.nav.taskb_student_env import TASK_B_PROPRIO_DIM, TaskBStudentEnv
 from atec_rl_lab.train.nav.nav_cfg import TaskBStudentPPORunnerCfg
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
 from atec_rl_lab.train.nav.taskb_student_actor_critic import TaskBStudentActorCritic
@@ -327,6 +327,7 @@ def main():
     agent_cfg.policy.img_h = policy_h
     agent_cfg.policy.img_w = policy_w
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
+    agent_cfg.policy.proprio_dim = TASK_B_PROPRIO_DIM
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskb_student_b2piper_depth"
 
