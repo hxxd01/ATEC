@@ -69,11 +69,16 @@ class NavRslRlVecEnvWrapper(VecEnv):
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
         dones = (terminated | truncated).to(dtype=torch.long)
 
+        out = dict(extras) if isinstance(extras, dict) else {}
         if not self.unwrapped.cfg.is_finite_horizon:
-            extras = dict(extras) if extras is not None else {}
-            extras["time_outs"] = truncated
+            out["time_outs"] = truncated
+        # rsl_rl averages extras["log"] every nav step and dilutes episode metrics.
+        # Publish episode stats only when an env actually finished this nav step.
+        if bool(dones.any()) and "log" in out:
+            out["episode"] = dict(out["log"])
+        out.pop("log", None)
 
-        return TensorDict(obs_dict, batch_size=[self.num_envs]), rew, dones, extras
+        return TensorDict(obs_dict, batch_size=[self.num_envs]), rew, dones, out
 
     def close(self):
         return self.env.close()
