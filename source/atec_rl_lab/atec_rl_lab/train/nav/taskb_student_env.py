@@ -68,6 +68,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         max_vel_cmd_delta: float = 0.0,
         w_action_rate: float = 0.5,
         illegal_contact_penalty: float = 0.0,
+        proprio_dim: int | None = None,
     ):
         super().__init__(
             env=env,
@@ -110,8 +111,18 @@ class TaskBStudentEnv(TaskDStudentEnv):
         self._w_action_rate = float(w_action_rate)
         self._illegal_contact_penalty = float(illegal_contact_penalty)
 
-        # Task-B actor proprio: base(9) + task context(6); parent init used proprio_dim=9.
-        self._actor_dim = self._student_img_flat + TASK_B_PROPRIO_DIM
+        if proprio_dim is None:
+            proprio_dim = TASK_B_PROPRIO_DIM
+        proprio_dim = int(proprio_dim)
+        if proprio_dim not in (TASK_B_BASE_PROPRIO_DIM, TASK_B_PROPRIO_DIM):
+            raise ValueError(
+                f"proprio_dim must be {TASK_B_BASE_PROPRIO_DIM} (legacy) or "
+                f"{TASK_B_PROPRIO_DIM} (with task context), got {proprio_dim}"
+            )
+        self._proprio_dim = proprio_dim
+        self._use_task_ctx_obs = proprio_dim > TASK_B_BASE_PROPRIO_DIM
+
+        self._actor_dim = self._student_img_flat + self._proprio_dim
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
         self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
         self._critic_dim = self._actor_dim + self._critic_extra_dim
@@ -180,7 +191,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
             f"max_vel_cmd_delta={self._max_vel_cmd_delta} w_action_rate={self._w_action_rate} "
             f"illegal_pen={self._illegal_contact_penalty} "
-            f"proprio_dim={TASK_B_PROPRIO_DIM} "
+            f"proprio_dim={self._proprio_dim} "
+            f"task_ctx_obs={self._use_task_ctx_obs} "
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
             flush=True,
         )
@@ -220,10 +232,12 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ang_vel = proprio[:, _ANG_VEL_SLICE]
         gravity = proprio[:, _GRAVITY_SLICE]
         proprio_feat = torch.cat([lin_vel, ang_vel, gravity], dim=-1)
-        task_ctx = self._build_task_ctx_obs()
         head = self._camera_tensor("head_camera", batch).reshape(batch, -1)
         ee = self._camera_tensor("ee_camera", batch).reshape(batch, -1)
-        return torch.cat([head, ee, proprio_feat, task_ctx], dim=-1)
+        if self._use_task_ctx_obs:
+            task_ctx = self._build_task_ctx_obs()
+            return torch.cat([head, ee, proprio_feat, task_ctx], dim=-1)
+        return torch.cat([head, ee, proprio_feat], dim=-1)
 
     def _vel_cmd_to_nav_action(self, vel_cmd: torch.Tensor) -> torch.Tensor:
         """Inverse of ``_nav_action_to_vel_cmd`` (clamped to [-1, 1])."""

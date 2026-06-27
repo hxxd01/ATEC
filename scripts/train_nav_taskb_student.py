@@ -21,6 +21,14 @@ parser.add_argument(
 parser.add_argument("--inner_steps", type=int, default=5, help="Low-level sim steps per nav step.")
 parser.add_argument("--max_iter", type=int, default=8000)
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument(
+    "--proprio_dim",
+    type=int,
+    default=15,
+    choices=[9, 15],
+    help="Actor proprio MLP input: 9=legacy (lin/ang/grav only, for old ckpt resume); "
+    "15=+last_vel/touch/scored/elapsed (default). Must match checkpoint.",
+)
 parser.add_argument("--steps_per_env", type=int, default=24)
 parser.add_argument("--vx_min", type=float, default=-1.0)
 parser.add_argument("--vx_max", type=float, default=1.0)
@@ -150,7 +158,7 @@ from atec_rl_lab.tasks.task_b.env_cfg import (
     apply_task_d_camera_depth_clip,
     refresh_task_b_terrain_cfg,
 )
-from atec_rl_lab.train.nav.taskb_student_env import TASK_B_PROPRIO_DIM, TaskBStudentEnv
+from atec_rl_lab.train.nav.taskb_student_env import TaskBStudentEnv
 from atec_rl_lab.train.nav.nav_cfg import TaskBStudentPPORunnerCfg
 from atec_rl_lab.train.nav.nav_rsl_wrapper import NavRslRlVecEnvWrapper
 from atec_rl_lab.train.nav.taskb_student_actor_critic import TaskBStudentActorCritic
@@ -329,7 +337,7 @@ def main():
     agent_cfg.policy.img_h = policy_h
     agent_cfg.policy.img_w = policy_w
     agent_cfg.policy.img_channels = 1 if args_cli.depth_only else 4
-    agent_cfg.policy.proprio_dim = TASK_B_PROPRIO_DIM
+    agent_cfg.policy.proprio_dim = int(args_cli.proprio_dim)
     if args_cli.depth_only:
         agent_cfg.experiment_name = "taskb_student_b2piper_depth"
 
@@ -394,12 +402,19 @@ def main():
         illegal_contact_penalty=args_cli.illegal_contact_penalty,
         visible_depth_tol=args_cli.visible_depth_tol,
         visible_check_depth=args_cli.visible_check_depth,
+        proprio_dim=args_cli.proprio_dim,
     )
     vec_env = NavRslRlVecEnvWrapper(nav_env)
 
     runner = OnPolicyRunner(vec_env, agent_cfg.to_dict(), log_dir=log_dir, device=device)
     if args_cli.resume:
         print(f"[INFO] Resuming PPO from: {args_cli.resume}", flush=True)
+        if args_cli.proprio_dim == 9:
+            print(
+                "[INFO] legacy proprio_dim=9 (no task-context obs); matches ckpts before "
+                "last_vel/touch/scored/elapsed were added.",
+                flush=True,
+            )
         runner.load(args_cli.resume)
     if args_cli.bc_ckpt:
         _load_bc_into_actor_critic(
