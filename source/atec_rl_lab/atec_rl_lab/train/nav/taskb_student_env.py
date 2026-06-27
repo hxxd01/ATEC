@@ -517,12 +517,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
     def _build_env_action(self, ll_action_train: torch.Tensor) -> torch.Tensor:
         """Legs from the low-level policy + arm frozen at the DETECT hold pose.
 
-        The base env action layout is [leg(12), arm(8)]. The locomotion policy only
-        outputs leg targets; we fill the arm slots with ``DETECT_HOLD_ARM_ACTION`` so
-        the action manager's PD target is ``default + 0.5 * DETECT_HOLD_ARM_ACTION``
-        every sim step — identical to the squat-flat training. Without this the arm
-        slots are 0 and the arm drifts back to its USD default instead of locking
-        to the DETECT pose.
+        Matches ``demo/solution.py`` / competition server: platform has no sim-side
+        detect-arm interval; arm targets come only from the 20-dim action each step.
         """
         batch = ll_action_train.shape[0]
         action = torch.zeros(

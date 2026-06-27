@@ -277,6 +277,8 @@ def main():
     cam_h = int(args_cli.sim_camera_h)
     cam_w = int(args_cli.sim_camera_w)
 
+    # Platform-aligned: TaskBNavEnvB2Cfg == TaskBEnvB2Cfg + nav train overrides + cam far=50m.
+    # Reset: USD default leg/arm; detect arm only via TaskBStudentEnv._build_env_action (same as demo/solution.py).
     env_cfg = TaskBNavEnvB2Cfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.env_spacing is not None:
@@ -342,6 +344,11 @@ def main():
     print(
         f"[INFO] TaskB cameras: head+ee dual cam, {cam_mode}/cam, "
         f"sim={cam_h}x{cam_w} -> policy={policy_h}x{policy_w}",
+        flush=True,
+    )
+    print(
+        "[INFO] TaskB platform-aligned reset: USD default joints, no sim detect-arm interval; "
+        "arm hold via wrapper action each step (matches competition server.py).",
         flush=True,
     )
 

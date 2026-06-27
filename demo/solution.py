@@ -556,6 +556,22 @@ class AlgSolution:
         action_env[:, self.arm_joint_indices] = self.arm_hold_action.expand(num_envs, -1)
         return action_env
 
+    def hold_squat_env_action(self, obs: dict) -> torch.Tensor:
+        """Squat LL at zero velocity + detect arm hold (matches training post-reset settle)."""
+        proprio = self._to_batch_tensor(obs["proprio"], self.device)
+        if proprio.ndim == 1:
+            proprio = proprio.unsqueeze(0)
+        action_dim = (int(proprio.shape[-1]) - 12) // 3
+        zero_vel = torch.zeros((proprio.shape[0], 3), device=self.device, dtype=torch.float32)
+        ll_obs = self._extract_ll_obs(obs, action_dim, zero_vel)
+        with torch.inference_mode():
+            action_train = self.ll_policy(ll_obs)
+        if not isinstance(action_train, torch.Tensor):
+            action_train = torch.as_tensor(action_train, device=self.device, dtype=torch.float32)
+        if action_train.ndim == 1:
+            action_train = action_train.unsqueeze(0)
+        return self._map_policy_action_to_env_action(action_train.to(self.device, dtype=torch.float32), action_dim)
+
     def predicts(self, obs, current_score):
         self._update_platform_score(current_score)
         self._time_since_last_touch_s += self.physics_step_dt

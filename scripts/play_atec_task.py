@@ -219,6 +219,13 @@ parser.add_argument(
     default=None,
     help="Sim camera far clip (m). Default: 50 with --platform_deploy, else 5 (nav depth_max).",
 )
+parser.add_argument(
+    "--taskb_settle_steps",
+    type=int,
+    default=0,
+    help="Task B play-only dev helper: LL squat settle after reset (NOT on competition server). "
+    "Default 0 = platform-aligned (reset -> first predicts immediately).",
+)
 AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
@@ -450,7 +457,7 @@ def _taskb_settle_action(device: str) -> torch.Tensor:
 
 
 def _taskb_physics_settle(env, obs: dict, *, steps: int, device: str) -> dict:
-    """Let spawn contacts decay out of contact_sensor history before nav+LL policy runs."""
+    """Fallback settle: default leg targets + detect arm (no LL policy). Prefer _taskb_policy_settle."""
     if steps <= 0:
         return obs
     hold = _taskb_settle_action(device)
@@ -459,7 +466,31 @@ def _taskb_physics_settle(env, obs: dict, *, steps: int, device: str) -> dict:
         flush=True,
     )
     for _ in range(steps):
-        obs, _, _, _, _ = env.step(hold)
+        obs, _, term, trunc, _ = env.step(hold)
+        if bool(term) or bool(trunc):
+            obs, _ = env.reset()
+    return _warmup_rtx_and_refresh_obs(env, obs, num_renders=3)
+
+
+def _taskb_policy_settle(env, solution, obs: dict, *, steps: int, device: str) -> dict:
+    """Post-reset settle via squat LL @ zero vel — matches taskb_student_env inner loop."""
+    if steps <= 0:
+        return obs
+    if not hasattr(solution, "hold_squat_env_action"):
+        return _taskb_physics_settle(env, obs, steps=steps, device=device)
+    print(
+        f"[play] Task B: LL squat settle {steps} steps (zero vel_cmd + detect arm) ...",
+        flush=True,
+    )
+    for _ in range(steps):
+        actions = solution.hold_squat_env_action(obs)
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.tensor(actions, dtype=torch.float32, device=device).view(1, -1)
+        obs, _, term, trunc, _ = env.step(actions)
+        if bool(term) or bool(trunc):
+            obs, _ = env.reset()
+            if hasattr(solution, "reset"):
+                solution.reset()
     return _warmup_rtx_and_refresh_obs(env, obs, num_renders=3)
 
 
@@ -854,10 +885,9 @@ def _disable_taskd_terminations(env_cfg) -> None:
         print(f"[play] Task B: disabled Task-D terminations: {', '.join(cleared)}", flush=True)
 
 
-def _configure_taskb_play(env_cfg) -> None:
-    """Task B play: nav-aligned spawn (env_origin + local) and terrain grid for num_envs."""
+def _configure_taskb_play(env_cfg, *, platform_deploy: bool = False) -> None:
+    """Task B play: terrain grid + spawn overrides; match competition TaskBEnvB2Cfg."""
     from atec_rl_lab.tasks.task_b.env_cfg import (
-        apply_task_b_detect_arm_hold,
         apply_task_b_nav_spawn_overrides,
         refresh_task_b_terrain_cfg,
     )
@@ -865,10 +895,10 @@ def _configure_taskb_play(env_cfg) -> None:
     _disable_taskd_terminations(env_cfg)
     refresh_task_b_terrain_cfg(env_cfg)
     apply_task_b_nav_spawn_overrides(env_cfg)
-    apply_task_b_detect_arm_hold(env_cfg)
+    mode = "platform_deploy" if platform_deploy else "play"
     print(
-        "[play] Task B: nav spawn (robot local (0,0,0.68), trash local [-5,5], "
-        "reset events on)",
+        f"[play] Task B ({mode}): TaskBEnvB2Cfg spawn, no sim-side detect-arm interval "
+        f"(arm via solution action only; reset=USD default joints)",
         flush=True,
     )
 
@@ -1161,7 +1191,23 @@ def play() -> tuple[float, float]:
     )
 
     if _is_task_b:
-        _configure_taskb_play(env_cfg)
+        _configure_taskb_play(
+            env_cfg,
+            platform_deploy=bool(getattr(args_cli, "platform_deploy", False)),
+        )
+        if not args_cli.fast and getattr(getattr(env_cfg, "observations", None), "image", None) is not None:
+            from atec_rl_lab.tasks.task_b.env_cfg import TASK_B_NAV_DEPTH_MAX, TASK_B_PLATFORM_CAMERA_FAR
+            from atec_rl_lab.tasks.task_d.env_cfg import apply_task_d_camera_depth_clip
+
+            far = args_cli.camera_far_clip
+            if far is None:
+                far = (
+                    TASK_B_PLATFORM_CAMERA_FAR
+                    if bool(getattr(args_cli, "platform_deploy", False))
+                    else TASK_B_NAV_DEPTH_MAX
+                )
+            apply_task_d_camera_depth_clip(env_cfg.scene, float(far))
+            print(f"[play] Task B: camera far clip={float(far):.1f}m", flush=True)
     if args_cli.video and not args_cli.no_ground_video:
         _enable_ground_view_camera(env_cfg)
 
@@ -1307,8 +1353,6 @@ def play() -> tuple[float, float]:
     obs, _ = env.reset()
     if _is_task_b and not args_cli.fast:
         obs = _warmup_rtx_and_refresh_obs(env, obs, num_renders=5)
-        # contact_sensor history_length=3: spawn thigh impulses linger unless we step with a hold pose.
-        obs = _taskb_physics_settle(env, obs, steps=12, device=args_cli.device)
     print("[play] env.reset() done, entering control loop.", flush=True)
     camera_recorder = None
     ground_recorder = None
@@ -1337,6 +1381,21 @@ def play() -> tuple[float, float]:
     if hasattr(solution, "reset"):
         solution.reset(task=args_cli.task)
     _is_task_b_play = isinstance(args_cli.task, str) and "TaskB" in args_cli.task
+    if _is_task_b_play and not args_cli.fast:
+        settle_steps = max(0, int(getattr(args_cli, "taskb_settle_steps", 0)))
+        if settle_steps > 0:
+            obs = _taskb_policy_settle(
+                env,
+                solution,
+                obs,
+                steps=settle_steps,
+                device=args_cli.device,
+            )
+        elif bool(getattr(args_cli, "platform_deploy", False)):
+            print(
+                "[play] platform_deploy: no settle (reset -> first predicts(), same as server.py).",
+                flush=True,
+            )
     if hasattr(solution, "bind_env") and (
         (
             isinstance(args_cli.task, str)

@@ -291,7 +291,12 @@ class TaskBEnvB2Cfg(TaskBEnvCfg):
 
 @configclass
 class TaskBNavEnvB2Cfg(TaskBEnvB2Cfg):
-    """Task B B2 nav training: multi-tile terrain, random trash on reset, detect arm hold."""
+    """Task B B2 nav training: multi-tile terrain, random trash on reset.
+
+    Platform-aligned: reset uses USD default leg/arm joints (same as TaskBEnvB2Cfg).
+    Detect arm is applied only via the student wrapper / demo solution action each step,
+    not via sim-side ``hold_detect_arm_interval`` (competition server has no such event).
+    """
 
     scene: BaseSceneCfg = BaseSceneCfg(num_envs=512, env_spacing=float(TASK_B_CELL_SIZE[0]))
 
@@ -300,7 +305,6 @@ class TaskBNavEnvB2Cfg(TaskBEnvB2Cfg):
 
         apply_task_b_nav_train_overrides(self)
         apply_task_d_camera_depth_clip(self.scene, TASK_B_PLATFORM_CAMERA_FAR)
-        apply_task_b_detect_arm_hold(self)
 
 
 @configclass
