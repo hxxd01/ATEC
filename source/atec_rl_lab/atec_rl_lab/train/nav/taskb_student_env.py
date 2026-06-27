@@ -36,8 +36,8 @@ class TaskBStudentEnv(TaskDStudentEnv):
         ll_policy_path: str,
         device: str = "cuda",
         inner_steps: int = 25,
-        vx_min: float = -1.0,
-        vx_max: float = 1.0,
+        vx_min: float = -2.0,
+        vx_max: float = 2.0,
         vy_max: float = 1.0,
         wz_max: float = 1.0,
         image_h: int = 24,
@@ -49,16 +49,17 @@ class TaskBStudentEnv(TaskDStudentEnv):
         w_dense_dist: float = 0.3,
         sparse_touch_reward: float = 10.0,
         grasp_dist_thresh: float = TASK_B_GRASP_DIST,
-        time_penalty_per_env_step: float = 0.004,
+        time_penalty_per_env_step: float = 0.0,
         ee_body_name: str = "gripper_base",
-        no_touch_timeout_s: float = 12.0,
+        no_touch_timeout_s: float = 0.0,
         finished_reward: float = 100.0,
         visible_depth_tol: float = 0.25,
         visible_check_depth: bool = False,
         guide_milestone_thresholds: tuple[float, ...] = (1.2, 0.8, 0.5, 0.3),
         guide_milestone_rewards: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4),
-        max_vel_cmd_delta: float = 0.15,
+        max_vel_cmd_delta: float = 0.0,
         w_action_rate: float = 0.5,
+        illegal_contact_penalty: float = 0.0,
     ):
         super().__init__(
             env=env,
@@ -99,6 +100,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         )
         self._max_vel_cmd_delta = float(max_vel_cmd_delta)
         self._w_action_rate = float(w_action_rate)
+        self._illegal_contact_penalty = float(illegal_contact_penalty)
 
         # Critic (Task-D student): actor flat + privileged extras; RNN value head in AC.
         self._critic_extra_dim = TASK_B_CRITIC_EXTRA_DIM
@@ -167,6 +169,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
             f"grasp_dist={self._grasp_dist_thresh} time_pen={self._time_penalty_per_env_step}/step "
             f"no_touch_timeout_s={self._no_touch_timeout_s} finished_reward={self._finished_reward} "
             f"max_vel_cmd_delta={self._max_vel_cmd_delta} w_action_rate={self._w_action_rate} "
+            f"illegal_pen={self._illegal_contact_penalty} "
             f"env_step_dt={self._env_step_dt:.4f} inner_steps={self.inner_steps}",
             flush=True,
         )
@@ -201,6 +204,28 @@ class TaskBStudentEnv(TaskDStudentEnv):
         # Skip first nav step after reset (last_cmd is zero).
         has_prev = self._last_vel_cmd.abs().sum(dim=1) > 1e-6
         return torch.where(has_prev, pen, torch.zeros_like(pen))
+
+    def _isaac_env(self):
+        """Reach the underlying Isaac Lab env through gym wrappers."""
+        env = self.env
+        while hasattr(env, "env"):
+            env = env.env
+        return env
+
+    def _termination_term_flags(self) -> dict[str, torch.Tensor]:
+        """Task-B MDP terminations used for metrics and illegal-contact penalty."""
+        tm = getattr(self._isaac_env(), "termination_manager", None)
+        if tm is None:
+            return {}
+        out: dict[str, torch.Tensor] = {}
+        for name in ("illegal_contact", "fall", "time_out"):
+            if name not in tm._term_names:
+                continue
+            idx = tm._term_name_to_term_idx[name]
+            out[name] = tm._last_episode_dones[: self.num_envs, idx].to(
+                device=self._device, dtype=torch.bool
+            )
+        return out
 
     def _ensure_ee_body_idx(self) -> int:
         if self._ee_body_idx is not None:
@@ -580,6 +605,7 @@ class TaskBStudentEnv(TaskDStudentEnv):
         total_finished = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_time_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_action_rate_pen = action_rate_pen.clone()
+        total_illegal_pen = torch.zeros(self.num_envs, device=self._device, dtype=torch.float32)
         total_reward += action_rate_pen
         terminated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
         truncated = torch.zeros(self.num_envs, device=self._device, dtype=torch.bool)
@@ -592,6 +618,9 @@ class TaskBStudentEnv(TaskDStudentEnv):
         dist_3d_all = torch.linalg.norm(diff_3d, dim=-1)
 
         for _ in range(self.inner_steps):
+            # Snapshot done mask before this inner step so we can detect first-time
+            # terminations inside one nav step (avoid shadow-episode double counting).
+            was_episode_done = episode_done.clone()
             active = ~episode_done
             if not bool(active.any()):
                 break
@@ -667,16 +696,31 @@ class TaskBStudentEnv(TaskDStudentEnv):
             total_time_pen += time_pen * alive_f
 
             if bool(done_now.any()):
-                self._record_scored_at_termination(done_now)
-                fall_flags = self._termination_term_flags().get("fall")
-                timeout_flags = done_now & step_trunc_1d
+                term_flags = self._termination_term_flags()
+                illegal_contact_flags = term_flags.get("illegal_contact")
+                fall_flags = term_flags.get("fall")
+                timeout_flags = term_flags.get("time_out")
+                if illegal_contact_flags is None:
+                    illegal_contact_flags = torch.zeros_like(done_now)
                 if fall_flags is None:
                     fall_flags = torch.zeros_like(done_now)
-                fall_flags = done_now & (~step_trunc_1d) & fall_flags
-                illegal_flags = done_now & (~step_trunc_1d) & (~fall_flags)
+                if timeout_flags is None:
+                    timeout_flags = torch.zeros_like(done_now)
+
+                newly_done = done_now & (~was_episode_done)
+                if bool(newly_done.any()):
+                    self._record_scored_at_termination(newly_done)
+
+                illegal_flags = newly_done & illegal_contact_flags
+                fall_flags = newly_done & fall_flags
+                timeout_flags = newly_done & timeout_flags
                 self._illegal_at_term_count += int(illegal_flags.sum().item())
                 self._fall_at_term_count += int(fall_flags.sum().item())
                 self._timeout_at_term_count += int(timeout_flags.sum().item())
+                if self._illegal_contact_penalty > 0.0 and bool(illegal_flags.any()):
+                    illegal_pen = illegal_flags.to(dtype=total_reward.dtype) * (-self._illegal_contact_penalty)
+                    total_reward += illegal_pen
+                    total_illegal_pen += illegal_pen
                 self._prev_obj_dist_3d = torch.where(
                     done_now.unsqueeze(-1),
                     torch.full_like(self._prev_obj_dist_3d, float("nan")),
@@ -707,15 +751,10 @@ class TaskBStudentEnv(TaskDStudentEnv):
                     torch.zeros_like(self._episode_finished),
                     self._episode_finished,
                 )
-                self._done_total += int(done_now.sum().item())
-                self._done_timeout += int((done_now & step_trunc_1d).sum().item())
-                if fall_flags is not None:
-                    self._done_fall += int((done_now & fall_flags).sum().item())
-                illegal = done_now
-                if fall_flags is not None:
-                    illegal = illegal & (~fall_flags)
-                illegal = illegal & (~step_trunc_1d)
-                self._done_illegal += int(illegal.sum().item())
+                self._done_total += int(newly_done.sum().item())
+                self._done_timeout += int(timeout_flags.sum().item())
+                self._done_fall += int(fall_flags.sum().item())
+                self._done_illegal += int(illegal_flags.sum().item())
 
         if self._nav_log_interval > 0 and self._nav_step_count % self._nav_log_interval == 0:
             min_xy, _, min_3d, _ = self._nearest_unscored_trash_metrics()
@@ -727,10 +766,11 @@ class TaskBStudentEnv(TaskDStudentEnv):
             print(
                 f"[TaskBStudent] nav={self._nav_step_count:5d} "
                 f"rew={total_reward.mean().item():+.4f} "
-                f"[guide/prog/mile/sparse/finished/time/rate]={total_dense.mean().item():+.3f}/"
+                f"[guide/prog/mile/sparse/finished/time/rate/illegal]={total_dense.mean().item():+.3f}/"
                 f"{total_guide_prog.mean().item():+.3f}/{total_guide_mile.mean().item():+.3f}/"
                 f"{total_sparse.mean().item():+.3f}/{total_finished.mean().item():+.3f}/"
-                f"{total_time_pen.mean().item():+.3f}/{total_action_rate_pen.mean().item():+.3f} "
+                f"{total_time_pen.mean().item():+.3f}/{total_action_rate_pen.mean().item():+.3f}/"
+                f"{total_illegal_pen.mean().item():+.3f} "
                 f"min_3d_oracle={min_3d[torch.isfinite(min_3d)].min().item() if torch.isfinite(min_3d).any() else float('nan'):.2f} "
                 f"min_xy_oracle={min_xy[torch.isfinite(min_xy)].mean().item() if torch.isfinite(min_xy).any() else float('nan'):.2f} "
                 f"scored_mean={scored:.2f}/18 touches={self._touch_total} "

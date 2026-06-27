@@ -22,8 +22,8 @@ parser.add_argument("--inner_steps", type=int, default=5, help="Low-level sim st
 parser.add_argument("--max_iter", type=int, default=8000)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--steps_per_env", type=int, default=24)
-parser.add_argument("--vx_min", type=float, default=-2.0)
-parser.add_argument("--vx_max", type=float, default=2.0)
+parser.add_argument("--vx_min", type=float, default=-1.0)
+parser.add_argument("--vx_max", type=float, default=1.0)
 parser.add_argument("--vy_max", type=float, default=1.0)
 parser.add_argument("--wz_max", type=float, default=1.0)
 parser.add_argument("--policy_img_h", type=int, default=24)
@@ -71,26 +71,32 @@ parser.add_argument("--grasp_dist_thresh", type=float, default=0.20, help="Platf
 parser.add_argument(
     "--time_penalty_per_env_step",
     type=float,
-    default=0.004,
-    help="Time penalty each low-level env step.",
+    default=0.0,
+    help="Time penalty each low-level env step (0=off).",
 )
 parser.add_argument(
     "--no_touch_timeout_s",
     type=float,
-    default=5.0,
+    default=0.0,
     help="Truncate episode if no new platform touch score for this many sim seconds (0=off).",
 )
 parser.add_argument(
     "--max_vel_cmd_delta",
     type=float,
-    default=0.15,
+    default=0.0,
     help="Max change in physical vel_cmd [vx,vy,wz] per nav step (m/s, rad/s). 0=disable rate limit.",
 )
 parser.add_argument(
     "--w_action_rate",
     type=float,
-    default=0.5,
+    default=0.01,
     help="Soft penalty weight on ||vel_cmd_t - vel_cmd_{t-1}||^2 per nav step (0=off).",
+)
+parser.add_argument(
+    "--illegal_contact_penalty",
+    type=float,
+    default=0.0,
+    help="Extra penalty added once when an episode ends with illegal_contact.",
 )
 parser.add_argument(
     "--finished_reward",
@@ -377,6 +383,7 @@ def main():
         finished_reward=args_cli.finished_reward,
         max_vel_cmd_delta=args_cli.max_vel_cmd_delta,
         w_action_rate=args_cli.w_action_rate,
+        illegal_contact_penalty=args_cli.illegal_contact_penalty,
         visible_depth_tol=args_cli.visible_depth_tol,
         visible_check_depth=args_cli.visible_check_depth,
     )
@@ -405,6 +412,7 @@ def main():
         f"sparse_only={args_cli.sparse_only} "
         f"time_pen={args_cli.time_penalty_per_env_step} no_touch_timeout_s={args_cli.no_touch_timeout_s} "
         f"max_vel_cmd_delta={args_cli.max_vel_cmd_delta} w_action_rate={args_cli.w_action_rate} "
+        f"illegal_pen={args_cli.illegal_contact_penalty} "
         f"finished_reward={args_cli.finished_reward}",
         flush=True,
     )

@@ -55,6 +55,13 @@ parser.add_argument(
     help="Enable debug prints: reward, elapsed sim time, measured base linear velocities.",
 )
 parser.add_argument(
+    "--print-ee-z",
+    action="store_true",
+    default=False,
+    help="Task B: print gripper_base EE height (world + env-local z) each step; "
+    "with --video also shown on video HUD.",
+)
+parser.add_argument(
     "--print-box-pose",
     action="store_true",
     default=False,
@@ -203,7 +210,8 @@ parser.add_argument(
 parser.add_argument(
     "--platform_deploy",
     action="store_true",
-    help="Mimic demo/server.py: no bind_env, proprio+image obs only (Task B / Task D).",
+    help="Mimic demo/server.py: no bind_env, proprio+image obs only (Task B / Task D). "
+    "Task B: auto-enables head/ee rgb+depth (disables --fast).",
 )
 parser.add_argument(
     "--camera_far_clip",
@@ -267,6 +275,22 @@ if args_cli.fast is None:
         and not args_cli.depth_lidar
         and not _is_task_d
     )
+
+# Task B platform_deploy mirrors demo/server.py: nav student needs head/ee rgb+depth in obs['image'].
+if bool(getattr(args_cli, "platform_deploy", False)) and _is_task_b:
+    if args_cli.fast:
+        print(
+            "[play] platform_deploy + Task B: nav student needs head/ee rgb+depth — disabling --fast.",
+            flush=True,
+        )
+    args_cli.fast = False
+    args_cli.enable_cameras = True
+    if not args_cli.full_obs and not args_cli.depth_lidar and not args_cli.cameras_only:
+        args_cli.cameras_only = True
+        print(
+            "[play] platform_deploy + Task B: default cameras-only (head/ee rgb+depth, no lidar).",
+            flush=True,
+        )
 
 # RecordVideo needs Kit rendering + head/ee RGB for tri-view stitch.
 if args_cli.video:
@@ -340,6 +364,103 @@ def _disable_heavy_sensors(env_cfg) -> None:
         env_cfg.observations.extero = None
         env_cfg.observations.image = None
     print("[play] --fast: disabled cameras + lidar (proprio-only).", flush=True)
+
+
+def _enable_rtx_camera_play(env_cfg, *, num_rerenders: int = 5) -> None:
+    """RTX head/ee depth obs need post-reset renders (Isaac Lab num_rerenders_on_reset).
+
+    Without this, the first policy step can see stale/empty depth while --video accidentally
+    works because extra cameras / RecordVideo trigger more renders during reset.
+    """
+    img = getattr(getattr(env_cfg, "observations", None), "image", None)
+    if img is None:
+        return
+    n = max(int(getattr(env_cfg, "num_rerenders_on_reset", 0)), int(num_rerenders))
+    env_cfg.num_rerenders_on_reset = n
+    print(f"[play] RTX cameras: num_rerenders_on_reset={n}", flush=True)
+
+
+def _unwrap_play_env(env):
+    base = env
+    while hasattr(base, "env"):
+        base = base.env
+    return base
+
+
+def _warmup_rtx_and_refresh_obs(env, obs: dict, *, num_renders: int = 5) -> dict:
+    unwrapped = _unwrap_play_env(env)
+    sim = getattr(unwrapped, "sim", None)
+    if sim is not None and sim.has_rtx_sensors():
+        for _ in range(num_renders):
+            sim.render()
+    om = getattr(unwrapped, "observation_manager", None)
+    if om is None:
+        return obs
+    computed = om.compute(update_history=True)
+    if isinstance(obs, dict) and isinstance(computed, dict) and "image" in computed:
+        refreshed = dict(obs)
+        refreshed["image"] = computed["image"]
+        return refreshed
+    return computed if isinstance(computed, dict) else obs
+
+
+_ee_body_idx_cache: dict[tuple[int, str], int] = {}
+
+
+def _taskb_ee_height(env, ee_body_name: str = "gripper_base") -> tuple[float, float] | None:
+    """Return (ee_z_world, ee_z_local) for gripper_base, or None if unavailable."""
+    try:
+        unwrapped = _unwrap_play_env(env)
+        robot = unwrapped.scene.articulations["robot"]
+        cache_key = (id(unwrapped), ee_body_name)
+        ee_idx = _ee_body_idx_cache.get(cache_key)
+        if ee_idx is None:
+            body_ids, found = robot.find_bodies(ee_body_name)
+            if not body_ids:
+                return None
+            ee_idx = int(body_ids[0])
+            _ee_body_idx_cache[cache_key] = ee_idx
+            print(f"[play] EE debug body: {found[0]} (idx={ee_idx})", flush=True)
+        ee_pos_w = robot.data.body_pos_w[0, ee_idx, :3]
+        ee_z_world = float(ee_pos_w[2].item())
+        origin_z = float(unwrapped.scene.env_origins[0, 2].item())
+        return ee_z_world, ee_z_world - origin_z
+    except (AttributeError, KeyError, IndexError, ValueError):
+        return None
+
+
+def _print_taskb_ee_z(env, *, timestep: int = 0) -> None:
+    heights = _taskb_ee_height(env)
+    if heights is None:
+        return
+    ee_z_world, ee_z_local = heights
+    print(
+        f"[play][ee_z] step={timestep} gripper_base z_world={ee_z_world:+.3f} z_local={ee_z_local:+.3f}",
+        flush=True,
+    )
+
+
+def _taskb_settle_action(device: str) -> torch.Tensor:
+    """Hold squat default leg pose + detect arm (matches taskb_student_env / solution.py)."""
+    from atec_rl_lab.train.locomotion.velocity.mdp.events import DETECT_HOLD_ARM_ACTION
+
+    action = torch.zeros(1, 20, device=device, dtype=torch.float32)
+    action[0, 12:20] = torch.tensor(DETECT_HOLD_ARM_ACTION, device=device, dtype=torch.float32)
+    return action
+
+
+def _taskb_physics_settle(env, obs: dict, *, steps: int, device: str) -> dict:
+    """Let spawn contacts decay out of contact_sensor history before nav+LL policy runs."""
+    if steps <= 0:
+        return obs
+    hold = _taskb_settle_action(device)
+    print(
+        f"[play] Task B: physics settle {steps} steps (default legs + detect arm hold) ...",
+        flush=True,
+    )
+    for _ in range(steps):
+        obs, _, _, _, _ = env.step(hold)
+    return _warmup_rtx_and_refresh_obs(env, obs, num_renders=3)
 
 
 def _disable_cameras_keep_lidar(env_cfg) -> None:
@@ -599,6 +720,7 @@ def _build_video_overlay_lines(
     total_elapsed_time: float,
     *,
     show_box_pose: bool = False,
+    show_ee_z: bool = False,
 ) -> list[str]:
     """Build HUD lines matching --debug terminal output."""
     in_pick_hud = (
@@ -636,6 +758,12 @@ def _build_video_overlay_lines(
     if show_box_pose:
         lines.extend(_taskd_pose_overlay_lines(env))
 
+    if show_ee_z:
+        heights = _taskb_ee_height(env)
+        if heights is not None:
+            ee_z_world, ee_z_local = heights
+            lines.append(f"ee_z_w={ee_z_world:+.3f} ee_z_local={ee_z_local:+.3f}")
+
     if hasattr(solution, "get_video_overlay_lines"):
         lines.extend(solution.get_video_overlay_lines())
 
@@ -651,6 +779,7 @@ def _debug_print_motion(
     *,
     timestep: int = 0,
     print_box_pose: bool = False,
+    print_ee_z: bool = False,
     env_reward: float | None = None,
 ) -> None:
     """Print score/time and measured velocities (after env.step)."""
@@ -660,6 +789,8 @@ def _debug_print_motion(
     print(f"total_elapsed_time:{total_elapsed_time: .2f}")
     if print_box_pose:
         _print_taskd_box_pose(env, timestep)
+    if print_ee_z:
+        _print_taskb_ee_z(env, timestep=timestep)
     proprio = obs.get("proprio")
     if proprio is None:
         return
@@ -1034,6 +1165,12 @@ def play() -> tuple[float, float]:
     if args_cli.video and not args_cli.no_ground_video:
         _enable_ground_view_camera(env_cfg)
 
+    # Safety net: platform_deploy Task B must keep head/ee rgb+depth (same as demo/server.py).
+    if bool(getattr(args_cli, "platform_deploy", False)) and _is_task_b and args_cli.fast:
+        args_cli.fast = False
+        if not args_cli.full_obs and not args_cli.depth_lidar:
+            args_cli.cameras_only = True
+
     if _use_pit_solution and _is_task_d and hasattr(solution, "configure_env_cfg"):
         solution.configure_env_cfg(env_cfg, args_cli)
     elif _use_pit_solution and _is_task_d:
@@ -1055,7 +1192,15 @@ def play() -> tuple[float, float]:
     else:
         print("[play] full-obs: 4 cameras + lidar enabled (reset may take several minutes).", flush=True)
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if not args_cli.fast and getattr(getattr(env_cfg, "observations", None), "image", None) is not None:
+        _enable_rtx_camera_play(env_cfg)
+
+    use_camera_render = bool(args_cli.enable_cameras or args_cli.video)
+    env = gym.make(
+        args_cli.task,
+        cfg=env_cfg,
+        render_mode="rgb_array" if use_camera_render else None,
+    )
 
     # Convert MARL -> single agent if needed (kept from your original script)
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -1160,6 +1305,10 @@ def play() -> tuple[float, float]:
         fast_hint = "full-obs (4 cameras + lidar, SLOW)"
     print(f"[play] env.reset() starting ({fast_hint}) ...", flush=True)
     obs, _ = env.reset()
+    if _is_task_b and not args_cli.fast:
+        obs = _warmup_rtx_and_refresh_obs(env, obs, num_renders=5)
+        # contact_sensor history_length=3: spawn thigh impulses linger unless we step with a hold pose.
+        obs = _taskb_physics_settle(env, obs, steps=12, device=args_cli.device)
     print("[play] env.reset() done, entering control loop.", flush=True)
     camera_recorder = None
     ground_recorder = None
@@ -1220,6 +1369,10 @@ def play() -> tuple[float, float]:
         print("[play] pit-edge ablation: student starts at pit lip (no teleop).", flush=True)
 
     show_box_pose = bool(_is_task_d and args_cli.print_box_pose)
+    print_ee_z = bool(_is_task_b_play and (args_cli.print_ee_z or args_cli.debug))
+    show_ee_z_hud = bool(_is_task_b_play and (print_ee_z or args_cli.video))
+    if print_ee_z and not args_cli.debug:
+        print("[play] Task B: --print-ee-z enabled (gripper_base z each step).", flush=True)
     if show_box_pose:
         global _play_box_lowest_z0
         _play_box_lowest_z0 = None
@@ -1279,6 +1432,7 @@ def play() -> tuple[float, float]:
                         display_score,
                         total_elapsed_time,
                         show_box_pose=show_box_pose,
+                        show_ee_z=show_ee_z_hud,
                     )
                 )
 
@@ -1305,6 +1459,7 @@ def play() -> tuple[float, float]:
                         display_score,
                         post_elapsed,
                         show_box_pose=show_box_pose,
+                        show_ee_z=show_ee_z_hud,
                     )
                 ground_recorder.write(obs, overlay_lines=ground_overlay)
             if not is_task_e and (args_cli.video or not args_cli.headless):
@@ -1339,8 +1494,11 @@ def play() -> tuple[float, float]:
                         solution=solution,
                         timestep=timestep,
                         print_box_pose=show_box_pose,
+                        print_ee_z=print_ee_z,
                         env_reward=total_episode_reward if platform_score_tracker is not None else None,
                     )
+            elif print_ee_z:
+                _print_taskb_ee_z(env, timestep=timestep)
             elif show_box_pose:
                 _print_taskd_box_pose(env, timestep)
 
